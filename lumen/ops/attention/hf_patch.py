@@ -47,6 +47,11 @@ def patch_sdpa() -> None:
 
     _original_sdpa = F.scaled_dot_product_attention
 
+    # Disable compilation for the entire AITER attention path.
+    # AITER flash attention has its own autograd.Function whose backward
+    # uses in-place view ops that are incompatible with AOT autograd tracing.
+    # Running it in eager (via compiler.disable) is the correct boundary.
+    @torch.compiler.disable
     def _lumen_sdpa(
         query: torch.Tensor,
         key: torch.Tensor,

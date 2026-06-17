@@ -635,7 +635,11 @@ def _replace_forward(
             return result, output_bias
 
     module._original_forward = original_forward
-    module.forward = quant_forward
+    # Wrap with compiler.disable so Dynamo treats the entire quantized-linear
+    # forward as an opaque eager call.  AOT autograd would otherwise trace into
+    # QuantizedLinearFunction.forward() and detect its view in-place operations
+    # (scaling-manager updates, FP8 activation store) as aliasing violations.
+    module.forward = torch.compiler.disable(quant_forward)
 
 
 def store_weights_fp8(

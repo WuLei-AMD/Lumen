@@ -34,6 +34,7 @@ import torch.nn as nn
 from lumen.core.grad_quant import quantize_grad_tensor
 from lumen.ops.dispatch import (
     Backend,
+    _mark_allow_in_graph,
     _probe_aiter_ck_norm,
     _probe_aiter_triton_norm,
     build_fallback_chain,
@@ -162,6 +163,9 @@ class _LayerNormGradQuant(torch.autograd.Function):
         dw = quantize_grad_tensor(w_d.grad, gqt)
         db = quantize_grad_tensor(b_d.grad, gqt) if b_d is not None and b_d.grad is not None else None
         return dx, dw, db, None, None
+
+
+_mark_allow_in_graph(_LayerNormGradQuant)
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +456,9 @@ class LumenLayerNorm(nn.Module):
             self.register_parameter("weight", None)
             self.register_parameter("bias", None)
 
+    # Disable AOT autograd tracing: AITER's _LayerNorm autograd Function uses
+    # in-place view ops incompatible with AOT aliasing constraints.
+    @torch.compiler.disable
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w = self.weight if self.weight is not None else torch.ones(x.shape[-1], device=x.device, dtype=x.dtype)
         w = w.to(x.dtype)

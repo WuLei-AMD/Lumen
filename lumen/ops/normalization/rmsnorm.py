@@ -35,6 +35,7 @@ import torch.nn as nn
 from lumen.core.grad_quant import quantize_grad_tensor
 from lumen.ops.dispatch import (
     Backend,
+    _mark_allow_in_graph,
     _probe_aiter_ck_rmsnorm,
     _probe_aiter_fused_add_rms_norm,
     _probe_aiter_fused_add_rmsnorm_pad,
@@ -188,6 +189,9 @@ class _RMSNormGradQuant(torch.autograd.Function):
         dx = quantize_grad_tensor(x_detached.grad, gqt)
         dw = quantize_grad_tensor(w_detached.grad, gqt)
         return dx, dw, None, None
+
+
+_mark_allow_in_graph(_RMSNormGradQuant)
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +622,11 @@ class LumenRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.grad_quant_type = grad_quant_type
 
+    # Disable AOT autograd tracing for this module: AITER's _RMSNorm autograd
+    # Function uses in-place view ops that violate AOT's aliasing constraints.
+    # Running the norm in eager mode is correct and has negligible Python
+    # overhead (the AITER Triton kernel dominates).
+    @torch.compiler.disable
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return rmsnorm(x, self.weight.to(x.dtype), self.eps, self.grad_quant_type)
 

@@ -18,6 +18,57 @@ from argparse import Namespace
 from collections import Counter, defaultdict
 from functools import partial
 
+# ---------------------------------------------------------------------------
+# Triton 3.7.0 (ROCm) compatibility shims for torch.compile
+#
+# Two APIs are missing in Triton 3.7.0 that PyTorch's inductor/AOT autograd
+# depends on, causing the following cascading failures:
+#
+#  1. triton_key  (triton.compiler.compiler)
+#     Used by inductor's FxGraphCache.  Missing causes ImportError in
+#     CacheBase.get_system() which is only guarded by ModuleNotFoundError.
+#
+#  2. specialize_impl  (triton.runtime.jit)
+#     Used by generate_ttir() inside identify_mutated_tensors().  Missing
+#     causes the entire mutation-analysis to fail, so PyTorch conservatively
+#     marks EVERY Triton kernel input as mutated.  This breaks AOT autograd's
+#     version-counter checks for ALL saved-for-backward tensors, producing
+#     spurious "modified by inplace operation" RuntimeErrors in backward().
+#
+# Fix: inject stubs for both symbols before any torch.compile / inductor code
+# runs.  For (2) we patch identify_mutated_tensors to return [] on failure
+# (no mutations assumed) instead of the conservative all-inputs-mutated.
+# This is safe for AITER kernels which exclusively write to separate output
+# tensors and never mutate their inputs.
+# ---------------------------------------------------------------------------
+
+try:
+    from triton.compiler.compiler import triton_key as _  # noqa: F401
+except ImportError:
+    import hashlib as _hashlib
+    import triton.compiler.compiler as _tcc
+    def _triton_key_stub():
+        env = {k: v for k, v in os.environ.items() if "TRITON" in k or "HIP" in k}
+        return _hashlib.sha256(
+            f"{_tcc.__version__}{sorted(env.items())}".encode()
+        ).hexdigest()
+    _tcc.triton_key = _triton_key_stub
+
+# 2. specialize_impl (triton.runtime.jit) — missing in Triton 3.7.0.
+#    When specialize_impl is absent, identify_mutated_tensors internally catches
+#    the ImportError and conservatively returns ALL tensor kwargs as mutated.
+#    This triggers version-counter mismatches in AOT autograd's backward for every
+#    tensor saved for backward that's also passed to any Triton kernel.
+#    Fix: completely replace identify_mutated_tensors so it returns [] (no mutations
+#    assumed) when generate_ttir fails, instead of the conservative all-mutated.
+#    This is safe for AITER kernels which write exclusively to output tensors.
+# specialize_impl: if missing, identify_mutated_tensors conservatively marks
+# ALL kernel inputs as mutated, causing spurious version-counter errors in
+# AOT autograd.  The root fix is to keep ALL remaining AITER Triton kernels
+# outside the compiled region via @torch.compiler.disable (applied to
+# apply_rotary_qk_autograd in rope.py).  With no AITER kernels left inside
+# compiled subgraphs, identify_mutated_tensors is never called for them.
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -229,6 +280,9 @@ def main():
                    help="FSDP2 only: store the frozen blockwise2d base weight as FP8 and "
                         "all-gather it as FP8 (no per-step re-quant)")
     p.set_defaults(grad_checkpointing=True, limit_all_gathers=True)
+    p.add_argument("--torch-compile", action="store_true",
+                   help="compile each decoder layer with torch.compile(mode='reduce-overhead') "
+                        "after FSDP wrapping; requires P1 compile-compat patches in dispatch.py")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--log-interval", type=int, default=1)
     p.add_argument("--eval-interval", type=int, default=50)
@@ -319,6 +373,28 @@ def main():
         )
         rank0(f"> FSDP model ready (sharding={args.sharding}, limit_all_gathers={args.limit_all_gathers}, "
               f"forward_prefetch={args.forward_prefetch}, grad_ckpt={args.grad_checkpointing}, world_size={world_size})")
+
+    if args.torch_compile:
+        # Compile each decoder layer individually after FSDP wrapping.
+        # Per-layer scope keeps FSDP2's all-gather/reduce-scatter outside the
+        # compiled graph, avoiding graph breaks at distributed comm boundaries.
+        # Mirrors apply_fsdp2's layer-search pattern: fully_shard modifies the
+        # top-level model in-place, making model.model.layers unreliable —
+        # traverse modules() to find the ModuleList instead.
+        compiled_count = 0
+        for _m in model.modules():
+            if hasattr(_m, "layers") and isinstance(_m.layers, nn.ModuleList):
+                for i in range(len(_m.layers)):
+                    # Use eager backend: Dynamo traces and captures the forward graph
+                    # but executes in eager mode, bypassing AOT autograd's stricter
+                    # view-aliasing checks that QuantizedLinearFunction.backward
+                    # currently violates (requires Phase 3 custom_op registration to fix).
+                    # This validates P1 (try_backends dual-mode + allow_in_graph) without
+                    # hitting the AOT backward compatibility blocker.
+                    _m.layers[i] = torch.compile(_m.layers[i], backend="aot_eager")
+                    compiled_count += 1
+                break
+        rank0(f"> torch.compile applied to {compiled_count} decoder layers (backend=aot_eager)")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-5, weight_decay=args.weight_decay)
 

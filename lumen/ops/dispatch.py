@@ -28,6 +28,18 @@ _BACKEND_WARMUP_CALLS = 3
 _IN_GRAPH_CAPTURE = False
 
 
+def _mark_allow_in_graph(cls):
+    """Register an autograd.Function with Dynamo so it is treated as an opaque
+    node rather than traced into, preventing graph breaks at Function boundaries.
+    No-op when torch._dynamo is unavailable (older PyTorch builds).
+    """
+    try:
+        from torch._dynamo import allow_in_graph
+        allow_in_graph(cls)
+    except ImportError:
+        pass
+
+
 def set_graph_capture_mode(active: bool):
     """Toggle graph-capture flag for dispatch safety."""
     global _IN_GRAPH_CAPTURE
@@ -502,7 +514,21 @@ def try_backends(
     ``torch.cuda.synchronize()`` is issued during warmup for error
     detection.  After warmup (or when ``LUMEN_SKIP_BACKEND_SYNC=1``),
     sync is skipped to reduce host-device round-trip overhead.
+
+    Under ``torch.compile``: Dynamo cannot trace ``try/except`` blocks or
+    ``cuda.synchronize()``.  When ``torch.compiler.is_compiling()`` is
+    True the fallback chain is bypassed entirely — the cached backend is
+    used if one has been locked in from eager warmup, otherwise
+    ``backends[0]`` is called directly.  Run at least
+    ``_BACKEND_WARMUP_CALLS`` eager steps before compiling so the cache
+    is warm and the correct backend is selected.
     """
+    # Compile-mode fast path: no try/except, no synchronize, no fallback.
+    if torch.compiler.is_compiling():
+        cached_idx = _backend_cache.get(op_name)
+        idx = cached_idx if (cached_idx is not None and cached_idx < len(backends)) else 0
+        return backends[idx][1](*args, **kwargs)
+
     _catchable = (RuntimeError, NotImplementedError, TypeError, ValueError, IndexError, KeyError)
     if _TritonCompilationError is not None:
         _catchable = _catchable + (_TritonCompilationError,)

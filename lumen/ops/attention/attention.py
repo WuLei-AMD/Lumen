@@ -30,6 +30,7 @@ if _is_aiter_available():
 _ck_jit_warned = False
 
 
+@torch.compiler.disable
 def _warn_ck_jit_if_needed():
     """Log a one-time warning if CK modules may require JIT compilation."""
     global _ck_jit_warned

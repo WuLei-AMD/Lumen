@@ -225,13 +225,7 @@ __all__ = ["QuantizedLinearFunction", "quantized_linear"]
 
 
 
-def _mark_allow_in_graph(cls):
-    try:
-        from torch._dynamo import allow_in_graph
-
-        allow_in_graph(cls)
-    except Exception:
-        pass
+from lumen.ops.dispatch import _mark_allow_in_graph  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

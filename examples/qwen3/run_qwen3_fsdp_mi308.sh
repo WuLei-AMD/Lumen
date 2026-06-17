@@ -96,6 +96,7 @@ docker run --rm --init \
     -e AITER_ATTN="${AITER_ATTN:-}" \
     -e LUMEN_NORM="${LUMEN_NORM:-}" \
     -e FUSE_ROPE="${FUSE_ROPE:-}" \
+    -e TORCH_COMPILE="${TORCH_COMPILE:-}" \
     "${IMAGE}" \
     bash -c '
 set -euo pipefail
@@ -111,6 +112,7 @@ EXTRA=""
 [[ -n "${AITER_ATTN}" ]] && EXTRA="${EXTRA} --aiter-attn"
 [[ -n "${LUMEN_NORM}" ]] && EXTRA="${EXTRA} --lumen-norm"
 [[ -n "${FUSE_ROPE}" ]] && EXTRA="${EXTRA} --fuse-rope"
+[[ -n "${TORCH_COMPILE}" ]] && EXTRA="${EXTRA} --torch-compile"
 torchrun --nproc_per_node=8 train_qwen3_fsdp_fp8_blockwise2d.py \
     --model-name-or-path /model-qwen3 \
     --train-data-path "/data/${TRAIN_FILE}" \

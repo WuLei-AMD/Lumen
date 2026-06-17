@@ -224,6 +224,7 @@ class _RoPEAutograd(torch.autograd.Function):
         return gx, None, None
 
 
+@torch.compiler.disable
 def apply_rotary_qk_autograd(q, k, cos, sin):
     """Autograd-aware fused RoPE for Q and K, HF-compatible signature.
 
