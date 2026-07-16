@@ -101,15 +101,16 @@ def fused_rmsnorm_fp8(
         fp8_dtype: Target FP8 dtype (e.g. ``torch.float8_e4m3fnuz``).
 
     Returns:
-        ``(fp8_out, bf16_norm_out, scale, rsigma)`` on success, or ``None``
-        if the kernel is unavailable.  ``rsigma`` has shape ``(M,)`` in
-        float32.
+        ``(fp8_out, bf16_norm_out, scale, rsigma, amax)`` on success, or
+        ``None`` if the kernel is unavailable.  ``rsigma`` has shape ``(M,)``
+        and ``amax`` shape ``(1,)`` in float32; ``amax`` is computed inside the
+        fused kernel (no separate amax scan).
     """
     fn = _get_fused_kernel()
     if fn is None:
         return None
     try:
-        fp8_out, bf16_out, _, _, rsigma = fn(
+        fp8_out, bf16_out, _, _, rsigma, amax = fn(
             x,
             norm_weight,
             eps,
@@ -117,8 +118,9 @@ def fused_rmsnorm_fp8(
             dtype_quant=fp8_dtype,
             output_unquantized_inp1=True,
             output_rsigma=True,
+            output_amax=True,
         )
-        return fp8_out, bf16_out, scale, rsigma
+        return fp8_out, bf16_out, scale, rsigma, amax
     except Exception:
         return None
 
@@ -239,16 +241,19 @@ def fused_norm_quant_for_linear(
     if result is None:
         return None, False
 
-    fp8_out, bf16_fused, scale, rsigma = result
+    fp8_out, bf16_fused, scale, rsigma, kernel_amax = result
 
     from lumen.quantize import _set_pre_quantized_activation
 
     _set_pre_quantized_activation(fp8_out, scale)
 
+    # Delayed scaling: prefer the precomputed amax; otherwise use the amax the
+    # fused kernel produced on the normalized output — avoids a separate
+    # _amax_abs scan kernel (matches TE's in-kernel amax).
     if precomputed_amax is not None:
         mgr.update_amax_value(act_tid, precomputed_amax)
     else:
-        mgr.update_amax(act_tid, x_2d)
+        mgr.update_amax_value(act_tid, kernel_amax.squeeze())
 
     bf16_norm_out = _FusedNQGNorm.apply(x_2d, norm_w, rsigma, bf16_fused)
 

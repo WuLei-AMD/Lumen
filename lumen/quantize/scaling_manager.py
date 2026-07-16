@@ -263,6 +263,21 @@ class ScalingManager:
         # 2 vectorized PyTorch ops.  Zero per-update overhead — all work is
         # deferred to a single lazy gather in _precompute_batch_scales().
         self._batch_enabled = bool(int(os.environ.get("LUMEN_BATCH_PRECOMPUTE_SCALES", "0")))
+        # Step-frozen batch scales (delayed + MAX-over-history). Computes ALL
+        # per-tensor scales ONCE per optimizer step from a frozen history
+        # snapshot (TE's amax_and_scale_update model), replacing ~N per-tensor
+        # ``stack().amax().compute_scale()`` launches with a single flat
+        # ``stack`` + ``amax(dim=1)``.  Invalidated only at the step boundary
+        # (optimizer post-step hook), NOT on every update_amax, so a step's
+        # reads all reuse the same frozen scales.
+        self._step_batch_enabled = bool(int(os.environ.get("LUMEN_STEP_BATCH_SCALES", "0")))
+        # Contiguous per-tensor amax ring buffers for the step-frozen path.
+        # Each tid owns a preallocated ``[history_len]`` row written in-place on
+        # ``update_amax`` (O(1) scalar copy), so the per-step MAX reduction is a
+        # single ``stack(rows).amax(dim=1)`` instead of ``N`` scattered
+        # ``stack(list(deque)).amax()`` launches (critical at history_len=1024).
+        self._ring_rows: Dict[str, torch.Tensor] = {}
+        self._ring_cursor: Dict[str, int] = {}
         self._batch_scale_fwd: Optional[torch.Tensor] = None
         self._batch_scale_bwd: Optional[torch.Tensor] = None
         self._batch_amax_buf: Optional[torch.Tensor] = None
@@ -337,6 +352,14 @@ class ScalingManager:
         if self.config.amax_algo == AmaxAlgo.MOST_RECENT:
             amax = history[-1].to(device="cuda")
         else:
+            if (
+                self._step_batch_enabled
+                and not (self.config.reduce_amax and self._dp_group is not None)
+            ):
+                self._precompute_batch_scales()
+                if self._batch_scales_valid and tensor_id in self._batch_tid_to_idx:
+                    idx = self._batch_tid_to_idx[tensor_id]
+                    return self._batch_scale_bwd[idx : idx + 1]
             amax = torch.stack(list(history)).amax().to(device="cuda")
         return self._compute_scale(amax, self._fp8_max_bwd)
 
@@ -361,17 +384,33 @@ class ScalingManager:
         N = len(self._batch_tid_to_idx)
         if N == 0:
             return
-        # Pre-allocate buffer once, reuse across steps
-        if self._batch_amax_buf is None:
-            device = self._batch_ordered_deques[0][-1].device
-            self._batch_amax_buf = torch.empty(
-                N, dtype=torch.float32, device=device,
-            )
-        # Scatter-copy latest amaxes into contiguous buffer (tight loop,
-        # no per-element dict lookup, no .float()/.reshape() when not needed)
-        buf = self._batch_amax_buf
-        for i, dq in enumerate(self._batch_ordered_deques):
-            buf[i] = dq[-1]
+        deques = self._batch_ordered_deques
+        if self.config.amax_algo == AmaxAlgo.MOST_RECENT:
+            # Pre-allocate buffer once, reuse across steps
+            if self._batch_amax_buf is None:
+                device = deques[0][-1].device
+                self._batch_amax_buf = torch.empty(
+                    N, dtype=torch.float32, device=device,
+                )
+            # Scatter-copy latest amaxes into contiguous buffer (tight loop,
+            # no per-element dict lookup, no .float()/.reshape() when not needed)
+            buf = self._batch_amax_buf
+            for i, dq in enumerate(deques):
+                buf[i] = dq[-1]
+        else:
+            # MAX-over-history: reduce every tensor's contiguous ring-buffer row
+            # in a single vectorized op.  Replaces ~N per-tensor
+            # ``stack(list(deque)).amax()`` launches (one Cat over history_len
+            # scalars + one reduce each) with a single ``stack`` of N rows +
+            # ``amax(dim=1)``.  Unfilled ring slots are 0, which is the identity
+            # for MAX over non-negative amaxes, so no masking is needed.
+            rows = self._ring_rows
+            if any(tid not in rows for tid in self._batch_tid_to_idx):
+                # A tensor has not been written to its ring yet (warmup): leave
+                # scales invalid so callers use the per-tensor slow path.
+                return
+            ordered = [rows[tid] for tid in self._batch_tid_to_idx]
+            buf = torch.stack(ordered).amax(dim=1)
         fwd_recip = 1.0 / (self._fp8_max / (2**self._margin))
         bwd_recip = 1.0 / (self._fp8_max_bwd / (2**self._margin))
         self._batch_scale_fwd = torch.where(
@@ -437,6 +476,21 @@ class ScalingManager:
                         return (scale, None) if return_amax else scale
                 amax = history[-1].to(device=tensor.device)
             else:
+                # Step-frozen batch fast path: one precompute per step covers
+                # all tensors' MAX-over-history scales; subsequent reads index
+                # the frozen buffer.  ``_precompute_batch_scales`` is called
+                # unconditionally (not guarded by map membership) so the
+                # tid→idx map bootstraps on the first read of the step.
+                if (
+                    self._step_batch_enabled
+                    and not (self.config.reduce_amax and self._dp_group is not None)
+                ):
+                    self._precompute_batch_scales()
+                    if self._batch_scales_valid and tensor_id in self._batch_tid_to_idx:
+                        idx = self._batch_tid_to_idx[tensor_id]
+                        buf = self._batch_scale_bwd if backward else self._batch_scale_fwd
+                        scale = buf[idx : idx + 1]
+                        return (scale, None) if return_amax else scale
                 amax = torch.stack(list(history)).amax().to(device=tensor.device)
 
             if self.config.reduce_amax and self._dp_group is not None:
@@ -475,15 +529,37 @@ class ScalingManager:
         """
         t = tensor.detach()
         if t.is_cuda and t.dim() >= 2:
-            self.amax_history[tensor_id].append(_get_fused_amax_abs()(t))
+            amax = _get_fused_amax_abs()(t)
         else:
-            self.amax_history[tensor_id].append(t.abs().amax())
-        self._batch_scales_valid = False
+            amax = t.abs().amax()
+        self.amax_history[tensor_id].append(amax)
+        # In step-frozen mode validity is controlled by the step boundary, not
+        # per-update, so a step's scales stay frozen while history accumulates.
+        if self._step_batch_enabled:
+            self._ring_append(tensor_id, amax)
+        else:
+            self._batch_scales_valid = False
 
     def update_amax_value(self, tensor_id: str, amax: torch.Tensor):
         """Record a pre-computed amax value, skipping the abs().amax() pass."""
-        self.amax_history[tensor_id].append(amax.detach().squeeze())
-        self._batch_scales_valid = False
+        amax = amax.detach().squeeze()
+        self.amax_history[tensor_id].append(amax)
+        if self._step_batch_enabled:
+            self._ring_append(tensor_id, amax)
+        else:
+            self._batch_scales_valid = False
+
+    def _ring_append(self, tensor_id: str, amax: torch.Tensor) -> None:
+        """Write *amax* into this tensor's contiguous ring buffer (in-place)."""
+        row = self._ring_rows.get(tensor_id)
+        if row is None:
+            row = torch.zeros(self.config.history_len, dtype=torch.float32,
+                              device=amax.device)
+            self._ring_rows[tensor_id] = row
+            self._ring_cursor[tensor_id] = 0
+        c = self._ring_cursor[tensor_id]
+        row[c] = amax
+        self._ring_cursor[tensor_id] = (c + 1) % self.config.history_len
 
     def quantize(self, tensor_id: str, tensor: torch.Tensor, *, backward: bool = False):
         """Quantize tensor. Returns :class:`~lumen.quantize.descriptor.FP8Descriptor` or ``None``.
@@ -652,11 +728,29 @@ class ScalingManager:
         master weights — no explicit call needed in the training loop.
         """
 
-        def _post_step(_opt, _args, _kwargs):
+        def _on_post_step():
             self.mark_fp8_params_stale()
+            # Step boundary: drop frozen batch scales so the next step's first
+            # get_scale recomputes them from the updated history snapshot.
+            if self._step_batch_enabled:
+                self._batch_scales_valid = False
 
-        optimizer.register_step_post_hook(_post_step)
-        logger.info("ScalingManager: registered FP8 optimizer post-step hook")
+        # torch.optim.Optimizer exposes register_step_post_hook, but Megatron's
+        # ChainedOptimizer / DistributedOptimizer do not — wrap ``step()`` in
+        # that case so the hook still fires exactly once per optimizer step.
+        if hasattr(optimizer, "register_step_post_hook"):
+            optimizer.register_step_post_hook(lambda _opt, _a, _k: _on_post_step())
+            logger.info("ScalingManager: registered FP8 optimizer post-step hook")
+        else:
+            _orig_step = optimizer.step
+
+            def _wrapped_step(*args, **kwargs):
+                result = _orig_step(*args, **kwargs)
+                _on_post_step()
+                return result
+
+            optimizer.step = _wrapped_step
+            logger.info("ScalingManager: wrapped optimizer.step() for FP8 staleness (no register_step_post_hook)")
         return self
 
     def enable_fp8_params(self, model: nn.Module) -> "ScalingManager":
@@ -892,10 +986,16 @@ class ScalingManager:
 
         if (
             _FUSED_QUANT_TRANSPOSE_CPP
+            and backward
             and _probe_hip_cast_transpose()
             and tensor.is_cuda
             and tensor.dim() == 2
         ):
+            # Only fuse cast+transpose on the backward grad quantization: there
+            # BOTH layouts are consumed (row-major for dgrad, transposed for
+            # wgrad), so producing both in one pass is a net win. Forward
+            # activation/weight quantization would waste the transpose (not used
+            # that step), so it falls through to the single-output fast path.
             from lumen.ops.quantize.cast_transpose_hip import cast_transpose_amax_fp8_hip
 
             tensor_2d = tensor.reshape(-1, tensor.shape[-1]).contiguous()
@@ -1101,7 +1201,16 @@ class ScalingManager:
             if not use_batch_scale:
                 amax = history[-1].to(device=tensor.device)
         else:
-            amax = torch.stack(list(history)).amax().to(device=tensor.device)
+            # Step-frozen batch fast path (MAX-over-history), bootstraps map.
+            if (
+                self._step_batch_enabled
+                and not (self.config.reduce_amax and self._dp_group is not None)
+            ):
+                self._precompute_batch_scales()
+                if self._batch_scales_valid and tensor_id in self._batch_tid_to_idx:
+                    use_batch_scale = True
+            if not use_batch_scale:
+                amax = torch.stack(list(history)).amax().to(device=tensor.device)
 
         if use_batch_scale:
             idx = self._batch_tid_to_idx[tensor_id]

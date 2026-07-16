@@ -1,0 +1,67 @@
+ARG BASE_IMAGE=rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1
+FROM ${BASE_IMAGE}
+
+WORKDIR /workspace
+
+# System build tools + mori build dependencies:
+#   cmake/ninja    — mori CMake build
+#   libopenmpi-dev — MPI (mori bootstrap)
+#   libibverbs-dev, rdma-core — RDMA verbs + mlx5 provider (mori transport)
+#   libpci-dev     — PCI topology detection
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git ninja-build cmake \
+        libopenmpi-dev libibverbs-dev rdma-core libpci-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy project source
+COPY . /workspace/Lumen
+
+# AITER (editable from third_party)
+# The COPYed source may carry pre-built JIT .so from the host (compiled for a
+# different Python, e.g. 3.10). They are incompatible with this image's 3.12,
+# so purge all JIT build artifacts first and let everything recompile for 3.12.
+# PREBUILD_KERNELS=1 pre-compiles CK attention forward+backward .so at
+# install time.  Without it, the first CK call triggers JIT compilation
+# which SIGSEGV's inside mp.spawn subprocesses (fork + HIP driver issue).
+RUN cd /workspace/Lumen/third_party/aiter && \
+    rm -f aiter/jit/*.so && rm -rf aiter/jit/build && \
+    PREBUILD_KERNELS=1 pip install -e .
+
+# mori — SDMA communication library (editable from third_party)
+# Submodule contents (spdlog, msgpack-c) are already vendored by the COPY above.
+# .git is excluded by .dockerignore, so skip `git submodule update` (no repo in
+# image) and give setuptools-scm a pretend version (it can't read git tags).
+RUN cd /workspace/Lumen/third_party/mori && \
+    pip install setuptools-scm && \
+    SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0 pip install -e . --no-build-isolation
+
+# torchao (quantization reference)
+RUN pip install torchao>=0.8
+
+# Megatron-LM-AMD (for Megatron backend)
+# Pre-cloned on the host to /workspace/Lumen/megatron_lm (already checked out at
+# the target commit, submodules populated) and brought in by the COPY above —
+# avoids a slow/stalling `git clone --recursive` during the build.
+RUN pip uninstall -y megatron-core
+RUN cd /workspace/Lumen/megatron_lm \
+    && pip install -e . -U --force-reinstall --no-deps --no-build-isolation \
+    && cd megatron/core/datasets && make
+
+ENV PYTHONPATH="/workspace/Lumen/megatron_lm:"
+ENV PYTHONPATH="/workspace/Lumen/third_party/mori:${PYTHONPATH:-}"
+ENV PYTHONPATH="/workspace/Lumen/third_party/aiter:${PYTHONPATH:-}"
+
+# Lumen + test dependencies
+RUN cd /workspace/Lumen && pip install -e ".[dev]"
+RUN pip install -r /workspace/Lumen/requirements.txt
+
+# Environment
+ENV PYTHONPATH="/workspace/Lumen:${PYTHONPATH}"
+ENV HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+ENV MORI_ENABLE_SDMA=1
+RUN python -c "import torch, pathlib; print(pathlib.Path(torch.__file__).parent / 'lib')" \
+        > /etc/ld.so.conf.d/torch.conf && ldconfig
+
+WORKDIR /workspace/Lumen
+
+CMD ["pytest", "tests/ops/", "-v", "--tb=short"]

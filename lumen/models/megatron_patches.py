@@ -1057,6 +1057,134 @@ def install_split_along_dim():
         pass
 
 
+# ── DistributedOptimizer _foreach_copy_ patch ────────────────────────────
+
+def install_optimizer_patches():
+    """Batch per-param copy loops in DistributedOptimizer with _foreach_copy_.
+
+    Replaces two methods that iterate over hundreds of BF16 params one by one:
+      _copy_model_grads_to_main_grads  : N BF16→FP32 grad copies → 1 batched call
+      _copy_main_params_to_model_params: N FP32→BF16 param copies → 1 batched call
+
+    FP32 param groups keep original per-param assignment (no allocation overhead).
+    Idempotent; safe to call multiple times.
+    """
+    try:
+        from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+    except ImportError:
+        return
+
+    if getattr(DistributedOptimizer, "_lumen_foreach_copy_patched", False):
+        return
+
+    import torch
+    from megatron.core.fp8_utils import is_float8tensor, quantize_param_shard
+
+    def _patched_copy_grads_to_main(self):
+        if self.is_stub_optimizer:
+            return
+        if self.ddp_config.use_megatron_fsdp:
+            return
+
+        # BF16 model params → FP32 main grads, batched with _foreach_copy_
+        def copy_float16_grads(model_groups, shard_main_groups):
+            bf16_srcs, fp32_dsts = [], []
+            for model_group, shard_main_group in zip(model_groups, shard_main_groups):
+                for model_param, shard_main_param in zip(model_group, shard_main_group):
+                    param_range_map = self._get_model_param_range_map(model_param)
+                    param_range = param_range_map["param"]
+                    assert param_range.size == shard_main_param.nelement()
+                    shard_model_grad = model_param.main_grad.view(-1)[
+                        param_range.start: param_range.end
+                    ]
+                    if (
+                        shard_main_param.grad is None
+                        or shard_main_param.grad.shape != shard_model_grad.shape
+                        or shard_main_param.grad.dtype != torch.float32
+                    ):
+                        shard_main_param.grad = torch.empty(
+                            shard_model_grad.shape,
+                            dtype=torch.float32,
+                            device=shard_model_grad.device,
+                        )
+                    bf16_srcs.append(shard_model_grad)
+                    fp32_dsts.append(shard_main_param.grad)
+            if bf16_srcs:
+                torch._foreach_copy_(fp32_dsts, bf16_srcs)
+
+        # FP32 model params → FP32 main grads, original per-param assignment
+        def copy_fp32_grads(model_groups, shard_main_groups):
+            for model_group, shard_main_group in zip(model_groups, shard_main_groups):
+                for model_param, shard_main_param in zip(model_group, shard_main_group):
+                    param_range_map = self._get_model_param_range_map(model_param)
+                    param_range = param_range_map["param"]
+                    assert param_range.size == shard_main_param.nelement()
+                    shard_model_grad = model_param.main_grad.view(-1)[
+                        param_range.start: param_range.end
+                    ]
+                    shard_main_param.grad = shard_model_grad.float()
+
+        # Precision-aware optimizer uses decoupled_grad instead of grad
+        def copy_decoupled_grads(model_groups, shard_main_groups):
+            for model_group, shard_main_group in zip(model_groups, shard_main_groups):
+                for model_param, shard_main_param in zip(model_group, shard_main_group):
+                    param_range_map = self._get_model_param_range_map(model_param)
+                    param_range = param_range_map["param"]
+                    assert param_range.size == shard_main_param.nelement()
+                    shard_model_grad = model_param.main_grad.view(-1)[
+                        param_range.start: param_range.end
+                    ]
+                    shard_main_param.decoupled_grad = shard_model_grad
+
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            copy_decoupled_grads(self.model_float16_groups, self.shard_float16_groups)
+            copy_decoupled_grads(self.model_fp32_groups, self.shard_fp32_groups)
+        else:
+            copy_float16_grads(self.model_float16_groups, self.shard_fp32_from_float16_groups)
+            copy_fp32_grads(self.model_fp32_groups, self.shard_fp32_groups)
+
+    def _patched_copy_main_to_model(self):
+        if self.is_stub_optimizer:
+            return
+        if self.ddp_config.use_megatron_fsdp:
+            for model_chunk in self.model_chunks:
+                model_chunk.param_and_grad_buffer.copy_main_weights_to_model_weights()
+            return
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            return
+
+        quantize_param_shard(
+            *self._get_fp8_params_and_shard_fp32_from_fp8(), self.data_parallel_group
+        )
+
+        # FP32 main params → BF16 model buffers, batched with _foreach_copy_
+        def copy_group_params(shard_main_groups, model_groups):
+            fp32_srcs, model_dsts = [], []
+            for shard_main_group, model_group in zip(shard_main_groups, model_groups):
+                for shard_main_param, model_param in zip(shard_main_group, model_group):
+                    if is_float8tensor(model_param):
+                        continue
+                    param_range_map = self._get_model_param_range_map(model_param)
+                    world_range = param_range_map["gbuf_world_in_bucket"]
+                    assert world_range.size == shard_main_param.nelement()
+                    gbuf_index, _, bucket_id = self.model_param_gbuf_map[model_param]
+                    model_param_buffer = self.buffers[gbuf_index].buckets[bucket_id].param_data
+                    shard_model_param = model_param_buffer.view(-1)[
+                        world_range.start: world_range.end
+                    ]
+                    fp32_srcs.append(shard_main_param)
+                    model_dsts.append(shard_model_param)
+            if fp32_srcs:
+                torch._foreach_copy_(model_dsts, fp32_srcs)
+
+        copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
+        copy_group_params(self.shard_fp32_groups, self.model_fp32_groups)
+
+    DistributedOptimizer._copy_model_grads_to_main_grads = _patched_copy_grads_to_main
+    DistributedOptimizer._copy_main_params_to_model_params = _patched_copy_main_to_model
+    DistributedOptimizer._lumen_foreach_copy_patched = True
+
+
 # ── Public API ──────────────────────────────────────────────────────────────
 
 def install_all():
@@ -1077,6 +1205,7 @@ def install_all():
     install_eval_recompute()
     install_post_eval_cache_clear()
     install_fused_residual_norm()
+    install_optimizer_patches()
     # install_split_along_dim()  # disabled — adds forward overhead
 
     # SDMA DP gradient all-reduce (replaces NCCL when --use-sdma is set)

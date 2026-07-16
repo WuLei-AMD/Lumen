@@ -1,9 +1,9 @@
 .git/
 .github/
-third_party/aiter/csrc/ck_gemm*/
-third_party/aiter/csrc/ck_batched*/
-third_party/aiter/csrc/py_itfs_cu/
-third_party/aiter/csrc/hsa/
+# NOTE: aiter csrc/{ck_gemm*,ck_batched*,py_itfs_cu,hsa} must NOT be excluded when
+# building aiter from source (Dockerfile.rocm72). py_itfs_cu holds asm_mha_fwd.cu /
+# asm_mha_bwd.cu which DEFINE fmha_v3_fwd/bwd; excluding them yields a JIT .so with
+# an undefined `aiter::torch_itfs::fmha_v3_fwd` symbol. Total ~1.5MB, safe to keep.
 third_party/aiter/aiter/jit/build/
 third_party/aiter/op_tests/
 third_party/aiter/benchmarks/
