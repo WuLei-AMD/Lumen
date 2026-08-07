@@ -83,16 +83,19 @@ def build_shapes(pairs, min_m=1, max_m=1024, include_static=False):
     return sorted(set(shapes))
 
 
-def _load_existing(path):
+def _load_existing(path, target_cu=None):
     if not path.is_file():
         return set()
     with path.open() as f:
         rows = csv.DictReader(f)
-        return {
-            (int(r["M"]), int(r["N"]), int(r["K"]))
-            for r in rows
-            if r.get("gfx", "gfx942") == "gfx942"
-        }
+        out = set()
+        for r in rows:
+            if r.get("gfx", "gfx942") != "gfx942":
+                continue
+            if target_cu is not None and str(r.get("cu_num")) != str(target_cu):
+                continue
+            out.add((int(r["M"]), int(r["N"]), int(r["K"])))
+        return out
 
 
 def main():
@@ -113,7 +116,13 @@ def main():
     parser.add_argument(
         "--include-existing",
         action="store_true",
-        help="skip shapes already present in --existing CSV",
+        help="skip shapes already present in --existing CSV (optionally scoped by --target-cu)",
+    )
+    parser.add_argument(
+        "--target-cu",
+        type=int,
+        default=None,
+        help="with --include-existing, only skip shapes tuned for this cu_num (80 or 304)",
     )
     parser.add_argument("--min-m", type=int, default=None)
     parser.add_argument("--max-m", type=int, default=None)
@@ -143,7 +152,7 @@ def main():
         include_static=args.include_static,
     )
     if args.include_existing:
-        have = _load_existing(args.existing)
+        have = _load_existing(args.existing, target_cu=args.target_cu)
         shapes = [s for s in shapes if s not in have]
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

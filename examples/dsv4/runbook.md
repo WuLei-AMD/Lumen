@@ -17,9 +17,9 @@
 
 **Worker 上还需**：`${LUMEN_DIR}`、`${TILEKERNELS_DIR}` 与 head 同步。
 
-### 1.1 本地 checkpoint（推荐）
+### 1.1 本地 checkpoint（推荐，默认 launch 示例）
 
-Head/worker 可使用不同宿主机 ckpt 路径（各自 NVMe），通过 launch 变量指定：
+Head/worker 使用各自 NVMe 上的 ckpt（**不要**用 NFS 加载 532GB dist ckpt，否则 init 极慢）：
 
 | 节点 | launch 变量 | 示例 |
 |------|-------------|------|
@@ -36,11 +36,13 @@ Head/worker 可使用不同宿主机 ckpt 路径（各自 NVMe），通过 launc
 
 | 用途 | 宿主机路径 | 容器内路径 |
 |------|-----------|-----------|
-| 模型目录 | `${MODEL_DIR}` | `/root/models` |
+| 模型目录（**默认推荐本地 NVMe**） | head: `/data1/${USER}/models`<br>worker: `/mnt/nvme0n1/${USER}/models` | `/root/models` |
 | 数据集 | `${DATA_DIR}` | `/root/datasets` |
 | 日志 | `${LOG_DIR}` | — |
 | Lumen 代码 | `${LUMEN_DIR}` | `/workspace/Lumen` |
-| **共享 rollout（双节点）** | `${DATA_ROOT}/models/fake_rollout.pt` | 同路径（`DATA_ROOT` bind-mount） |
+| **共享 rollout（双节点，NFS）** | `${DATA_ROOT}/models/fake_rollout.pt` | 同路径（`DATA_ROOT` bind-mount） |
+
+`${MODEL_DIR}` 未显式设置时 `dsv4_paths.sh` 会落到 `${DATA_ROOT}/models`（NFS）——仅适合小模型或已有 ckpt；**43L flash finetune 请始终指定本地 `MODEL_DIR` / `WORKER_MODEL_DIR`**。
 
 ### 2.1 预训练 checkpoint（finetune **加载**）
 
@@ -116,7 +118,8 @@ cd "${LUMEN_DIR}"
 MASTER_ADDR=<head-ip> WORKER_SSH=${USER}@<worker-ip> \
 MODEL_DIR=/data1/${USER}/models \
 WORKER_MODEL_DIR=/mnt/nvme0n1/${USER}/models \
-SKIP_PREPARE=1 GBS=256 NUM_ROLLOUT=10 DSV4_HC_MULT=4 \
+DATA_ROOT=/nfs/data/${USER} \
+SKIP_PREPARE=1 DSV4_HC_MULT=4 \
 V4_INDEXER_IMPL=aiter V4_SPARSE_MLA_BACKEND=triton MHC_BACKEND=triton \
 OPTIMIZER_OFFLOAD_FRACTION=0.75 \
 NCCL_IB_GDR_LEVEL=0 NCCL_NET_GDR_LEVEL=LOC MEGATRON_NO_BATCH_P2P_COMM=1 \
@@ -125,12 +128,14 @@ IMAGE=lumen/dsv4-lumen:mi308x \
 bash examples/dsv4/launch_dsv4_2node.sh
 ```
 
-Smoke（小 batch，2 step）：
+默认 finetune batch：**`GBS=256`**、**`SEQ_LEN=4096`**、**`NUM_ROLLOUT=10`**（`launch_dsv4_2node.sh` / `dsv4_finetune_common.sh`）。
+
+**可选 bisect smoke**（连通性/PP 调试，非默认生产配置）：
 
 ```bash
 GBS=8 DSV4_KEEP_GBS=1 SEQ_LEN=512 DSV4_KEEP_SEQ_LEN=1 NUM_ROLLOUT=2 \
 ROLLOUT_N_PROMPTS=1 ROLLOUT_N_PER_PROMPT=8 SMOKE_LEGACY_FAKE_ROLLOUT=1 \
-# …其余 env 同上…
+# …其余 env 同上（含 MODEL_DIR / WORKER_MODEL_DIR）…
 bash examples/dsv4/launch_dsv4_2node.sh
 ```
 
@@ -138,11 +143,15 @@ bash examples/dsv4/launch_dsv4_2node.sh
 
 | 变量 | 默认/推荐 | 说明 |
 |------|----------|------|
-| `GBS` | `256` | 必须等于 rollout 样本数 |
+| `GBS` | **`256`** | 必须等于 rollout 样本数（32×8） |
+| `SEQ_LEN` | **`4096`** | Megatron 训练序列长度 |
+| `MBS` | `1` | micro-batch |
 | `NUM_ROLLOUT` | `10` | GRPO rollout / train iters |
 | `DSV4_HC_MULT` | `4` | MHC 乘数 |
 | `SKIP_PREPARE` | `1`（launch） | 跳过 HF→torch_dist 转换 |
-| `WORKER_MODEL_DIR` | 同 `MODEL_DIR` | worker 专用 ckpt 宿主机路径 |
+| `MODEL_DIR` | **`/data1/${USER}/models`（head）** | 本地 NVMe ckpt；勿用 NFS 加载全模型 |
+| `WORKER_MODEL_DIR` | **`/mnt/nvme0n1/${USER}/models`** | worker 本地 ckpt |
+| `DATA_ROOT` | `/nfs/data/${USER}` | 共享 rollout 路径 |
 | `V4_INDEXER_IMPL` | `aiter` | DSA indexer（aiter triton kernel） |
 | `V4_SPARSE_MLA_BACKEND` | `triton` | sparse MLA |
 | `MHC_BACKEND` | `triton` | 需挂载 TileKernels |
@@ -160,7 +169,7 @@ Head：
 cd "${LUMEN_DIR}"
 NODE_RANK=0 MASTER_ADDR=<head-ip> \
 MODEL_DIR=/data1/${USER}/models \
-SKIP_PREPARE=1 GBS=256 NUM_ROLLOUT=10 DSV4_HC_MULT=4 \
+SKIP_PREPARE=1 DSV4_HC_MULT=4 \
 V4_INDEXER_IMPL=aiter V4_SPARSE_MLA_BACKEND=triton MHC_BACKEND=triton \
 OPTIMIZER_OFFLOAD_FRACTION=0.75 \
 NCCL_IB_GDR_LEVEL=0 NCCL_NET_GDR_LEVEL=LOC MEGATRON_NO_BATCH_P2P_COMM=1 \
@@ -212,6 +221,7 @@ docker ps --filter name=lumen-dsv4-flash-finetune
 
 | 现象 | 原因 / 处理 |
 |------|------------|
+| Checkpoint 加载极慢 | 确认 `MODEL_DIR` / `WORKER_MODEL_DIR` 指向本地 NVMe，而非 `${DATA_ROOT}/models`（NFS） |
 | `TRAIN_ITERS: unbound variable` | 使用最新 `preflight_dsv4_flash_multinode.sh` |
 | rollout 数据缺失 | 确认双节点 `FAKE_ROLLOUT_DATA=${DATA_ROOT}/models/fake_rollout.pt`；或 `SMOKE_LEGACY_FAKE_ROLLOUT=1` |
 | worker rank OOM | worker GPU 被其他进程占用；`rocm-smi --showpids` 确认并释放 |

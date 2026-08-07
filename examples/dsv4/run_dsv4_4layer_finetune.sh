@@ -33,11 +33,16 @@ DATA_DIR="${DATA_DIR:-${DATA_ROOT}/datasets}"
 
 V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND:-triton}"
 MHC_BACKEND="${MHC_BACKEND:-triton}"
-V4_INDEXER_IMPL="${V4_INDEXER_IMPL:-tilelang}"
+V4_INDEXER_IMPL="${V4_INDEXER_IMPL:-aiter}"
 V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N:-64}"
 V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES:-1}"
 SKIP_PREPARE="${SKIP_PREPARE:-0}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-10}"
+GBS="${GBS:-256}"
+
+# shellcheck source=examples/dsv4/dsv4_finetune_common.sh
+source "${SCRIPT_DIR}/dsv4_finetune_common.sh"
+dsv4_apply_finetune_batch_defaults
 
 USE_BOOTSTRAP=0
 BOOTSTRAP_MOUNT="${BOOTSTRAP_DIR}"
@@ -76,6 +81,7 @@ echo "  Mode      : native torchrun GRPO (debug-train-only)"
 echo "  Logs      : Miles format rollout/step/perf per GRPO step"
 echo "  Spec      : lumen.models.dsv4.megatron.spec get_dsv4_spec"
 echo "  Rollouts  : ${NUM_ROLLOUT}"
+echo "  Batch     : GBS=${GBS} MBS=${MBS} seq_len=${SEQ_LEN}"
 echo "  HC mult   : ${DSV4_HC_MULT} (MHC_BACKEND=${MHC_BACKEND})"
 echo "  SparseMLA : ${V4_SPARSE_MLA_BACKEND}"
 dsv4_print_gemm_env
@@ -111,7 +117,9 @@ DOCKER_ENV=(
     -e DSV4_HC_MULT="${DSV4_HC_MULT}"
     -e SKIP_PREPARE="${SKIP_PREPARE}"
     -e NUM_ROLLOUT="${NUM_ROLLOUT}"
-    -e GBS="${GBS:-256}"
+    -e GBS="${GBS}"
+    -e MBS="${MBS}"
+    -e SEQ_LEN="${SEQ_LEN}"
 )
 dsv4_docker_append_kernel_env
 dsv4_docker_append_gemm_env

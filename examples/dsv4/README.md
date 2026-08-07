@@ -15,6 +15,16 @@
 
 加载预训练 checkpoint → **GRPO policy loss** 更新几乎全部权重（MoE router gate / e-score bias 冻结）。默认 `DEBUG_TRAIN_ONLY=1`（预生成 `fake_rollout.pt`，无 SGLang / Ray）。
 
+**Finetune 默认 batch**（4-layer 与 flash 相同，由 `dsv4_finetune_common.sh` 设置）：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `GBS` | `256` | 须等于 rollout 样本数（32 prompts × 8） |
+| `SEQ_LEN` | `4096` | Megatron `--seq-length` |
+| `MBS` | `1` | micro-batch |
+
+Pretrain-only 脚本（`run_dsv4_*pretrain*`）仍默认 `GBS=8`、`SEQ_LEN=2048`，与 finetune 不同。
+
 ---
 
 ## 前置条件
@@ -72,7 +82,7 @@ bash examples/dsv4/build_dsv4_lumen_image.sh
 # 首次：自动 prepare checkpoint + GSM8K + fake rollout
 bash examples/dsv4/run_dsv4.sh
 
-# 已有 checkpoint
+# 已有 checkpoint + rollout
 SKIP_PREPARE=1 DSV4_HC_MULT=4 bash examples/dsv4/run_dsv4.sh
 ```
 
@@ -90,20 +100,24 @@ SKIP_PREPARE=1 DSV4_HC_MULT=4 bash examples/dsv4/run_dsv4.sh
 
 ```bash
 MASTER_ADDR=<head-ip> WORKER_SSH=${USER}@<worker-host> \
-SKIP_PREPARE=1 GBS=256 NUM_ROLLOUT=10 DSV4_HC_MULT=4 \
+MODEL_DIR=/data1/${USER}/models \
+WORKER_MODEL_DIR=/mnt/nvme0n1/${USER}/models \
+SKIP_PREPARE=1 DSV4_HC_MULT=4 \
   bash examples/dsv4/launch_dsv4_2node.sh
 ```
+
+默认 `GBS=256`、`SEQ_LEN=4096`、`NUM_ROLLOUT=10`（见 launch 脚本）。checkpoint 建议放各节点本地 NVMe（上表 `MODEL_DIR` / `WORKER_MODEL_DIR`），rollout 仍用 NFS `${DATA_ROOT}/models/fake_rollout.pt`。
 
 **手动两节点**
 
 ```bash
 # head
-NODE_RANK=0 MASTER_ADDR=<head-ip> SKIP_PREPARE=1 GBS=256 NUM_ROLLOUT=10 \
-  DSV4_PROFILE=flash bash examples/dsv4/run_dsv4.sh
+NODE_RANK=0 MASTER_ADDR=<head-ip> MODEL_DIR=/data1/${USER}/models \
+  SKIP_PREPARE=1 DSV4_HC_MULT=4 DSV4_PROFILE=flash bash examples/dsv4/run_dsv4.sh
 
 # worker（head preflight 通过后再启动）
-NODE_RANK=1 MASTER_ADDR=<head-ip> SKIP_PREPARE=1 GBS=256 NUM_ROLLOUT=10 \
-  DSV4_PROFILE=flash bash examples/dsv4/run_dsv4.sh
+NODE_RANK=1 MASTER_ADDR=<head-ip> MODEL_DIR=/mnt/nvme0n1/${USER}/models \
+  SKIP_PREPARE=1 DSV4_HC_MULT=4 DSV4_PROFILE=flash bash examples/dsv4/run_dsv4.sh
 ```
 
 日志：`${LOG_DIR}/lumen_dsv4_flash_finetune_node{0,1}_*.log`
@@ -117,6 +131,8 @@ NODE_RANK=1 MASTER_ADDR=<head-ip> SKIP_PREPARE=1 GBS=256 NUM_ROLLOUT=10 \
 | `DSV4_PROFILE` | `4layer` | `4layer` 或 `flash` |
 | `NUM_ROLLOUT` | `10` | GRPO 训练步数 |
 | `GBS` | `256` | 须等于 rollout 样本数 |
+| `SEQ_LEN` | `4096` | 训练序列长度（finetune） |
+| `MBS` | `1` | micro-batch |
 | `DSV4_HC_MULT` | `4`（4layer）/ `4`（flash） | 须与 checkpoint 目录 `_torch_dist_hc{N}` 一致 |
 | `SKIP_PREPARE` | `0` | `1` = 跳过 HF→torch_dist |
 | `DEBUG_TRAIN_ONLY` | `1` | 必须为 1（无 SGLang live rollout） |
