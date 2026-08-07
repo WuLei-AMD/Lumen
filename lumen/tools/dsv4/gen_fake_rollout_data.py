@@ -231,7 +231,7 @@ def prepare(
     model_name = model_name or os.environ.get("MODEL_NAME", "DeepSeek-V4-Flash-FP8-4layer")
     data_dir = data_dir or os.environ.get("DATA_DIR", "/root/datasets")
 
-    from dsv4_datasets import ensure_gsm8k  # noqa: WPS433
+    from lumen.tools.dsv4.dsv4_datasets import ensure_gsm8k  # noqa: WPS433
 
     n_prompts = int(os.environ.get("ROLLOUT_N_PROMPTS", "32"))
     n_per_prompt = int(os.environ.get("ROLLOUT_N_PER_PROMPT", "8"))

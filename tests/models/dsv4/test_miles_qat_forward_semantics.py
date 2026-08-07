@@ -5,10 +5,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).parents[3]
 ATTENTION = REPO_ROOT / "lumen/models/dsv4/megatron/deepseek_v4.py"
-COMPRESSOR = REPO_ROOT / "lumen/models/dsv4/ops/compressor.py"
+COMPRESSOR = REPO_ROOT / "lumen/models/dsv4/compressor.py"
 INDEXER = REPO_ROOT / "lumen/models/dsv4/megatron/v4_indexer.py"
 QAT = REPO_ROOT / "lumen/ops/dsv4/qat.py"
-HYPER_CONNECTION = REPO_ROOT / "lumen/models/dsv4/ops/hyper_connection.py"
+HYPER_CONNECTION = REPO_ROOT / "lumen/models/dsv4/hyper_connection.py"
 
 
 def _call_block_sizes(path: Path, function_name: str) -> list[int]:

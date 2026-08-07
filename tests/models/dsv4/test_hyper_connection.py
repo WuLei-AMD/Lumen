@@ -11,7 +11,7 @@ import pytest
 import torch
 
 HYPER_CONNECTION_PATH = (
-    Path(__file__).parents[3] / "lumen/models/dsv4/ops/hyper_connection.py"
+    Path(__file__).parents[3] / "lumen/models/dsv4/hyper_connection.py"
 )
 
 
@@ -63,18 +63,18 @@ def _load_hyper_connection(monkeypatch, calls):
         sys.modules, "megatron.core.transformer.transformer_config", config_mod
     )
 
-    legacy_backend = types.ModuleType("lumen.models.dsv4.ops.mhc_backend")
+    legacy_backend = types.ModuleType("lumen.models.dsv4.mhc_backend")
 
     def get_mhc_op(_name):
         raise AssertionError("legacy MHC backend was invoked")
 
     legacy_backend.get_mhc_op = get_mhc_op
-    for name in ("lumen", "lumen.models", "lumen.models.dsv4", "lumen.models.dsv4.ops"):
+    for name in ("lumen", "lumen.models", "lumen.models.dsv4"):
         package = types.ModuleType(name)
         package.__path__ = []
         monkeypatch.setitem(sys.modules, name, package)
     monkeypatch.setitem(
-        sys.modules, "lumen.models.dsv4.ops.mhc_backend", legacy_backend
+        sys.modules, "lumen.models.dsv4.mhc_backend", legacy_backend
     )
 
     module_name = "_test_dsv4_hyper_connection"
@@ -187,7 +187,7 @@ def test_lumen_hc_chain_matches_direct_aiter_outputs_and_gradients():
         mhc_pre_dsv4,
     )
 
-    from lumen.models.dsv4.ops.hyper_connection import (
+    from lumen.models.dsv4.hyper_connection import (
         DeepSeekV4HyperConnectionUtil,
     )
 

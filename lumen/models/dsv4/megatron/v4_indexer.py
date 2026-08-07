@@ -9,7 +9,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 from lumen.models.dsv4.megatron.layers import LumenDuplicatedLinear
-from lumen.models.dsv4.ops.compressor import DeepSeekV4Compressor
+from lumen.models.dsv4.compressor import DeepSeekV4Compressor
 from lumen.ops.dsv4 import (
     all_gather_cp,
     apply_rotary_emb,

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Inner container entry for run_dsv4.sh — native torchrun GRPO finetune.
+# Inner container entry for dsv4_launch.sh — native torchrun GRPO finetune.
 set -euo pipefail
 
 cd /workspace/Lumen

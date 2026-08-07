@@ -34,7 +34,7 @@ from lumen.models.dsv4.megatron.layers import (
 from lumen.models.dsv4.megatron.moe_mori import mori_ep_enabled, patch_megatron_moe_mori
 from lumen.models.dsv4.megatron.spec_provider import LumenDSV4SpecProvider
 from lumen.models.dsv4.megatron.v4_indexer import V4Indexer
-from lumen.models.dsv4.ops.compressor import DeepSeekV4Compressor
+from lumen.models.dsv4.compressor import DeepSeekV4Compressor
 from lumen.ops.dsv4 import (
     all_gather_cp,
     apply_rotary_emb,

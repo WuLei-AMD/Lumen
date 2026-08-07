@@ -1,9 +1,27 @@
 #!/usr/bin/env bash
-# Shared Docker/bootstrap helpers for run_dsv4.sh (source, do not execute).
+# Shared Docker/bootstrap helpers for examples/dsv4/dsv4_launch.sh (source, do not execute).
+
+dsv4_docker_detect_miles_image() {
+    USE_MILES_IMAGE=0
+    if [[ "${IMAGE}" == miles-dsv4-mi300x* || "${IMAGE}" == rlsys/miles* ]]; then
+        USE_MILES_IMAGE=1
+    fi
+}
+
+dsv4_docker_prepare_host() {
+    dsv4_docker_detect_miles_image
+    dsv4_docker_bootstrap_setup
+    dsv4_docker_ensure_image
+    dsv4_docker_check_rocm
+    dsv4_docker_mkdirs
+}
 
 dsv4_docker_bootstrap_setup() {
     USE_BOOTSTRAP=0
     BOOTSTRAP_MOUNT="${BOOTSTRAP_DIR}"
+    if [[ "${USE_MILES_IMAGE:-0}" -eq 1 ]]; then
+        return 0
+    fi
     if [[ "${IMAGE}" == "lumen/tests:latest" || "${IMAGE}" == "lumen/dsv4-lumen:mi308x" ]]; then
         USE_BOOTSTRAP=1
         if [[ "${IMAGE}" == "lumen/dsv4-lumen:mi308x" ]]; then
@@ -213,6 +231,19 @@ dsv4_docker_run_opts_multinode() {
         --security-opt seccomp=unconfined
         --ulimit memlock=-1
         --ulimit nofile=65536:524288
-        --group-add render
     )
+    if [[ "${USE_MILES_IMAGE:-0}" -eq 1 ]]; then
+        DOCKER_RUN+=(--privileged)
+    else
+        DOCKER_RUN+=(--group-add render)
+    fi
+}
+
+dsv4_docker_append_miles_ray_env() {
+    if [[ "${USE_MILES_IMAGE:-0}" -eq 1 ]]; then
+        DOCKER_ENV+=(
+            -e RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1
+            -e RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
+        )
+    fi
 }

@@ -4,7 +4,7 @@
 # Ensures head and worker use identical torchrun args before any rank enters
 # Megatron (avoids NCCL hang from GBS / rollout path mismatch across nodes).
 #
-# Called from run_dsv4.sh when DSV4_PROFILE=flash and NNODES > 1.
+# Called from dsv4_launch.sh when DSV4_PROFILE=flash and NNODES > 1.
 # Set SKIP_PREFLIGHT=1 to bypass (not recommended).
 
 preflight_dsv4_multinode() {

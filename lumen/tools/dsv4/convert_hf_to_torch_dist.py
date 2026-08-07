@@ -18,18 +18,16 @@ from megatron.training.training import get_model
 from mbridge import AutoBridge
 
 TOOLS_DIR = Path(__file__).resolve().parent
-LUMEN_DIR = TOOLS_DIR.parent.parent.parent
-if str(LUMEN_DIR) not in sys.path:
-    sys.path.insert(0, str(LUMEN_DIR))
-if str(TOOLS_DIR) not in sys.path:
-    sys.path.insert(0, str(TOOLS_DIR))
+REPO_ROOT = TOOLS_DIR.parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 MEGATRON_PATH = os.environ.get("MEGATRON_PATH")
 if MEGATRON_PATH and MEGATRON_PATH not in sys.path:
     sys.path.insert(0, MEGATRON_PATH)
 
-import lumen_mbridge  # noqa: F401,E402 — register DeepseekV4Bridge
-from megatron_convert import (  # noqa: E402
+from lumen.tools.dsv4 import lumen_mbridge  # noqa: F401,E402 — register DeepseekV4Bridge
+from lumen.tools.dsv4.megatron_convert import (  # noqa: E402
     get_convert_model_provider,
     init_megatron_for_convert,
     set_default_megatron_args,

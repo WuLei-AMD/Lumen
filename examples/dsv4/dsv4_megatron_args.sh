@@ -34,8 +34,15 @@ elif [[ "${DSV4_PROFILE}" == "flash" ]]; then
     MBS="${MBS:-1}"
     SEQ_LEN="${SEQ_LEN:-2048}"
     MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-1024}"
-    # shellcheck source=examples/dsv4/dsv4_flash_mi300x_parallel.sh
-    source "$(dirname "${BASH_SOURCE[0]}")/dsv4_flash_mi300x_parallel.sh"
+    NNODES="${NNODES:-2}"
+    NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+    TP="${TP:-4}"
+    PP="${PP:-4}"
+    CP="${CP:-1}"
+    EP="${EP:-4}"
+    ETP="${ETP:-1}"
+    DECODER_FIRST_PP_LAYERS="${DECODER_FIRST_PP_LAYERS:-11}"
+    DECODER_LAST_PP_LAYERS="${DECODER_LAST_PP_LAYERS:-10}"
 else
     echo "[dsv4_megatron_args] ERROR: unknown DSV4_PROFILE=${DSV4_PROFILE} (expected 4layer or flash)" >&2
     exit 1
@@ -104,3 +111,10 @@ DSV4_MODEL_ARGS=(
     --no-bias-swiglu-fusion
     --no-activation-func-clamp-shared-expert
 )
+
+# Converted torch_dist ckpt (Miles convert) omits router expert_bias shards.
+# Opt-in only: set DSV4_ENABLE_EXPERT_BIAS=1 when ckpt includes expert_bias.
+DSV4_ENABLE_EXPERT_BIAS="${DSV4_ENABLE_EXPERT_BIAS:-0}"
+if [[ "${DSV4_ENABLE_EXPERT_BIAS}" == "1" ]]; then
+    DSV4_MODEL_ARGS+=(--moe-router-enable-expert-bias)
+fi

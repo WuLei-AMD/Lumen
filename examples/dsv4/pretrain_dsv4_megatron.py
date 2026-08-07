@@ -2,7 +2,7 @@
 
 Uses ``megatron.training.pretrain`` with ``--spec lumen.models.dsv4.megatron.spec get_dsv4_spec``.
 
-Launched by ``run_dsv4_4layer_pretrain_inner.sh`` or ``run_dsv4_flash_pretrain_inner.sh``.
+Launched by ``run_dsv4_pretrain_inner.sh``.
 """
 
 from __future__ import annotations
@@ -37,6 +37,10 @@ from lumen.models.dsv4.megatron.pretrain import (  # noqa: E402
 )
 
 install_dsv4_safe_mock_data()
+
+from dsv4_profiler import install_dsv4_profiler  # noqa: E402
+
+install_dsv4_profiler()
 
 
 def _build_model_provider():

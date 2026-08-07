@@ -45,4 +45,4 @@ docker build -f "${LUMEN_DIR}/examples/dsv4/Dockerfile" \
     "${LUMEN_DIR}"
 
 echo "==> Done: ${IMAGE}"
-echo "Run: SKIP_PREPARE=1 GBS=256 NUM_ROLLOUT=10 IMAGE=${IMAGE} bash examples/dsv4/run_dsv4.sh"
+echo "Run: SKIP_PREPARE=1 GBS=256 NUM_ROLLOUT=10 IMAGE=${IMAGE} bash examples/dsv4/dsv4_launch.sh"

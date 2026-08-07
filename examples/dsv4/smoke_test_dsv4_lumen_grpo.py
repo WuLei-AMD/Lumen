@@ -126,14 +126,14 @@ def _prepare_checkpoint(args: ScriptArgs) -> None:
         print("[finetune] SKIP_PREPARE=1 — skipping checkpoint prep")
         return
     sys.path.insert(0, str(LUMEN_DIR / "examples" / "dsv4"))
-    from prepare_dsv4_4layer_checkpoint import prepare as lumen_prepare  # noqa: WPS433
+    from prepare_dsv4_checkpoint import prepare as lumen_prepare  # noqa: WPS433
 
     lumen_prepare(
+        profile="4layer",
         model_dir=args.model_dir,
         model_name=args.model_name,
         megatron_path=args.megatron_path,
         hc_mult=int(os.environ.get("DSV4_HC_MULT", "2")),
-        miles_dir=MILES_DIR,
     )
 
 
@@ -142,15 +142,15 @@ def _prepare_rollout_data(args: ScriptArgs) -> None:
         print("[finetune] live rollout mode — skipping fake rollout.pt generation")
         return
 
-    sys.path.insert(0, str(LUMEN_DIR / "examples" / "dsv4"))
-    from prepare_dsv4_fake_rollout import prepare as prepare_rollout  # noqa: WPS433
+    from lumen.tools.dsv4.gen_fake_rollout_data import (  # noqa: WPS433
+        prepare as prepare_rollout,
+    )
 
     prepare_rollout(
         output_path=FAKE_ROLLOUT_DATA,
         model_dir=args.model_dir,
         model_name=args.model_name,
         data_dir=args.data_dir,
-        miles_dir=str(MILES_DIR),
     )
 
 

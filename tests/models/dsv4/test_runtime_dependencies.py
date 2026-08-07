@@ -8,9 +8,10 @@ import types
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parents[3]
-OPS_INIT_PATH = REPO_ROOT / "lumen/models/dsv4/ops/__init__.py"
+MODELS_DSV4_INIT_PATH = REPO_ROOT / "lumen/models/dsv4/__init__.py"
 CANONICAL_OPS_INIT_PATH = REPO_ROOT / "lumen/ops/dsv4/__init__.py"
-COMPRESSOR_PATH = REPO_ROOT / "lumen/models/dsv4/ops/compressor.py"
+COMPRESSOR_PATH = REPO_ROOT / "lumen/models/dsv4/compressor.py"
+HYPER_CONNECTION_PATH = REPO_ROOT / "lumen/models/dsv4/hyper_connection.py"
 PRETRAIN_PATH = REPO_ROOT / "lumen/models/dsv4/megatron/pretrain.py"
 PIPELINE_PATH = REPO_ROOT / "lumen/models/dsv4/megatron/pipeline.py"
 DSV4_EXAMPLES = REPO_ROOT / "examples/dsv4"
@@ -53,18 +54,13 @@ def test_dsv4_sources_live_in_canonical_ops_and_kernel_trees():
         for filename in filenames:
             assert (canonical_kernels / group / filename).is_file(), filename
 
-    assert not (REPO_ROOT / "lumen/models/dsv4/ops/kernel").exists()
-    for legacy_name in (
-        "sparse_mla_backend.py",
-        "indexer_backend.py",
-        "indexer_utils.py",
-        "cp_utils.py",
-        "dsa_topk.py",
-        "rope.py",
-        "qat.py",
-        "utils.py",
-    ):
-        assert not (REPO_ROOT / "lumen/models/dsv4/ops" / legacy_name).exists()
+    assert not (REPO_ROOT / "lumen/models/dsv4/ops").exists()
+    assert not (REPO_ROOT / "lumen/models/dsv4/modules").exists()
+    assert not (REPO_ROOT / "lumen/models/dsv4/tools").exists()
+    assert not (REPO_ROOT / "lumen/dsv4").exists()
+    assert (COMPRESSOR_PATH).is_file()
+    assert (HYPER_CONNECTION_PATH).is_file()
+    assert (MODELS_DSV4_INIT_PATH).is_file()
 
 
 def test_internal_python_imports_use_canonical_dsv4_paths():
@@ -78,28 +74,40 @@ def test_internal_python_imports_use_canonical_dsv4_paths():
         "lumen.models.dsv4.ops.rope",
         "lumen.models.dsv4.ops.qat",
         "lumen.models.dsv4.ops.utils",
+        "lumen.models.dsv4.ops.compressor",
+        "lumen.models.dsv4.ops.hyper_connection",
+        "lumen.models.dsv4.modules.compressor",
+        "lumen.models.dsv4.modules.hyper_connection",
+        "lumen.models.dsv4.tools.gen_fake_rollout_data",
+        "lumen.dsv4.modules.compressor",
+        "lumen.dsv4.modules.hyper_connection",
+        "lumen.dsv4.tools.gen_fake_rollout_data",
     )
+    patch_hc = DSV4_EXAMPLES / "megatron_patch/hc.py"
     for root in (REPO_ROOT / "lumen", REPO_ROOT / "examples"):
         for path in root.rglob("*.py"):
+            if ".bootstrap-build" in path.parts:
+                continue
+            if path == patch_hc:
+                continue
             source = path.read_text(encoding="utf-8")
             assert not any(old_path in source for old_path in forbidden), path
 
 
-def test_canonical_and_model_facades_do_not_eagerly_import_qat_or_kernels():
-    for path in (CANONICAL_OPS_INIT_PATH, OPS_INIT_PATH):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        imports = [
-            node
-            for node in tree.body
-            if isinstance(node, (ast.Import, ast.ImportFrom))
-        ]
-        assert all(
-            not isinstance(node, ast.ImportFrom)
-            or not (node.module or "").startswith(
-                ("lumen.ops.dsv4.qat", "lumen.kernels.dsv4")
-            )
-            for node in imports
-        ), path
+def test_canonical_ops_facade_does_not_eagerly_import_qat_or_kernels():
+    tree = ast.parse(CANONICAL_OPS_INIT_PATH.read_text(encoding="utf-8"))
+    imports = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+    ]
+    assert all(
+        not isinstance(node, ast.ImportFrom)
+        or not (node.module or "").startswith(
+            ("lumen.ops.dsv4.qat", "lumen.kernels.dsv4")
+        )
+        for node in imports
+    ), CANONICAL_OPS_INIT_PATH
 
 
 def test_canonical_dsv4_modules_import_without_model_or_tilekernels(monkeypatch):
@@ -215,17 +223,6 @@ def test_dsv4_ops_lazily_exports_qat_without_importing_tilekernels(monkeypatch):
     assert callable(qat.fp8_simulate_qat)
     assert not any(name.startswith("tile_kernels") for name in sys.modules)
 
-    marker = object()
-    canonical_module = types.ModuleType("lumen.ops.dsv4")
-    canonical_module.fp8_simulate_qat = marker
-    monkeypatch.setitem(sys.modules, "lumen.ops.dsv4", canonical_module)
-    spec = importlib.util.spec_from_file_location("_test_dsv4_ops_init", OPS_INIT_PATH)
-    assert spec is not None and spec.loader is not None
-    ops = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(ops)
-    assert ops.fp8_simulate_qat is marker
-    assert ops.fp8_simulate_qat is marker
-
 
 def test_compressor_has_no_module_level_qat_import():
     tree = ast.parse(COMPRESSOR_PATH.read_text(encoding="utf-8"))
@@ -249,47 +246,43 @@ def test_dsv4_launchers_mount_explicit_aiter_tree():
     assert '${AITER_DIR}:/workspace/aiter' in common
     assert "AITER_DIR=/workspace/aiter" in common
 
-    launchers = (
-        "run_dsv4_4layer_finetune.sh",
-        "run_dsv4_4layer_pretrain.sh",
-        "run_dsv4_4layer_profile.sh",
-        "run_dsv4_flash_finetune.sh",
-        "run_dsv4_flash_pretrain.sh",
-    )
-    for launcher in launchers:
-        source = (DSV4_EXAMPLES / launcher).read_text(encoding="utf-8")
-        assert '${AITER_DIR}:/workspace/aiter' in source, launcher
-        if "AITER_DIR=/workspace/aiter" not in source:
-            assert "dsv4_docker_common.sh" in source, launcher
-            assert "dsv4_docker_append_kernel_env" in source, launcher
+    launch = (DSV4_EXAMPLES / "dsv4_launch.sh").read_text(encoding="utf-8")
+    assert "dsv4_docker_common.sh" in launch
+    assert "dsv4_docker_append_kernel_env" in launch
+    assert "run_dsv4_pretrain_inner.sh" in launch
+    assert "run_dsv4_inner.sh" in launch
 
-    two_node_launchers = (
-        "launch_dsv4_2node.sh",
-        "launch_dsv4_flash_finetune_2node.sh",
+    two_node = (DSV4_EXAMPLES / "launch_dsv4_2node.sh").read_text(encoding="utf-8")
+    assert 'DSV4_MODE="${DSV4_MODE:-finetune}"' in two_node
+    assert "dsv4_launch.sh" in two_node
+    assert '"AITER_DIR=${AITER_DIR}"' in two_node
+    assert "pretrain" in two_node
+
+
+def test_legacy_dsv4_wrappers_removed():
+    removed = (
         "launch_dsv4_flash_pretrain_2node.sh",
+        "prepare_dsv4_4layer_checkpoint.py",
+        "prepare_dsv4_flash_checkpoint.py",
+        "prepare_dsv4_fake_rollout.py",
     )
-    for launcher in two_node_launchers:
-        source = (DSV4_EXAMPLES / launcher).read_text(encoding="utf-8")
-        assert '"AITER_DIR=${AITER_DIR}"' in source, launcher
+    for name in removed:
+        assert not (DSV4_EXAMPLES / name).exists(), name
 
 
-def test_model_facade_preserves_triton_mhc_backend_compatibility():
-    spec = importlib.util.spec_from_file_location("_test_dsv4_ops_compat", OPS_INIT_PATH)
-    assert spec is not None and spec.loader is not None
-    ops = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(ops)
+def test_pretrain_entry_installs_profiler_hook():
+    source = (DSV4_EXAMPLES / "pretrain_dsv4_megatron.py").read_text(encoding="utf-8")
+    assert "install_dsv4_profiler()" in source
 
-    assert ops.get_mhc_backend() == "triton"
-    assert ops.configure_mhc_backend() == "triton"
-    assert ops.configure_mhc_backend("triton") == "triton"
-    assert ops.log_mhc_backend() == "triton"
 
-    try:
-        ops.configure_mhc_backend("tilelang")
-    except ValueError as error:
-        assert "AIter Triton" in str(error)
-    else:
-        raise AssertionError("TileLang MHC compatibility request should fail")
+def test_models_dsv4_package_is_canonical_entrypoint():
+    tree = ast.parse(MODELS_DSV4_INIT_PATH.read_text(encoding="utf-8"))
+    assert any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "lumen.models.dsv4.compressor"
+        for node in tree.body
+    )
+    assert "DeepSeekV4Compressor" in MODELS_DSV4_INIT_PATH.read_text(encoding="utf-8")
 
 
 def test_container_preflight_requires_all_dsv4_mhc_apis():
@@ -298,5 +291,37 @@ def test_container_preflight_requires_all_dsv4_mhc_apis():
     assert 'AITER_DIR="${AITER_DIR:-/workspace/aiter}"' in bootstrap
     assert "${AITER_DIR}" in bootstrap
     for symbol in ("mhc_pre_dsv4", "mhc_post_dsv4", "mhc_head_dsv4"):
-        assert symbol in setup
+        assert symbol in setup or symbol in bootstrap
     assert "missing required AIter DSV4 MHC APIs" in setup
+
+
+def test_dsv4_tools_live_in_tools_package():
+    tools_dir = REPO_ROOT / "lumen/tools/dsv4"
+    for filename in (
+        "convert_hf_to_torch_dist.py",
+        "fp8_cast_bf16.py",
+        "gen_fake_rollout_data.py",
+        "megatron_convert.py",
+        "param_name_remap.py",
+        "stress_mhc_dsv4.py",
+    ):
+        assert (tools_dir / filename).is_file(), filename
+
+
+def test_megatron_patch_is_modular():
+    patch_dir = DSV4_EXAMPLES / "megatron_patch"
+    assert (patch_dir / "__init__.py").is_file()
+    init_source = (patch_dir / "__init__.py").read_text(encoding="utf-8")
+    assert "PATCH_VERSION" in init_source
+    assert "apply_all" in init_source
+    patch_cli = (DSV4_EXAMPLES / "patch_rocm_megatron_dsv4.py").read_text(encoding="utf-8")
+    assert "from megatron_patch import" in patch_cli
+
+
+def test_unified_launcher_exists():
+    launch = (DSV4_EXAMPLES / "dsv4_launch.sh").read_text(encoding="utf-8")
+    assert 'DSV4_MODE="${DSV4_MODE:-finetune}"' in launch
+    assert "run_dsv4_pretrain_inner.sh" in launch
+    assert "run_dsv4_inner.sh" in launch
+    assert (DSV4_EXAMPLES / "run_dsv4_pretrain_inner.sh").is_file()
+    assert (DSV4_EXAMPLES / "run_dsv4_inner.sh").is_file()

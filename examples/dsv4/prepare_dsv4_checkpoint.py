@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 LUMEN_DIR = Path(os.environ.get("LUMEN_DIR", "/workspace/Lumen"))
-TOOLS_DIR = LUMEN_DIR / "examples/dsv4/tools"
+TOOLS_DIR = LUMEN_DIR / "lumen/tools/dsv4"
 PROFILE = os.environ.get("DSV4_PROFILE", "4layer").lower()
 
 
@@ -137,7 +137,7 @@ def prepare(
 
     if profile == "4layer":
         model_name = model_name or os.environ.get("MODEL_NAME", "DeepSeek-V4-Flash-FP8-4layer")
-        hc_mult = int(hc_mult if hc_mult is not None else os.environ.get("DSV4_HC_MULT", "2"))
+        hc_mult = int(hc_mult if hc_mult is not None else os.environ.get("DSV4_HC_MULT", "4"))
         hf_dir = model_root / model_name
         bf16_dir = model_root / f"{model_name}-bf16"
         torch_dist = model_root / f"{model_name}_torch_dist_hc{hc_mult}"

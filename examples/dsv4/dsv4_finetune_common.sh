@@ -34,7 +34,7 @@ dsv4_resolve_finetune_ckpt() {
     export CKPT
 }
 
-# Host-side ckpt path for run_dsv4.sh banners (before Docker).
+# Host-side ckpt path for dsv4_launch.sh banners (before Docker).
 dsv4_host_resolve_finetune_ckpt() {
     local model_name="${1:?model_name}"
     local hc_mult="${2:-4}"
@@ -64,8 +64,8 @@ dsv4_prepare_rollout_on_shared_fs() {
     export PYTHONPATH="/workspace/Lumen:${PYTHONPATH:-}"
 
     if [[ "${NODE_RANK:-0}" == "0" ]]; then
-        PYTHONPATH="/workspace/Lumen/examples/dsv4/tools:${PYTHONPATH:-}" \
-            python -c "from gen_fake_rollout_data import prepare; prepare()"
+        export PYTHONPATH="/workspace/Lumen:${PYTHONPATH:-}"
+        python -c "from lumen.tools.dsv4.gen_fake_rollout_data import prepare; prepare()"
         return
     fi
 

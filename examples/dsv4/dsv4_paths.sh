@@ -45,4 +45,10 @@ MEGATRON_PATH="${MEGATRON_PATH:-${MEGATRON_ROCM_DIR}}"
 TILELANG_DIR="${TILELANG_DIR:-${DATA_ROOT}/tilelang}"
 PYTHON_EXTRAS_DIR="${PYTHON_EXTRAS_DIR:-${DATA_ROOT}/python-extras}"
 
+# Canonical DSV4 kernel backend defaults (runtime uses aiter; override for experiments).
+V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND:-triton}"
+V4_INDEXER_IMPL="${V4_INDEXER_IMPL:-aiter}"
+V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N:-64}"
+V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES:-1}"
+
 unset _dsv4_data_candidate
