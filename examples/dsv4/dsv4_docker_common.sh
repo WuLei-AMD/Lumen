@@ -119,7 +119,7 @@ dsv4_docker_append_kernel_env() {
 
 dsv4_docker_append_rocm_env() {
     DOCKER_ENV+=(
-        -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+        -e HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
         -e CUDA_DEVICE_MAX_CONNECTIONS=1
         -e NCCL_NVLS_ENABLE=0
         -e RCCL_MSCCL_ENABLE=0

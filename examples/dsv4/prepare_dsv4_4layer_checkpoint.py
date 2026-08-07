@@ -20,7 +20,7 @@ def _run(cmd: str) -> None:
     subprocess.run(cmd, shell=True, executable="/bin/bash", check=True)
 
 
-def _patch_hc_mult(model_dir: Path, hc_mult: int = 2) -> None:
+def _patch_hc_mult(model_dir: Path, hc_mult: int = 4) -> None:
     cfg_path = model_dir / "config.json"
     cfg = json.loads(cfg_path.read_text())
     if cfg.get("hc_mult", 4) != hc_mult:
@@ -82,7 +82,7 @@ def prepare(
     model_dir: str = "/root/models",
     model_name: str = "DeepSeek-V4-Flash-FP8-4layer",
     megatron_path: str | None = None,
-    hc_mult: int = 2,
+    hc_mult: int = 4,
     miles_dir: Path | None = None,
 ) -> Path:
     miles_dir = miles_dir or MILES_DIR
@@ -129,7 +129,7 @@ def main() -> None:
     ckpt = prepare(
         model_dir=os.environ.get("MODEL_DIR", "/root/models"),
         megatron_path=os.environ.get("MEGATRON_PATH"),
-        hc_mult=int(os.environ.get("DSV4_HC_MULT", "2")),
+        hc_mult=int(os.environ.get("DSV4_HC_MULT", "4")),
     )
     print(f"[prepare] checkpoint ready: {ckpt}")
 

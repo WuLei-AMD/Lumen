@@ -9,6 +9,8 @@
 # Optional overrides (exported to both nodes unless noted):
 #   SKIP_PREPARE=1 GBS=256 NUM_ROLLOUT=10 DSV4_HC_MULT=4 IMAGE=lumen/dsv4-lumen:mi308x
 #   WORKER_MODEL_DIR=/mnt/nvme0n1/${USER}/models  (worker-only host ckpt path; head uses MODEL_DIR)
+#   Health (before launch): DSV4_LAUNCH_MAX_MEM_USED_GIB=200 DSV4_LAUNCH_MAX_GPU_USE_PCT=5
+#   SKIP_HEALTH_CHECK=1  DSV4_LAUNCH_KILL_STALE_PROCS=0  SKIP_WORKER_RSYNC=1
 #   Smoke (match pretrain batch): GBS=8 DSV4_KEEP_GBS=1 SEQ_LEN=512 DSV4_KEEP_SEQ_LEN=1 \
 #     NUM_ROLLOUT=2 ROLLOUT_N_PROMPTS=1 ROLLOUT_N_PER_PROMPT=8 SMOKE_LEGACY_FAKE_ROLLOUT=1
 #   Bisect: TP=4 PP=2 EP=1 DECODER_FIRST_PP_LAYERS=22 DECODER_LAST_PP_LAYERS=21
@@ -18,6 +20,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=examples/dsv4/dsv4_paths.sh
 source "${SCRIPT_DIR}/dsv4_paths.sh"
+# shellcheck source=examples/dsv4/dsv4_launch_common.sh
+source "${SCRIPT_DIR}/dsv4_launch_common.sh"
 
 DSV4_PROFILE="${DSV4_PROFILE:-flash}"
 MASTER_ADDR="${MASTER_ADDR:?Set MASTER_ADDR to head node IP}"
@@ -27,10 +31,13 @@ if [[ -z "${WORKER_SSH}" && -n "${WORKER_ADDR}" ]]; then
     WORKER_SSH="${USER}@${WORKER_ADDR}"
 fi
 WORKER_SSH="${WORKER_SSH:?Set WORKER_SSH (e.g. ${USER}@worker-host) or WORKER_ADDR}"
-SSH_KEY="${SSH_KEY:-}"
+SSH_KEY="${SSH_KEY:-${HOME}/.ssh/id_ed25519_conductor}"
 PREFLIGHT_ID="$(date +%Y%m%d_%H%M%S)"
 CONTAINER_PREFIX="lumen-dsv4-flash-finetune-node"
 WORKER_MODEL_DIR="${WORKER_MODEL_DIR:-${MODEL_DIR}}"
+
+dsv4_launch_validate_local_model_dirs
+dsv4_launch_init_ssh
 
 COMMON_ENV=(
     "DSV4_PROFILE=${DSV4_PROFILE}"
@@ -91,17 +98,20 @@ echo "  parallel : TP=${TP:-4} PP=${PP:-4} EP=${EP:-4} (override via env)"
 echo "  NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-0}  IB_HCA=${NCCL_IB_HCA:-mlx5_0-7}  NCCL_DEBUG=${NCCL_DEBUG:-WARN}"
 echo "════════════════════════════════════════════════"
 
-docker rm -f "${CONTAINER_PREFIX}0" "${CONTAINER_PREFIX}1" 2>/dev/null || true
-_ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10)
-if [[ -n "${SSH_KEY}" ]]; then
-    _ssh_opts+=(-i "${SSH_KEY}" -o IdentitiesOnly=yes)
-fi
+dsv4_launch_cleanup_stale "${CONTAINER_PREFIX}0" "${CONTAINER_PREFIX}1"
 if ssh "${_ssh_opts[@]}" \
     "${WORKER_SSH}" "docker rm -f ${CONTAINER_PREFIX}0 ${CONTAINER_PREFIX}1 2>/dev/null || true"; then
     WORKER_REACHABLE=1
 else
     WORKER_REACHABLE=0
     echo "[launch][WARN] worker unreachable (${WORKER_SSH}) - head will start; preflight waits for worker manifest"
+fi
+
+dsv4_launch_run_health_checks "$([[ "${WORKER_REACHABLE}" == "1" ]] && echo "${WORKER_SSH}" || echo "")"
+dsv4_launch_publish_preflight_id
+
+if [[ "${WORKER_REACHABLE}" == "1" ]]; then
+    dsv4_launch_sync_worker_dsv4_scripts "${WORKER_SSH}"
 fi
 
 join_env() {

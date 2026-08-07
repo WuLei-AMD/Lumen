@@ -4,6 +4,9 @@
 # Native Megatron + Lumen get_dsv4_spec (no Miles train.py / Ray).
 # Run on EACH node with NODE_RANK=0 (head) and NODE_RANK=1 (worker).
 #
+# Tier-2 loss probe (LR=0, 2 iters — forward/backward without weight updates):
+#   LOSS_PROBE=1 LOAD_CKPT=1 SKIP_PREPARE=1 bash examples/dsv4/launch_dsv4_flash_pretrain_2node.sh
+#
 # Example (head):
 #   NODE_RANK=0 MASTER_ADDR=<head-ip> DATA_ROOT=/nfs/data/$USER \
 #   SKIP_PREPARE=1 LOAD_CKPT=0 TRAIN_ITERS=10 \
@@ -22,6 +25,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=examples/dsv4/dsv4_paths.sh
 source "${SCRIPT_DIR}/dsv4_paths.sh"
+# shellcheck source=examples/dsv4/dsv4_docker_common.sh
+source "${SCRIPT_DIR}/dsv4_docker_common.sh"
 
 IMAGE="${IMAGE:-lumen/dsv4-lumen:mi308x}"
 
@@ -34,9 +39,16 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 MODEL_NAME="${MODEL_NAME:-DeepSeek-V4-Flash-FP8}"
 DSV4_HC_MULT="${DSV4_HC_MULT:-4}"
 SKIP_PREPARE="${SKIP_PREPARE:-0}"
+LOSS_PROBE="${LOSS_PROBE:-0}"
+LOSS_PROBE_ITERS="${LOSS_PROBE_ITERS:-2}"
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
 LOAD_CKPT="${LOAD_CKPT:-0}"
 EVAL_ITERS="${EVAL_ITERS:-1}"
+if [[ "${LOSS_PROBE}" == "1" ]]; then
+    TRAIN_ITERS="${LOSS_PROBE_ITERS}"
+    EVAL_ITERS=0
+    LOAD_CKPT="${LOAD_CKPT:-1}"
+fi
 OPTIMIZER_OFFLOAD_FRACTION="${OPTIMIZER_OFFLOAD_FRACTION:-0.75}"
 DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES:-180}"
 
@@ -45,7 +57,7 @@ source "${SCRIPT_DIR}/dsv4_flash_megatron_args.sh"
 
 V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND:-triton}"
 MHC_BACKEND="${MHC_BACKEND:-triton}"
-V4_INDEXER_IMPL="${V4_INDEXER_IMPL:-tilelang}"
+V4_INDEXER_IMPL="${V4_INDEXER_IMPL:-aiter}"
 V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N:-64}"
 V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES:-1}"
 LUMEN_DSV4_LINEAR_FP8="${LUMEN_DSV4_LINEAR_FP8:-0}"
@@ -100,10 +112,12 @@ echo "  Nodes     : ${NNODES}×${NPROC_PER_NODE}  node_rank=${NODE_RANK}"
 echo "  Master    : ${MASTER_ADDR}:${MASTER_PORT}"
 echo "  Parallel  : TP4 PP4 EP4 (11+11+11+10)"
 echo "  Steps     : ${TRAIN_ITERS}"
+echo "  Loss probe: LOSS_PROBE=${LOSS_PROBE} (LR=0 forward/backward sanity when 1)"
 echo "  Batch     : GBS=${GBS} MBS=${MBS} seq_len=${SEQ_LEN}"
 echo "  Ckpt load : LOAD_CKPT=${LOAD_CKPT}"
 echo "  Preflight : PREFLIGHT_ID=${PREFLIGHT_ID:-n/a}"
-echo "  Kernels   : MLA=${V4_SPARSE_MLA_BACKEND} MHC=${MHC_BACKEND} TileKernels=${TILEKERNELS_DIR}"
+echo "  Kernels   : MLA=${V4_SPARSE_MLA_BACKEND} MHC=${MHC_BACKEND} indexer=${V4_INDEXER_IMPL} TileKernels=${TILEKERNELS_DIR}"
+dsv4_print_gemm_env
 echo "  HC mult   : ${DSV4_HC_MULT}"
 echo "  Optimizer : CPU offload fraction=${OPTIMIZER_OFFLOAD_FRACTION}"
 echo "  Ckpt path : ${TORCH_DIST} (used only when LOAD_CKPT=1)"
@@ -137,6 +151,8 @@ DOCKER_ENV=(
     -e LUMEN_DSV4_PRETRAIN=1
     -e MODEL_DIR=/root/models
     -e MODEL_NAME="${MODEL_NAME}"
+    -e LOSS_PROBE="${LOSS_PROBE}"
+    -e LOSS_PROBE_ITERS="${LOSS_PROBE_ITERS}"
     -e TRAIN_ITERS="${TRAIN_ITERS}"
     -e GBS="${GBS}"
     -e MBS="${MBS}"
@@ -152,28 +168,16 @@ DOCKER_ENV=(
     -e MASTER_PORT="${MASTER_PORT}"
     -e OPTIMIZER_OFFLOAD_FRACTION="${OPTIMIZER_OFFLOAD_FRACTION}"
     -e DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES}"
-    -e V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND}"
-    -e MHC_BACKEND="${MHC_BACKEND}"
-    -e V4_INDEXER_IMPL="${V4_INDEXER_IMPL}"
-    -e V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N}"
-    -e V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES}"
     -e LUMEN_DSV4_LINEAR_FP8="${LUMEN_DSV4_LINEAR_FP8}"
-    -e DSV4_ENABLE_RECOMPUTE="${DSV4_ENABLE_RECOMPUTE:-1}"
     -e HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-9.4.2}"
-    -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-    -e CUDA_DEVICE_MAX_CONNECTIONS=1
-    -e NCCL_NVLS_ENABLE=0
-    -e RCCL_MSCCL_ENABLE=0
-    -e HSA_FORCE_FINE_GRAIN_PCIE=1
-    -e TORCHDYNAMO_DISABLE=1
-    -e NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-ens14np0}"
-    -e NCCL_IB_HCA="${NCCL_IB_HCA:-mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7}"
-    -e NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
     -e MEGATRON_PATH="${MEGATRON_PATH}"
+    -e TP="${TP:-4}"
+    -e PP="${PP:-4}"
+    -e EP="${EP:-4}"
+    -e ETP="${ETP:-1}"
+    -e DECODER_FIRST_PP_LAYERS="${DECODER_FIRST_PP_LAYERS:-11}"
+    -e DECODER_LAST_PP_LAYERS="${DECODER_LAST_PP_LAYERS:-10}"
 )
-if [[ -d "${TILEKERNELS_DIR}" ]]; then
-    DOCKER_ENV+=(-e TILEKERNELS_DIR=/workspace/TileKernels)
-fi
 if [[ -d "${MILES_DIR}" ]]; then
     DOCKER_ENV+=(-e MILES_DIR=/workspace/miles)
 fi
@@ -183,10 +187,22 @@ if [[ "${USE_MILES_IMAGE}" -eq 1 ]]; then
         -e RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
     )
 fi
-if [[ "${USE_BOOTSTRAP}" -eq 1 && -n "${BOOTSTRAP_MOUNT}" ]]; then
-    DOCKER_ENV+=(-e BOOTSTRAP_DIR=/bootstrap)
-elif [[ "${IMAGE}" == "lumen/dsv4-lumen:mi308x" ]]; then
-    DOCKER_ENV+=(-e BOOTSTRAP_DIR=/opt/dsv4-bootstrap -e WRITABLE_ROOT=/opt/dsv4-runtime)
+dsv4_docker_append_kernel_env
+dsv4_docker_append_gemm_env
+dsv4_docker_append_rocm_env
+dsv4_docker_append_bootstrap_env
+# Multinode NCCL overrides (single-node pretrain ignores unset defaults).
+if [[ "${NNODES}" -gt 1 ]]; then
+    DOCKER_ENV+=(
+        -e NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-ens14np0}"
+        -e GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-ens14np0}"
+        -e NCCL_IB_HCA="${NCCL_IB_HCA:-mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7}"
+        -e NCCL_IB_GDR_LEVEL="${NCCL_IB_GDR_LEVEL:-0}"
+        -e NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-LOC}"
+        -e NCCL_CROSS_NIC="${NCCL_CROSS_NIC:-0}"
+        -e NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+        -e MEGATRON_NO_BATCH_P2P_COMM="${MEGATRON_NO_BATCH_P2P_COMM:-1}"
+    )
 fi
 
 CONTAINER_NAME="lumen-dsv4-full-node${NODE_RANK}"

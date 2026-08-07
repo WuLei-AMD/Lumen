@@ -18,13 +18,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=examples/dsv4/dsv4_paths.sh
 source "${SCRIPT_DIR}/dsv4_paths.sh"
+# shellcheck source=examples/dsv4/dsv4_docker_common.sh
+source "${SCRIPT_DIR}/dsv4_docker_common.sh"
 
 LOGFILE="${LOG_DIR}/lumen_dsv4_4layer_pretrain_$(date +%Y%m%d_%H%M%S).log"
 
 IMAGE="${IMAGE:-lumen/dsv4-lumen:mi308x}"
 
 MODEL_NAME="${MODEL_NAME:-DeepSeek-V4-Flash-FP8-4layer}"
-DSV4_HC_MULT="${DSV4_HC_MULT:-2}"
+DSV4_HC_MULT="${DSV4_HC_MULT:-4}"
 # shellcheck source=examples/dsv4/dsv4_4layer_megatron_args.sh
 source "${SCRIPT_DIR}/dsv4_4layer_megatron_args.sh"
 
@@ -32,7 +34,7 @@ TORCH_DIST="${MODEL_DIR}/${MODEL_NAME}_torch_dist_hc${DSV4_HC_MULT}"
 
 V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND:-triton}"
 MHC_BACKEND="${MHC_BACKEND:-triton}"
-V4_INDEXER_IMPL="${V4_INDEXER_IMPL:-tilelang}"
+V4_INDEXER_IMPL="${V4_INDEXER_IMPL:-aiter}"
 V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N:-64}"
 V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES:-1}"
 LUMEN_DSV4_LINEAR_FP8="${LUMEN_DSV4_LINEAR_FP8:-0}"
@@ -88,6 +90,7 @@ else
     echo "  mHC       : bootstrap site-packages (set TILEKERNELS_DIR for local overlay)"
 fi
 echo "  SparseMLA : ${V4_SPARSE_MLA_BACKEND} (triton -> aiter sparse_mla_dsv4_train)"
+dsv4_print_gemm_env
 echo "  Ckpt      : ${TORCH_DIST}"
 echo "  Log       : ${LOGFILE}"
 echo "════════════════════════════════════════════════"
@@ -121,38 +124,20 @@ DOCKER_ENV=(
     -e LOAD_CKPT="${LOAD_CKPT}"
     -e EVAL_ITERS="${EVAL_ITERS}"
     -e DSV4_HC_MULT="${DSV4_HC_MULT}"
-    -e V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND}"
-    -e MHC_BACKEND="${MHC_BACKEND}"
-    -e V4_INDEXER_IMPL="${V4_INDEXER_IMPL}"
-    -e V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N}"
-    -e V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES}"
     -e LUMEN_DSV4_LINEAR_FP8="${LUMEN_DSV4_LINEAR_FP8}"
     -e LUMEN_DSV4_FP8_SCALING="${LUMEN_DSV4_FP8_SCALING}"
     -e LUMEN_DSV4_MOE_MORI="${LUMEN_DSV4_MOE_MORI}"
-    -e DSV4_ENABLE_RECOMPUTE="${DSV4_ENABLE_RECOMPUTE:-1}"
 )
-if [[ -d "${TILEKERNELS_DIR}" ]]; then
-    DOCKER_ENV+=(-e TILEKERNELS_DIR=/workspace/TileKernels)
-fi
 if [[ -d "${MILES_DIR}" ]]; then
     DOCKER_ENV+=(-e MILES_DIR=/workspace/miles)
 fi
 if [[ "${MORI_ENABLE_SDMA}" == "1" ]]; then
     DOCKER_ENV+=(-e MORI_ENABLE_SDMA=1)
 fi
-DOCKER_ENV+=(
-    -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-    -e CUDA_DEVICE_MAX_CONNECTIONS=1
-    -e NCCL_NVLS_ENABLE=0
-    -e RCCL_MSCCL_ENABLE=0
-    -e HSA_FORCE_FINE_GRAIN_PCIE=1
-    -e TORCHDYNAMO_DISABLE=1
-)
-if [[ "${USE_BOOTSTRAP}" -eq 1 && -n "${BOOTSTRAP_MOUNT}" ]]; then
-    DOCKER_ENV+=(-e BOOTSTRAP_DIR=/bootstrap)
-elif [[ "${IMAGE}" == "lumen/dsv4-lumen:mi308x" ]]; then
-    DOCKER_ENV+=(-e BOOTSTRAP_DIR=/opt/dsv4-bootstrap -e WRITABLE_ROOT=/opt/dsv4-runtime)
-fi
+dsv4_docker_append_kernel_env
+dsv4_docker_append_gemm_env
+dsv4_docker_append_rocm_env
+dsv4_docker_append_bootstrap_env
 
 docker rm -f lumen-dsv4-pretrain 2>/dev/null || true
 

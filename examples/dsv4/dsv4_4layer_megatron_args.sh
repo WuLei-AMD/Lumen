@@ -4,7 +4,7 @@
 # Lumen pretrain smoke default GBS=8 (Miles GRPO smoke uses GBS=256 via rollout 32×8).
 
 NLAYERS=4
-DSV4_HC_MULT="${DSV4_HC_MULT:-2}"
+DSV4_HC_MULT="${DSV4_HC_MULT:-4}"
 COMPRESS_RATIOS=(0 0 4 128)
 LUMEN_DSV4_SPEC_MODULE="${LUMEN_DSV4_SPEC_MODULE:-lumen.models.dsv4.megatron.spec}"
 LUMEN_DSV4_SPEC_FN="${LUMEN_DSV4_SPEC_FN:-get_dsv4_spec}"

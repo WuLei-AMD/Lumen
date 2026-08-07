@@ -12,20 +12,15 @@ LOAD_CKPT="${LOAD_CKPT:-0}"
 
 source examples/dsv4/dsv4_4layer_megatron_args.sh
 # DSV4_HC_MULT / GBS / MBS / SEQ_LEN come from dsv4_4layer_megatron_args.sh
+# shellcheck source=examples/dsv4/dsv4_finetune_common.sh
+source examples/dsv4/dsv4_finetune_common.sh
 
 export LUMEN_DSV4_PRETRAIN=1
 # shellcheck source=examples/dsv4/setup_container_env.sh
 source examples/dsv4/setup_container_env.sh
 setup_dsv4_container_env /workspace/miles
 
-CKPT="/root/models/${MODEL_NAME}_torch_dist_hc${DSV4_HC_MULT}"
-if [[ ! -f "${CKPT}/latest_checkpointed_iteration.txt" ]]; then
-    FALLBACK="/root/models/${MODEL_NAME}_torch_dist"
-    if [[ -f "${FALLBACK}/latest_checkpointed_iteration.txt" ]]; then
-        echo "[prepare] using fallback checkpoint ${FALLBACK}"
-        CKPT="${FALLBACK}"
-    fi
-fi
+dsv4_resolve_finetune_ckpt "${MODEL_NAME}" "${DSV4_HC_MULT}"
 if [[ "${SKIP_PREPARE}" != "1" && ! -f "${CKPT}/latest_checkpointed_iteration.txt" ]]; then
     if [[ ! -d /workspace/miles ]]; then
         echo "[ERROR] Checkpoint missing and MILES_DIR not mounted for prepare_dsv4_4layer_checkpoint.py"
@@ -33,16 +28,23 @@ if [[ "${SKIP_PREPARE}" != "1" && ! -f "${CKPT}/latest_checkpointed_iteration.tx
     fi
     export PYTHONPATH="/workspace/Lumen:/workspace/miles:${PYTHONPATH:-}"
     DSV4_HC_MULT="${DSV4_HC_MULT}" python examples/dsv4/prepare_dsv4_4layer_checkpoint.py
+    dsv4_resolve_finetune_ckpt "${MODEL_NAME}" "${DSV4_HC_MULT}"
 else
     echo "[prepare] torch_dist checkpoint already present — skipping"
 fi
 
 LOAD_ARGS=()
-if [[ "${LOAD_CKPT}" == "1" && -f "${CKPT}/latest_checkpointed_iteration.txt" ]]; then
+if [[ "${LOAD_CKPT}" == "1" ]]; then
+    if [[ ! -f "${CKPT}/latest_checkpointed_iteration.txt" ]]; then
+        echo "[ERROR] LOAD_CKPT=1 but checkpoint not found under /root/models for ${MODEL_NAME} (hc_mult=${DSV4_HC_MULT})"
+        exit 1
+    fi
     LOAD_ARGS=(--load "${CKPT}" --no-load-optim --no-load-rng)
     echo "[pretrain] loading checkpoint ${CKPT} (dsv4-hc-mult=${DSV4_HC_MULT})"
+elif [[ -f "${CKPT}/latest_checkpointed_iteration.txt" ]]; then
+    echo "[pretrain] checkpoint available at ${CKPT} but LOAD_CKPT=${LOAD_CKPT} — training from random init"
 else
-    echo "[pretrain] training from random init (LOAD_CKPT=${LOAD_CKPT})"
+    echo "[pretrain] training from random init (no checkpoint, LOAD_CKPT=${LOAD_CKPT})"
 fi
 
 RECOMPUTE_ARGS=()

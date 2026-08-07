@@ -7,9 +7,14 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-9.4.2}"
 
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
+LOSS_PROBE="${LOSS_PROBE:-0}"
 MODEL_NAME="${MODEL_NAME:-DeepSeek-V4-Flash-FP8}"
 SKIP_PREPARE="${SKIP_PREPARE:-0}"
 LOAD_CKPT="${LOAD_CKPT:-0}"
+PRETRAIN_LR="${PRETRAIN_LR:-1e-6}"
+PRETRAIN_MIN_LR="${PRETRAIN_MIN_LR:-1e-6}"
+PRETRAIN_LR_WARMUP_ITERS="${PRETRAIN_LR_WARMUP_ITERS:-0}"
+LOSS_PROBE_ITERS="${LOSS_PROBE_ITERS:-2}"
 NNODES="${NNODES:-2}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 NODE_RANK="${NODE_RANK:-0}"
@@ -22,19 +27,25 @@ DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES:-180}"
 source examples/dsv4/dsv4_flash_megatron_args.sh
 # shellcheck source=examples/dsv4/dsv4_flash_mi300x_parallel.sh
 source examples/dsv4/dsv4_flash_mi300x_parallel.sh
+# shellcheck source=examples/dsv4/dsv4_finetune_common.sh
+source examples/dsv4/dsv4_finetune_common.sh
 
 export LUMEN_DSV4_PRETRAIN=1
 # shellcheck source=examples/dsv4/setup_container_env.sh
 source examples/dsv4/setup_container_env.sh
 setup_dsv4_container_env /workspace/miles
 
-CKPT="/root/models/${MODEL_NAME}_torch_dist"
-if [[ ! -f "${CKPT}/latest_checkpointed_iteration.txt" ]]; then
-    FALLBACK="/root/models/${MODEL_NAME}_torch_dist_hc${DSV4_HC_MULT}"
-    if [[ -f "${FALLBACK}/latest_checkpointed_iteration.txt" ]]; then
-        echo "[prepare] using fallback checkpoint ${FALLBACK}"
-        CKPT="${FALLBACK}"
-    fi
+dsv4_resolve_finetune_ckpt "${MODEL_NAME}" "${DSV4_HC_MULT}"
+
+if [[ "${LOSS_PROBE}" == "1" ]]; then
+    TRAIN_ITERS="${LOSS_PROBE_ITERS}"
+    EVAL_ITERS=0
+    LOAD_CKPT="${LOAD_CKPT:-1}"
+    PRETRAIN_LR=0
+    PRETRAIN_MIN_LR=0
+    PRETRAIN_LR_WARMUP_ITERS=0
+    echo "[pretrain-full][LOSS_PROBE] Tier-2 probe: LR=0 (no weight updates), iters=${TRAIN_ITERS}, LOAD_CKPT=${LOAD_CKPT}"
+    echo "[pretrain-full][LOSS_PROBE] PASS if iter1/iter2 lm loss are finite, 0 NaN, and nearly unchanged"
 fi
 
 if [[ "${SKIP_PREPARE}" != "1" && ! -f "${CKPT}/latest_checkpointed_iteration.txt" ]]; then
@@ -44,16 +55,23 @@ if [[ "${SKIP_PREPARE}" != "1" && ! -f "${CKPT}/latest_checkpointed_iteration.tx
     fi
     export PYTHONPATH="/workspace/Lumen:/workspace/miles:${PYTHONPATH:-}"
     python examples/dsv4/prepare_dsv4_flash_checkpoint.py
+    dsv4_resolve_finetune_ckpt "${MODEL_NAME}" "${DSV4_HC_MULT}"
 else
     echo "[prepare] torch_dist checkpoint already present — skipping (path=${CKPT})"
 fi
 
 LOAD_ARGS=()
-if [[ "${LOAD_CKPT}" == "1" && -f "${CKPT}/latest_checkpointed_iteration.txt" ]]; then
+if [[ "${LOAD_CKPT}" == "1" ]]; then
+    if [[ ! -f "${CKPT}/latest_checkpointed_iteration.txt" ]]; then
+        echo "[ERROR] LOAD_CKPT=1 but checkpoint not found under /root/models for ${MODEL_NAME} (hc_mult=${DSV4_HC_MULT})"
+        exit 1
+    fi
     LOAD_ARGS=(--load "${CKPT}" --no-load-optim --no-load-rng)
     echo "[pretrain-full] loading checkpoint ${CKPT}"
+elif [[ -f "${CKPT}/latest_checkpointed_iteration.txt" ]]; then
+    echo "[pretrain-full] checkpoint available at ${CKPT} but LOAD_CKPT=${LOAD_CKPT} — training from random init"
 else
-    echo "[pretrain-full] training from random init (LOAD_CKPT=${LOAD_CKPT})"
+    echo "[pretrain-full] training from random init (no checkpoint, LOAD_CKPT=${LOAD_CKPT})"
 fi
 
 RECOMPUTE_ARGS=()
@@ -68,6 +86,7 @@ fi
 echo "[pretrain-full] launching torchrun ${NNODES}×${NPROC_PER_NODE} (node_rank=${NODE_RANK}) ..."
 echo "[pretrain-full] parallel: TP=${TP} PP=${PP} EP=${EP} | batch GBS=${GBS} MBS=${MBS} seq=${SEQ_LEN}"
 echo "[pretrain-full] optimizer CPU offload fraction=${OPTIMIZER_OFFLOAD_FRACTION}"
+echo "[pretrain-full] lr=${PRETRAIN_LR} min_lr=${PRETRAIN_MIN_LR} warmup_iters=${PRETRAIN_LR_WARMUP_ITERS}"
 echo "[pretrain-full] CPU memory: num_workers=0, pin_cpu_grads/params=off (mock-data smoke)"
 
 torchrun \
@@ -110,7 +129,9 @@ torchrun \
     --use-precision-aware-optimizer \
     --overlap-cpu-optimizer-d2h-h2d \
     --optimizer-offload-fraction "${OPTIMIZER_OFFLOAD_FRACTION}" \
-    --lr 1e-6 \
+    --lr "${PRETRAIN_LR}" \
+    --min-lr "${PRETRAIN_MIN_LR}" \
+    --lr-warmup-iters "${PRETRAIN_LR_WARMUP_ITERS}" \
     --lr-decay-style constant \
     --weight-decay 0.1 \
     --adam-beta1 0.9 \
@@ -125,4 +146,9 @@ torchrun \
     --distributed-backend nccl
 
 echo ""
-echo "=== [done] Lumen DSV4 Flash full-model pretrain smoke completed (node_rank=${NODE_RANK}) ==="
+if [[ "${LOSS_PROBE}" == "1" ]]; then
+    echo "=== [done] Lumen DSV4 Flash LOSS_PROBE completed (node_rank=${NODE_RANK}) ==="
+    echo "=== Compare iter1 vs iter2 lm loss in logs; delta should be tiny with LR=0 ==="
+else
+    echo "=== [done] Lumen DSV4 Flash full-model pretrain smoke completed (node_rank=${NODE_RANK}) ==="
+fi

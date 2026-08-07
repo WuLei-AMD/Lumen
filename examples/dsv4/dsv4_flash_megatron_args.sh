@@ -58,7 +58,6 @@ DSV4_MODEL_ARGS=(
     --moe-shared-expert-intermediate-size 2048
     --moe-router-pre-softmax
     --moe-router-score-function sqrtsoftplus
-    --moe-router-enable-expert-bias
     --moe-router-load-balancing-type seq_aux_loss
     --moe-token-dispatcher-type alltoall
     --moe-aux-loss-coeff 0
@@ -84,3 +83,8 @@ DSV4_MODEL_ARGS=(
     --no-bias-swiglu-fusion
     --no-activation-func-clamp-shared-expert
 )
+
+# Converted torch_dist checkpoints may omit router expert_bias shards (same as finetune path).
+if [[ "${DSV4_ENABLE_EXPERT_BIAS:-0}" == "1" ]]; then
+    DSV4_MODEL_ARGS+=(--moe-router-enable-expert-bias)
+fi
