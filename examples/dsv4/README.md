@@ -123,7 +123,7 @@ NODE_RANK=1 MASTER_ADDR=<head-ip> SKIP_PREPARE=1 GBS=256 NUM_ROLLOUT=10 \
 | `FAKE_ROLLOUT_DATA` | `${DATA_ROOT}/models/fake_rollout.pt`（双节点）或 `/root/models/fake_rollout.pt` | debug-train-only rollout |
 | `V4_INDEXER_IMPL` | `aiter` | DSA indexer（aiter triton kernel；`tilelang` 仅作兼容别名） |
 | `V4_SPARSE_MLA_BACKEND` | `triton` | sparse MLA |
-| `MHC_BACKEND` | `triton` | Hyper-Connection |
+| `MHC_BACKEND` | `triton` | Hyper-Connection（TileKernels `tile_kernels/mhc/*_triton.py`；可选 `tilelang`） |
 | `OPTIMIZER_OFFLOAD_FRACTION` | `0.75` | Flash 全模型 CPU Adam offload |
 
 ---

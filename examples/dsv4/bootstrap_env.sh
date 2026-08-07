@@ -2,6 +2,9 @@
 # Runtime env setup inside lumen/tests:latest for DSV4 smoke.
 set -euo pipefail
 
+: "${MHC_BACKEND:=triton}"
+export MHC_BACKEND
+
 BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-/bootstrap}"
 LUMEN_DIR="${LUMEN_DIR:-/workspace/Lumen}"
 AITER_ROOT="${AITER_ROOT:-${LUMEN_DIR}/third_party/aiter}"
@@ -42,6 +45,9 @@ export SITE_PKGS
 
 if [[ ! -f "${SITE_PKGS}/lumen_dsv4_bootstrap.pth" ]]; then
     cat > "${SITE_PKGS}/lumen_dsv4_bootstrap.pth" <<'PY'
+import os
+
+os.environ.setdefault("MHC_BACKEND", "triton")
 import megatron.core.jit as _jit
 _jit.disable_jit_fuser()
 PY
@@ -121,6 +127,10 @@ if [[ -n "${TILEKERNELS_DIR:-}" && -d "${TILEKERNELS_DIR}/tile_kernels/mhc" && -
     mkdir -p "${_tk_dest}/mhc" "${_tk_dest}/modeling/mhc"
     rsync -a "${TILEKERNELS_DIR}/tile_kernels/mhc/" "${_tk_dest}/mhc/"
     rsync -a "${TILEKERNELS_DIR}/tile_kernels/modeling/mhc/" "${_tk_dest}/modeling/mhc/"
+    if [[ -d "${TILEKERNELS_DIR}/tile_kernels/torch/mhc" ]]; then
+        mkdir -p "${_tk_dest}/torch/mhc"
+        rsync -a "${TILEKERNELS_DIR}/tile_kernels/torch/mhc/" "${_tk_dest}/torch/mhc/"
+    fi
 fi
 
 python - <<'PY'
@@ -180,13 +190,14 @@ if os.environ.get("V4_SPARSE_MLA_BACKEND", "triton").lower() == "triton":
         print(f"[bootstrap_env] FAIL sparse MLA triton: {e}")
         raise SystemExit(1)
 
-_mhc_backend = os.environ.get("MHC_BACKEND", "triton").lower()
+_mhc_backend = os.environ.setdefault("MHC_BACKEND", "triton").lower()
 try:
+    from lumen.models.dsv4.ops.mhc_backend import configure_mhc_backend, log_mhc_backend
+
+    configure_mhc_backend(_mhc_backend)
     import tile_kernels
 
     print(f"[bootstrap_env] tile_kernels: {tile_kernels.__file__}")
-    from lumen.models.dsv4.ops.mhc_backend import log_mhc_backend
-
     print(f"[bootstrap_env] OK MHC backend={log_mhc_backend()} (MHC_BACKEND={_mhc_backend})")
 except Exception as e:
     print(f"[bootstrap_env] FAIL MHC/tile_kernels: {e}")

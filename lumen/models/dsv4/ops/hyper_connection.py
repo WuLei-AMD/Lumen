@@ -16,15 +16,9 @@ import torch
 import torch.nn.functional as F
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tile_kernels.modeling.mhc.ops import (
-    mhc_head_compute_mix,
-    mhc_post,
-    mhc_pre_apply_mix,
-    mhc_pre_big_fuse,
-    mhc_pre_norm_fn,
-    mhc_pre_split_mixes_and_sinkhorn,
-)
 from torch import Tensor
+
+from lumen.models.dsv4.ops.mhc_backend import get_mhc_op
 
 # DeepSeek V4 originally used post = 2 * sigmoid(...) for the post-layer mix
 # (see the legacy ``hc_split_sinkhorn`` kernel). TileKernels lets us pass the
@@ -83,7 +77,7 @@ class DeepSeekV4HyperConnectionUtil:
         # backward — but Megatron's call sites use independent ``layer_pre``/
         # ``layer_post`` rearranges, so the storage objects don't match.
         if not torch.is_grad_enabled():
-            post, comb, layer_input = mhc_pre_big_fuse(
+            post, comb, layer_input = get_mhc_op("mhc_pre_big_fuse")(
                 x_bf16,
                 hc_fn,
                 hc_scale,
@@ -96,14 +90,14 @@ class DeepSeekV4HyperConnectionUtil:
                 n_splits=16,
             )
         else:
-            mixes = mhc_pre_norm_fn(
+            mixes = get_mhc_op("mhc_pre_norm_fn")(
                 x_bf16,
                 hc_fn,
                 None,
                 self.norm_eps,
                 fuse_grad_acc=False,
             )
-            pre_mix, post, comb = mhc_pre_split_mixes_and_sinkhorn(
+            pre_mix, post, comb = get_mhc_op("mhc_pre_split_mixes_and_sinkhorn")(
                 mixes,
                 hc_scale,
                 hc_base,
@@ -113,7 +107,7 @@ class DeepSeekV4HyperConnectionUtil:
                 sinkhorn_repeat=self.hc_sinkhorn_iters,
                 sinkhorn_eps=self.hc_eps,
             )
-            layer_input = mhc_pre_apply_mix(x_bf16, pre_mix)
+            layer_input = get_mhc_op("mhc_pre_apply_mix")(x_bf16, pre_mix)
         return layer_input.to(dtype), post, comb
 
     def hc_post_raw(
@@ -131,7 +125,7 @@ class DeepSeekV4HyperConnectionUtil:
         dtype = x.dtype
         x_bf16 = (x if x.dtype == torch.bfloat16 else x.bfloat16()).contiguous()
         res_bf16 = (residual if residual.dtype == torch.bfloat16 else residual.bfloat16()).contiguous()
-        out = mhc_post(x_bf16, res_bf16, post, comb)
+        out = get_mhc_op("mhc_post")(x_bf16, res_bf16, post, comb)
         return out.to(dtype)
 
     def hc_head_raw(
@@ -159,7 +153,7 @@ class DeepSeekV4HyperConnectionUtil:
         if fn_padded.shape[0] < mhc_mult3:
             fn_padded = F.pad(fn_padded, (0, 0, 0, mhc_mult3 - fn_padded.shape[0]))
 
-        mixes = mhc_pre_norm_fn(
+        mixes = get_mhc_op("mhc_pre_norm_fn")(
             x_bf16,
             fn_padded,
             None,
@@ -168,8 +162,8 @@ class DeepSeekV4HyperConnectionUtil:
         )
         mix_in = mixes[..., :mhc_mult].contiguous()
         scale = hc_scale.reshape(1) if hc_scale.numel() == 1 else hc_scale
-        out_mix = mhc_head_compute_mix(mix_in, scale, hc_base, self.hc_eps)
-        layer_input = mhc_pre_apply_mix(x_bf16, out_mix.unsqueeze(-1))
+        out_mix = get_mhc_op("mhc_head_compute_mix")(mix_in, scale, hc_base, self.hc_eps)
+        layer_input = get_mhc_op("mhc_pre_apply_mix")(x_bf16, out_mix.unsqueeze(-1))
         return layer_input.to(dtype)
 
     def layer_pre(

@@ -10,6 +10,9 @@
 
 : "${SCRIPT_DIR:?dsv4_paths.sh: set SCRIPT_DIR before sourcing}"
 
+# shellcheck source=examples/dsv4/dsv4_mhc_env.sh
+source "${SCRIPT_DIR}/dsv4_mhc_env.sh"
+
 LUMEN_DIR="${LUMEN_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-$(cd "${LUMEN_DIR}/.." && pwd)}"
 
