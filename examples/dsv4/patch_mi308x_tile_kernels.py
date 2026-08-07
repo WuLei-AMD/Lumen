@@ -7,7 +7,6 @@ import re
 import sys
 from pathlib import Path
 
-# Bootstrap layout: /bootstrap/site-packages/tile_kernels
 SITE = Path(
     sys.argv[1]
     if len(sys.argv) > 1
@@ -54,28 +53,13 @@ def patch_sinkhorn_bwd_token_block() -> None:
         print(f"[mi308x] patched sinkhorn bwd token_block 32->{SINKHORN_BWD_TOKEN_BLOCK}")
 
 
-def patch_sitecustomize(miles_root: Path) -> None:
-    patch_py = miles_root / "docker/usercustomize_mi308x.py"
-    sc = Path("/usr/lib/python3.10/sitecustomize.py")
-    if not patch_py.is_file() or not sc.is_file():
-        return
-    marker = "# MI308X (gfx942) compatibility patches"
-    text = sc.read_text()
-    if marker in text:
-        text = text[: text.index(marker)]
-    sc.write_text(text + patch_py.read_text())
-    print("[mi308x] refreshed sitecustomize patches")
-
-
 def main() -> None:
-    miles_root = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("/workspace/miles")
     if not SITE.is_dir():
         print(f"[mi308x] WARN: tile_kernels not found at {SITE}", file=sys.stderr)
         return
     patch_post_kernel()
     patch_norm_fn_kernel()
     patch_sinkhorn_bwd_token_block()
-    patch_sitecustomize(miles_root)
 
 
 if __name__ == "__main__":

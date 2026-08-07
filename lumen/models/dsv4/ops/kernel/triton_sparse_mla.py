@@ -1,6 +1,6 @@
 """DSV4 sparse MLA via aiter Triton kernels (MI308X-optimised).
 
-Layout adapter: Lumen/Miles use [B,S,H,D] batched tensors; aiter expects flat [N,H,D].
+Layout adapter: Lumen uses [B,S,H,D] batched tensors; aiter expects flat [N,H,D].
 Calls ``sparse_mla_dsv4_train`` from ``third_party/aiter`` (fwd + bwd autograd).
 """
 

@@ -111,12 +111,24 @@ def install_mmap_checkpoint():
     _orig_torch_load = torch.load
 
     def _mmap_torch_load(*args, **kwargs):
-        kwargs.setdefault("mmap", True)
         kwargs.setdefault("weights_only", False)
+        if args and isinstance(args[0], (str, os.PathLike)):
+            kwargs.setdefault("mmap", True)
         return _orig_torch_load(*args, **kwargs)
 
-    if hasattr(_ckpt_mod, "torch"):
-        _ckpt_mod.torch.load = _mmap_torch_load
+    for mod_name in (
+        "megatron.training.checkpointing",
+        "megatron.core.dist_checkpointing.strategies.common",
+    ):
+        try:
+            mod = __import__(mod_name, fromlist=["torch"])
+        except ImportError:
+            continue
+        if getattr(mod, "_lumen_mmap_patched", False):
+            continue
+        mod.torch.load = _mmap_torch_load
+        mod._lumen_mmap_patched = True
+
     _ckpt_mod._lumen_mmap_patched = True
 
 

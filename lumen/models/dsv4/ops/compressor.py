@@ -120,7 +120,7 @@ class DeepSeekV4Compressor(nn.Module):
         return tensor[:, start : start + G_local, :, :]
 
     def forward_raw(self, x: torch.Tensor) -> torch.Tensor:
-        assert self.ape.dtype == torch.float32
+        ape = self.ape if self.ape.dtype == torch.float32 else self.ape.float()
         assert self.wkv.weight.dtype == torch.bfloat16
         assert self.wgate.weight.dtype == torch.bfloat16
 
@@ -136,7 +136,7 @@ class DeepSeekV4Compressor(nn.Module):
         score = linear_bf16_fp32(x, self.wgate.weight)
 
         kv = kv.unflatten(1, (-1, ratio))
-        score = score.unflatten(1, (-1, ratio)) + self.ape
+        score = score.unflatten(1, (-1, ratio)) + ape
 
         if overlap:
             kv = self.overlap_transform_with_cp(kv, 0)

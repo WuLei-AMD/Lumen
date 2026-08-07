@@ -21,19 +21,21 @@ class LumenNorm(torch.nn.Module):
     def __init__(self, config, hidden_size, eps=1e-6, **kwargs):
         super().__init__()
         del kwargs
+        self.eps = eps
         norm_type = getattr(config, "normalization", "LayerNorm")
-        if norm_type == "RMSNorm":
-            from lumen.ops.normalization import LumenRMSNorm
-
-            self._norm = LumenRMSNorm(hidden_size, eps=eps)
-        else:
-            from lumen.ops.normalization import LumenLayerNorm
-
-            self._norm = LumenLayerNorm(hidden_size, eps=eps)
-        self.weight = self._norm.weight
+        self._norm_type = norm_type
+        # Own weight at ``*.weight`` so torch_dist ckpt keys match mbridge/HF
+        # (nested ``_norm.weight`` breaks dist checkpoint load).
+        self.weight = nn.Parameter(torch.ones(hidden_size))
 
     def forward(self, x):
-        return self._norm(x)
+        if self._norm_type == "RMSNorm":
+            from lumen.ops.normalization import rmsnorm
+
+            return rmsnorm(x, self.weight, self.eps)
+        from lumen.ops.normalization import layernorm
+
+        return layernorm(x, self.weight, self.eps)
 
 __all__ = [
     "LumenDuplicatedLinear",

@@ -1,25 +1,22 @@
 import torch
 
-from tile_kernels.quant import per_token_cast_back
-
-from .kernel.act_quant import act_quant
+from tile_kernels.quant.cast_back_kernel import per_token_cast_back
+from tile_kernels.quant.per_token_cast_kernel import per_token_cast
 
 
 def fp8_simulate(x: torch.Tensor, block_size: int):
-    """Simulate per-token FP8 (E4M3) cast + dequant with UE8M0 scaling.
-
-    Both the cast (via :func:`act_quant`) and the cast-back step are routed
-    through ``deepseek-ai/TileKernels`` so we share the same FP8 kernels with
-    the rest of the DeepSeek stack.
-    """
+    """Simulate per-token FP8 cast + dequant using TileKernels quant helpers."""
     x_c = x.contiguous()
-    y, scale = act_quant(x_c, block_size, "ue8m0")
-
-    N = x_c.size(-1)
-    y_flat = y.view(-1, N)
-    scale_flat = scale.reshape(y_flat.size(0), N // block_size).contiguous()
-
-    out_flat = per_token_cast_back((y_flat, scale_flat), "bf16" if x.dtype == torch.bfloat16 else "fp32", block_size)
+    n = x_c.size(-1)
+    y_flat, scale_flat = per_token_cast(
+        x_c.view(-1, n),
+        "e4m3",
+        block_size,
+        round_sf=True,
+        use_packed_ue8m0=True,
+    )
+    out_dtype = "bf16" if x.dtype == torch.bfloat16 else "fp32"
+    out_flat = per_token_cast_back((y_flat, scale_flat), out_dtype, block_size)
     return out_flat.view_as(x_c).to(x.dtype)
 
 

@@ -6,8 +6,11 @@ import os
 
 
 def get_mhc_backend() -> str:
-    """Return ``triton`` or ``tilelang`` (TileKernels ``MHC_BACKEND`` env)."""
-    return os.environ.get("MHC_BACKEND", "triton").lower()
+    """Return active MHC backend (TileKernels triton path)."""
+    backend = os.environ.get("MHC_BACKEND", "triton").lower()
+    if backend != "triton":
+        raise ValueError(f"MHC_BACKEND={backend!r} is unsupported; use 'triton'")
+    return backend
 
 
 def log_mhc_backend() -> str:
