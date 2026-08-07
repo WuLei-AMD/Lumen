@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Shared helpers for native GRPO finetune inner scripts (source, do not execute).
 
-# Override megatron args defaults (GBS=8, SEQ_LEN=2048) for rollout training.
+# Finetune defaults: GBS=256, seq_len=4096 (Miles GRPO smoke: 32×8 rollout samples).
+# Megatron arg files still use GBS=8 / SEQ_LEN=2048 for pretrain-only paths; this
+# helper overrides those when sourcing finetune inner scripts. Set DSV4_KEEP_GBS=1 or
+# DSV4_KEEP_SEQ_LEN=1 to preserve explicit smoke overrides (e.g. GBS=8, SEQ_LEN=512).
 dsv4_apply_finetune_batch_defaults() {
     GBS="${GBS:-256}"
     if [[ "${GBS}" == "8" && "${DSV4_KEEP_GBS:-0}" != "1" ]]; then

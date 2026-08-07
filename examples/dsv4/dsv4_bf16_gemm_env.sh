@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # DSV4 BF16 tuned GEMM defaults — sourced from dsv4_paths.sh.
 #
-# CSV strategy: gfx942-only GPU-tuned entries in configs/dsv4_bf16_tuned_gemm_mi308x.csv
-# (sole runtime file). Tune pipeline intermediates live under .gemm_tune/ (gitignored).
+# CSV strategy: shared gfx942 runtime file configs/dsv4_bf16_tuned_gemm_mi308x.csv
+# holds BOTH MI308X (cu_num=80) and MI300X (cu_num=304) rows. AITER lookup uses
+# runtime get_cu_num(), so platforms never conflict. Tune intermediates under
+# .gemm_tune/ (gitignored):
+#   bash examples/dsv4/run_tune_dsv4_bf16_gemm.sh          # auto cu_num
+#   bash examples/dsv4/run_tune_dsv4_bf16_gemm_flash2node.sh
+#
+# Optional override: CU_NUM=304 bash examples/dsv4/run_tune_dsv4_bf16_gemm.sh
 #
 # Env:
 #   LUMEN_DSV4_GEMM_BF16   1 (default) | 0 — route BF16 linear through gemm_bf16
