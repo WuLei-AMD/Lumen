@@ -32,6 +32,10 @@ from torch import Tensor
 _HC_POST_MULT_VALUE = 2.0
 
 
+def _as_fp32(tensor: Tensor) -> Tensor:
+    return tensor if tensor.dtype == torch.float32 else tensor.float()
+
+
 class HCHeadParams(MegatronModule):
     def __init__(self, config: TransformerConfig):
         super().__init__(config)
@@ -138,9 +142,9 @@ class DeepSeekV4HyperConnectionUtil:
         hc_base: Tensor,
     ) -> Tensor:
         """``x``: ``(B, S, hc_mult, hidden)``. Returns ``(B, S, hidden)``."""
-        assert hc_fn.dtype == torch.float32
-        assert hc_scale.dtype == torch.float32
-        assert hc_base.dtype == torch.float32
+        hc_fn = _as_fp32(hc_fn)
+        hc_scale = _as_fp32(hc_scale)
+        hc_base = _as_fp32(hc_base)
 
         dtype = x.dtype
         x_bf16 = (x if x.dtype == torch.bfloat16 else x.bfloat16()).contiguous()
@@ -175,9 +179,9 @@ class DeepSeekV4HyperConnectionUtil:
         hc_scale: Tensor,
         hc_base: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        assert hc_fn.dtype == torch.float32
-        assert hc_scale.dtype == torch.float32
-        assert hc_base.dtype == torch.float32
+        hc_fn = _as_fp32(hc_fn)
+        hc_scale = _as_fp32(hc_scale)
+        hc_base = _as_fp32(hc_base)
 
         x = einops.rearrange(hidden_states, "s b hc d -> b s hc d")
         x, post, comb = self.hc_pre_raw(x=x, hc_fn=hc_fn, hc_scale=hc_scale, hc_base=hc_base)

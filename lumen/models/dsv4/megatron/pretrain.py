@@ -26,11 +26,11 @@ __all__ = [
 
 
 def install_dsv4_safe_mock_data() -> None:
-    """Use Miles-style token ids for Megatron MockGPTDataset.
+    """Use safe token ids for Megatron MockGPTDataset.
 
     Default mock data cycles ``(arange + 1) % vocab_size``, which hits hash-routed
     MoE layers with ``tid2eid[input_ids] == -1`` for unmapped vocab slots and
-    triggers GPU faults during ``torch.gather``. Miles GRPO smoke uses small ids
+    triggers GPU faults during ``torch.gather``. GRPO smoke uses small ids
     (e.g. 100+) from fake rollout instead.
     """
     from megatron.core.datasets.gpt_dataset import MockGPTLowLevelDataset
@@ -39,7 +39,7 @@ def install_dsv4_safe_mock_data() -> None:
 
     def _safe_getitem(self, idx: int) -> numpy.number:
         length = self.sequence_lengths[idx]
-        # Miles fake-rollout style ids in [0, 128000); avoid NullTokenizer eod (= vocab_size).
+        # GRPO fake-rollout style ids in [0, 128000); avoid NullTokenizer eod (= vocab_size).
         tokens = numpy.array(
             [(token_base + idx * 7 + j * 13) % 128000 for j in range(length)],
             dtype=numpy.int64,
@@ -60,7 +60,7 @@ def install_dsv4_safe_mock_data() -> None:
 
 
 def dsv4_forward_step(data_iterator, model, return_schedule_plan: bool = False):
-    """Forward step aligned with Miles actor (``position_ids=None``, no attention mask)."""
+    """Forward step for DSV4 Megatron training (``position_ids=None``, no attention mask)."""
     from megatron.core.utils import get_attr_wrapped_model
     from megatron.training import get_args, get_timers
     from pretrain_gpt import get_batch, loss_func, stimer
@@ -100,17 +100,46 @@ def add_dsv4_pretrain_args(parser):
     group = parser.add_argument_group(title="dsv4 pretrain")
     safe_add_argument(
         group,
-        "--miles-dsa-topk-backend",
+        "--dsv4-dsa-topk-backend",
         type=str,
         default="torch",
         choices=["torch", "flashinfer"],
         help="Top-k backend for DSV4 DSA indexer.",
     )
+    safe_add_argument(
+        group,
+        "--original-max-position-embeddings",
+        type=int,
+        default=4096,
+        help="Original maximum position embeddings for YaRN RoPE (MLA).",
+    )
+    safe_add_argument(group, "--beta-fast", type=float, default=32, help="YaRN beta_fast (MLA).")
+    safe_add_argument(group, "--beta-slow", type=float, default=1, help="YaRN beta_slow (MLA).")
+    safe_add_argument(
+        group,
+        "--moe-router-freeze-gate",
+        action="store_true",
+        help="Freeze MoE router gate weights during training.",
+    )
+    safe_add_argument(
+        group,
+        "--freeze-e-score-correction-bias",
+        action="store_true",
+        help="Freeze MoE expert score correction bias during training.",
+    )
+    safe_add_argument(
+        group,
+        "--no-activation-func-clamp-shared-expert",
+        action="store_false",
+        dest="activation_func_clamp_shared_expert",
+        default=True,
+        help="Skip activation clamp inside shared expert MLP.",
+    )
     return parser
 
 
 def dsv4_gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
-    """Build GPTModel with callable ``--spec`` hooks (same as Miles model_provider)."""
+    """Build GPTModel with callable ``--spec`` hooks."""
     print_rank_0("building DSV4 GPT model ...")
 
     if config is None:

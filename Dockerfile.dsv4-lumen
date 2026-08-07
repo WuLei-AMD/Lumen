@@ -1,4 +1,4 @@
-# DSV4 training image: Lumen base + Miles bootstrap artifacts (no Miles base image).
+# DSV4 training image: Lumen base + bootstrap artifacts (TileKernels + pip deps).
 #
 # Build:
 #   bash examples/dsv4/build_dsv4_lumen_image.sh
@@ -12,7 +12,9 @@ FROM ${LUMEN_IMAGE}
 
 WORKDIR /workspace/Lumen
 
-# Bootstrap artifacts (Megatron miles-main, tile_kernels, tilelang, sglang).
+# Bootstrap artifacts (ROCm Megatron rocm_dev, TileKernels, mbridge via pip).
+# Replace bootstrap entirely (COPY merges; stale miles files remain from old base layers).
+RUN rm -rf /opt/dsv4-bootstrap
 COPY examples/dsv4/.bootstrap-build/ /opt/dsv4-bootstrap/
 RUN test -f /opt/dsv4-bootstrap/.ready
 
@@ -23,17 +25,12 @@ RUN apt-get update -qq \
 
 # Pre-stage writable runtime tree (no TE — ABI mismatch with Lumen PyTorch 2.8).
 RUN bash -c 'set -euo pipefail; \
-    mkdir -p /opt/dsv4-runtime/site-packages /opt/dsv4-runtime/tilelang /opt/dsv4-runtime/sglang-python; \
+    mkdir -p /opt/dsv4-runtime/site-packages; \
     rsync -a \
         --exclude=transformer_engine \
         --exclude=transformer_engine*.dist-info \
         --exclude=transformer_engine*.egg-info \
         /opt/dsv4-bootstrap/site-packages/. /opt/dsv4-runtime/site-packages/; \
-    cp -a /opt/dsv4-bootstrap/tilelang/. /opt/dsv4-runtime/tilelang/; \
-    cp -a /opt/dsv4-bootstrap/sglang-python/. /opt/dsv4-runtime/sglang-python/; \
-    if [[ -d /opt/dsv4-runtime/tilelang/build/lib && -d /opt/dsv4-runtime/tilelang/tilelang/3rdparty ]]; then \
-        rm -rf /opt/dsv4-runtime/tilelang/tilelang/3rdparty; \
-    fi; \
     printf "import megatron.core.jit as _jit\n_jit.disable_jit_fuser()\n" \
         > /opt/dsv4-runtime/site-packages/lumen_dsv4_bootstrap.pth'
 
@@ -47,8 +44,13 @@ RUN cd /workspace/Lumen/third_party/mori && \
 RUN mkdir -p /opt/dsv4-runtime/mori-libs && \
     cp /workspace/Lumen/third_party/mori/python/mori/*.so /opt/dsv4-runtime/mori-libs/
 RUN cd /workspace/Lumen && pip install -e ".[dev]" -q
-RUN pip install -r /workspace/Lumen/examples/dsv4/requirements-bootstrap.txt -q
+RUN pip install pyarrow -q \
+    && (pip install fast-hadamard-transform -q \
+        || echo "[dsv4-lumen] skip fast-hadamard-transform (optional on ROCm)")
 
+ENV V4_INDEXER_IMPL=aiter
+ENV V4_SPARSE_MLA_BACKEND=triton
+ENV MHC_BACKEND=triton
 ENV BOOTSTRAP_DIR=/opt/dsv4-bootstrap
 ENV WRITABLE_ROOT=/opt/dsv4-runtime
 ENV LD_LIBRARY_PATH="/opt/dsv4-bootstrap/native-libs:${LD_LIBRARY_PATH:-}"

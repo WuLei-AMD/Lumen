@@ -9,19 +9,14 @@ import torch
 
 
 def get_sparse_mla_backend() -> str:
-    return os.environ.get("V4_SPARSE_MLA_BACKEND", "triton").lower()
+    backend = os.environ.get("V4_SPARSE_MLA_BACKEND", "triton").lower()
+    if backend != "triton":
+        raise ValueError(f"V4_SPARSE_MLA_BACKEND={backend!r} is unsupported; use 'triton'")
+    return backend
 
 
 def get_sparse_attn_fn() -> Callable[..., torch.Tensor]:
-    backend = get_sparse_mla_backend()
-    if backend == "triton":
-        from lumen.models.dsv4.ops.kernel.triton_sparse_mla import sparse_attn_triton
+    get_sparse_mla_backend()
+    from lumen.models.dsv4.ops.kernel.triton_sparse_mla import sparse_attn_triton
 
-        return sparse_attn_triton
-    if backend == "tilelang":
-        from lumen.models.dsv4.ops.kernel.tilelang_sparse_mla import sparse_attn_tilelang
-
-        return sparse_attn_tilelang
-    raise ValueError(
-        f"Unknown V4_SPARSE_MLA_BACKEND={backend!r}; expected 'triton' or 'tilelang'"
-    )
+    return sparse_attn_triton

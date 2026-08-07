@@ -183,15 +183,15 @@ class DeepSeekV4Attention(MegatronModule):
                 cp_group=self.cp_group,
             )
             if self.compress_ratio == 4:
-                indexer_impl = os.environ.get("V4_INDEXER_IMPL", "tilelang")
-                topk_backend = config.miles_dsa_topk_backend
-                if indexer_impl == "tilelang":
+                indexer_impl = os.environ.get("V4_INDEXER_IMPL", "aiter")
+                topk_backend = config.dsv4_dsa_topk_backend
+                if indexer_impl in ("aiter", "tilelang"):
                     self.indexer = V4Indexer(config=config, pg_collection=pg_collection)
                 else:
                     if topk_backend != "torch":
                         raise ValueError(
-                            "DeepSeek V4 miles DSA topk backend is only supported with "
-                            f"V4_INDEXER_IMPL=tilelang; got {topk_backend=} with {indexer_impl=}."
+                            "DeepSeek V4 DSA topk backend is only supported with "
+                            f"V4_INDEXER_IMPL=aiter; got {topk_backend=} with {indexer_impl=}."
                         )
                     indexer_submodules = DSAIndexerSubmodules(
                         linear_wq_b=LumenDuplicatedLinear,
@@ -304,7 +304,9 @@ class DeepSeekV4Attention(MegatronModule):
             if kv_compress_sbd is not None:
                 kv_compress = einops.rearrange(kv_compress_sbd, "s b d -> b s d")
 
-        assert self.attn_sink.dtype == torch.float32
+        attn_sink = self.attn_sink
+        if attn_sink.dtype != torch.float32:
+            attn_sink = attn_sink.float()
 
         if self.cp_size > 1:
             kv_vanilla = all_gather_cp(kv_vanilla, dim=1, cp_group=self.cp_group)
@@ -317,9 +319,14 @@ class DeepSeekV4Attention(MegatronModule):
         else:
             kv = kv_vanilla
 
-        kv = copy_to_tensor_model_parallel_region(kv, group=self.tp_group, all_reduce_grad_fp32=True)
+        try:
+            kv = copy_to_tensor_model_parallel_region(
+                kv, group=self.tp_group, all_reduce_grad_fp32=True
+            )
+        except TypeError:
+            kv = copy_to_tensor_model_parallel_region(kv, group=self.tp_group)
 
-        o = _sparse_attn_fn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+        o = _sparse_attn_fn(q, kv, attn_sink, topk_idxs, self.softmax_scale)
 
         apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)
 
@@ -333,7 +340,7 @@ class DeepSeekV4Attention(MegatronModule):
         if self.sequence_parallel:
             output = scatter_to_sequence_parallel_region(output, group=self.tp_group)
 
-        return output
+        return output, None
 
     def _compute_indexer_mask(self, *, q_positions: torch.Tensor, seqlen_global: int) -> torch.Tensor:
         ratio = 4
@@ -392,7 +399,7 @@ def get_dsv4_spec(args, config, vp_stage):
 
         --spec lumen.models.dsv4.megatron.spec get_dsv4_spec
     """
-    config.miles_dsa_topk_backend = getattr(args, "miles_dsa_topk_backend", "torch")
+    config.dsv4_dsa_topk_backend = getattr(args, "dsv4_dsa_topk_backend", "torch")
     _patch_megatron_no_te()
     if mori_ep_enabled():
         patch_megatron_moe_mori()

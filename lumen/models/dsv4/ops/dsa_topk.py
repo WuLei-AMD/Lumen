@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 
@@ -5,6 +7,13 @@ _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
     "large": 2,
 }
+
+
+def _env_bool(name: str, *, default: bool = False) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.lower() in ("1", "true", "yes")
 
 
 def torch_dsa_topk(logits: torch.Tensor, topk: int) -> torch.Tensor:
@@ -15,7 +24,6 @@ def torch_dsa_topk(logits: torch.Tensor, topk: int) -> torch.Tensor:
 
 def flashinfer_dsa_topk(logits: torch.Tensor, topk: int) -> torch.Tensor:
     import flashinfer
-    from sglang.srt.environ import envs
 
     orig_shape = logits.shape
     if logits.dim() > 2:
@@ -25,7 +33,10 @@ def flashinfer_dsa_topk(logits: torch.Tensor, topk: int) -> torch.Tensor:
         logits,
         topk,
         sorted=False,
-        deterministic=envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
+        deterministic=_env_bool(
+            "DSV4_DSA_TOPK_FLASHINFER_DETERMINISTIC",
+            default=_env_bool("SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC"),
+        ),
         tie_break=_flashinfer_tie_break_value(),
         dsa_graph_safe=True,
     )
@@ -41,19 +52,19 @@ def get_dsa_topk_fn(topk_backend: str):
         return torch_dsa_topk
     if topk_backend == "flashinfer":
         return flashinfer_dsa_topk
-    raise ValueError(f"Unsupported miles DSA topk backend: {topk_backend}")
+    raise ValueError(f"Unsupported DSV4 DSA topk backend: {topk_backend}")
 
 
 def _flashinfer_tie_break_value() -> int:
-    from sglang.srt.environ import envs
-
-    mode = envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.get()
+    mode = os.environ.get("DSV4_DSA_TOPK_FLASHINFER_TIE_BREAK") or os.environ.get(
+        "SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK"
+    )
     if mode is None:
         return 0
     mode = mode.lower()
     if mode not in _FLASHINFER_TIE_BREAK_VALUES:
         raise RuntimeError(
-            "SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK must be one of "
+            "DSV4_DSA_TOPK_FLASHINFER_TIE_BREAK must be one of "
             f"{tuple(_FLASHINFER_TIE_BREAK_VALUES)} or unset, got {mode!r}."
         )
     return _FLASHINFER_TIE_BREAK_VALUES[mode]
