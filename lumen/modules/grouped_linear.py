@@ -93,6 +93,7 @@ class LumenGroupedLinear(nn.Module):
         self.delay_wgrad = False
         self.fp8_activation_store = False
         self._deferred_wgrad = _DeferredWgrad()
+        self.use_gemm_bf16 = False
 
         for gemm_idx in range(num_gemms):
             weight = Parameter(
@@ -149,7 +150,12 @@ class LumenGroupedLinear(nn.Module):
                     deferred_wgrad=self._deferred_wgrad if self.delay_wgrad else None,
                 )
             else:
-                yi = F.linear(xi, weight, bias_i)
+                if self.use_gemm_bf16:
+                    from lumen.ops.quantize.linear import gemm_bf16
+
+                    yi = gemm_bf16(xi, weight, bias_i)
+                else:
+                    yi = F.linear(xi, weight, bias_i)
             outputs.append(yi)
             offset += count
 
