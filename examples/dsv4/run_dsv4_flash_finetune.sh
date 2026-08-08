@@ -26,6 +26,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=examples/dsv4/dsv4_paths.sh
 source "${SCRIPT_DIR}/dsv4_paths.sh"
+# shellcheck source=examples/dsv4/dsv4_docker_common.sh
+source "${SCRIPT_DIR}/dsv4_docker_common.sh"
 
 IMAGE="${IMAGE:-lumen/dsv4-lumen:mi308x}"
 
@@ -183,6 +185,7 @@ DOCKER_ENV=(
 if [[ -d "${TILEKERNELS_DIR}" ]]; then
     DOCKER_ENV+=(-e TILEKERNELS_DIR=/workspace/TileKernels)
 fi
+dsv4_docker_append_gemm_env
 if [[ "${USE_MILES_IMAGE}" -eq 1 ]]; then
     DOCKER_ENV+=(
         -e RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1

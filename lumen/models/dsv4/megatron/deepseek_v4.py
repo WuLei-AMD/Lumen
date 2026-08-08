@@ -15,7 +15,6 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
@@ -152,13 +151,16 @@ class DeepSeekV4Attention(MegatronModule):
         for p in list(self.wq_a.parameters()) + list(self.wkv.parameters()):
             p.sequence_parallel = False
 
-        self.wo_a = ColumnParallelLinear(
+        self.wo_a = LumenColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
             config=config_no_sp,
             init_method=config.init_method,
             bias=False,
             gather_output=False,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_group=self.tp_group,
         )
         self.wo_b = LumenRowParallelLinear(
             self.n_groups * self.o_lora_rank,

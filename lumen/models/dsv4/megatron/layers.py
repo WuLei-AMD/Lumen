@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Callable, Optional
 
 import torch
@@ -12,7 +13,19 @@ from megatron.core.tensor_parallel.layers import (
 )
 from megatron.core.transformer.module import MegatronModule
 
-from lumen.modules.parallel_linear import LumenColumnParallelLinear, LumenRowParallelLinear
+from lumen.modules.grouped_linear import (
+    LumenColumnParallelGroupedLinear as _LumenColumnParallelGroupedLinear,
+    LumenRowParallelGroupedLinear as _LumenRowParallelGroupedLinear,
+)
+from lumen.modules.parallel_linear import (
+    LumenColumnParallelLinear as _LumenColumnParallelLinear,
+    LumenRowParallelLinear as _LumenRowParallelLinear,
+)
+from lumen.ops.quantize.linear import gemm_bf16
+
+
+def _dsv4_use_gemm_bf16() -> bool:
+    return os.environ.get("LUMEN_DSV4_GEMM_BF16", "1") != "0"
 
 
 class LumenNorm(torch.nn.Module):
@@ -24,8 +37,7 @@ class LumenNorm(torch.nn.Module):
         self.eps = eps
         norm_type = getattr(config, "normalization", "LayerNorm")
         self._norm_type = norm_type
-        # Own weight at ``*.weight`` so torch_dist ckpt keys match mbridge/HF
-        # (nested ``_norm.weight`` breaks dist checkpoint load).
+        # Own weight at ``*.weight`` so torch_dist ckpt keys match mbridge/HF.
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
     def forward(self, x):
@@ -37,10 +49,37 @@ class LumenNorm(torch.nn.Module):
 
         return layernorm(x, self.weight, self.eps)
 
+
+class _Dsv4GemmBf16Mixin:
+    """Enable AITER tuned BF16 GEMM on DSV4 linear subclasses."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_gemm_bf16 = _dsv4_use_gemm_bf16()
+
+
+class LumenColumnParallelLinear(_Dsv4GemmBf16Mixin, _LumenColumnParallelLinear):
+    pass
+
+
+class LumenRowParallelLinear(_Dsv4GemmBf16Mixin, _LumenRowParallelLinear):
+    pass
+
+
+class LumenColumnParallelGroupedLinear(_Dsv4GemmBf16Mixin, _LumenColumnParallelGroupedLinear):
+    pass
+
+
+class LumenRowParallelGroupedLinear(_Dsv4GemmBf16Mixin, _LumenRowParallelGroupedLinear):
+    pass
+
+
 __all__ = [
     "LumenDuplicatedLinear",
     "LumenColumnParallelLinear",
     "LumenRowParallelLinear",
+    "LumenColumnParallelGroupedLinear",
+    "LumenRowParallelGroupedLinear",
     "LumenNorm",
 ]
 
@@ -72,6 +111,7 @@ class LumenDuplicatedLinear(MegatronModule):
         self.input_size = input_size
         self.output_size = output_size
         self.skip_bias_add = skip_bias_add
+        self.use_gemm_bf16 = _dsv4_use_gemm_bf16()
 
         self.scaling_type = "none"
         self.scaling_manager = None
@@ -107,6 +147,8 @@ class LumenDuplicatedLinear(MegatronModule):
                 fp8_dtype=self.fp8_dtype,
                 block_size=self.block_size,
             )
+        elif self.use_gemm_bf16:
+            out = gemm_bf16(x, self.weight, bias)
         else:
             out = F.linear(x, self.weight, bias)
         output_bias = self.bias if self.skip_bias_add and self.bias is not None else None

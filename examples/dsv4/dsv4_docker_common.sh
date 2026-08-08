@@ -89,7 +89,11 @@ dsv4_docker_append_bootstrap_env() {
     if [[ "${USE_BOOTSTRAP}" -eq 1 && -n "${BOOTSTRAP_MOUNT}" ]]; then
         DOCKER_ENV+=(-e BOOTSTRAP_DIR=/bootstrap)
     elif [[ "${IMAGE}" == "lumen/dsv4-lumen:mi308x" ]]; then
-        DOCKER_ENV+=(-e BOOTSTRAP_DIR=/opt/dsv4-bootstrap -e WRITABLE_ROOT=/opt/dsv4-runtime)
+        DOCKER_ENV+=(
+            -e BOOTSTRAP_DIR=/opt/dsv4-bootstrap
+            -e WRITABLE_ROOT=/opt/dsv4-runtime
+            -e TILELANG_DIR=/opt/dsv4-runtime/tilelang
+        )
     fi
 }
 
@@ -128,6 +132,24 @@ dsv4_docker_append_rocm_env() {
     if [[ -n "${NCCL_NET_GDR_LEVEL:-}" ]]; then
         DOCKER_ENV+=(-e NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL}")
     fi
+}
+
+# Pass GEMM routing flags; remap host LUMEN_DIR CSV paths to container /workspace/Lumen.
+dsv4_docker_append_gemm_env() {
+    DOCKER_ENV+=(
+        -e "LUMEN_DSV4_GEMM_BF16=${LUMEN_DSV4_GEMM_BF16:-1}"
+        -e "AITER_LOG_TUNED_CONFIG=${AITER_LOG_TUNED_CONFIG:-0}"
+        -e "AITER_LOG_MORE=${AITER_LOG_MORE:-0}"
+    )
+    if [[ -z "${AITER_CONFIG_GEMM_BF16:-}" ]]; then
+        return 0
+    fi
+    local _host_csv="${AITER_CONFIG_GEMM_BF16}"
+    local _container_csv="${_host_csv}"
+    if [[ "${_host_csv}" == "${LUMEN_DIR}/"* ]]; then
+        _container_csv="/workspace/Lumen/${_host_csv#"${LUMEN_DIR}/"}"
+    fi
+    DOCKER_ENV+=(-e "AITER_CONFIG_GEMM_BF16=${_container_csv}")
 }
 
 dsv4_docker_append_multinode_env() {

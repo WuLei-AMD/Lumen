@@ -74,7 +74,27 @@ _dsv4_prepend_pythonpath() {
     fi
 }
 
-# FP8 QAT uses tile_kernels.quant (TileLang JIT); runtime mounts from NFS, not the image.
+# FP8 QAT uses tile_kernels.quant (TileLang JIT); prefer host mount, else in-image copy.
+_dsv4_resolve_tilelang_dir() {
+    if [[ -n "${TILELANG_DIR:-}" && -d "${TILELANG_DIR}/tilelang" ]]; then
+        return
+    fi
+    for candidate in \
+        "${TILELANG_DIR:-}" \
+        "${DATA_ROOT:-}/tilelang" \
+        "${BOOTSTRAP_DIR}/tilelang" \
+        "${WRITABLE_ROOT}/tilelang" \
+        "/opt/dsv4-runtime/tilelang" \
+        "/opt/dsv4-bootstrap/tilelang"; do
+        if [[ -n "${candidate}" && -d "${candidate}/tilelang" ]]; then
+            TILELANG_DIR="${candidate}"
+            export TILELANG_DIR
+            echo "[bootstrap_env] TILELANG_DIR=${TILELANG_DIR}"
+            return
+        fi
+    done
+}
+_dsv4_resolve_tilelang_dir
 _dsv4_prepend_pythonpath "${PYTHON_EXTRAS_DIR:-}"
 _dsv4_prepend_pythonpath "${TILELANG_DIR:-}"
 
@@ -202,4 +222,8 @@ try:
 except Exception as e:
     print(f"[bootstrap_env] FAIL MHC/tile_kernels: {e}")
     raise SystemExit(1)
+
+_gemm_bf16 = os.environ.get("LUMEN_DSV4_GEMM_BF16", "1")
+_gemm_csv = os.environ.get("AITER_CONFIG_GEMM_BF16", "")
+print(f"[bootstrap_env] GEMM BF16: LUMEN_DSV4_GEMM_BF16={_gemm_bf16} AITER_CONFIG_GEMM_BF16={_gemm_csv}")
 PY

@@ -21,6 +21,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=examples/dsv4/dsv4_paths.sh
 source "${SCRIPT_DIR}/dsv4_paths.sh"
+# shellcheck source=examples/dsv4/dsv4_docker_common.sh
+source "${SCRIPT_DIR}/dsv4_docker_common.sh"
 
 LOGFILE="${LOG_DIR}/lumen_dsv4_4layer_finetune_$(date +%Y%m%d_%H%M%S).log"
 
@@ -76,6 +78,7 @@ echo "  Spec      : lumen.models.dsv4.megatron.spec get_dsv4_spec"
 echo "  Rollouts  : ${NUM_ROLLOUT}"
 echo "  HC mult   : ${DSV4_HC_MULT} (MHC_BACKEND=${MHC_BACKEND})"
 echo "  SparseMLA : ${V4_SPARSE_MLA_BACKEND}"
+dsv4_print_gemm_env
 echo "  Ckpt      : ${TORCH_DIST}"
 echo "  Miles     : ${MILES_DIR}"
 echo "  Log       : ${LOGFILE}"
@@ -109,28 +112,11 @@ DOCKER_ENV=(
     -e SKIP_PREPARE="${SKIP_PREPARE}"
     -e NUM_ROLLOUT="${NUM_ROLLOUT}"
     -e GBS="${GBS:-256}"
-    -e V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND}"
-    -e MHC_BACKEND="${MHC_BACKEND}"
-    -e V4_INDEXER_IMPL="${V4_INDEXER_IMPL}"
-    -e V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N}"
-    -e V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES}"
 )
-if [[ -d "${TILEKERNELS_DIR}" ]]; then
-    DOCKER_ENV+=(-e TILEKERNELS_DIR=/workspace/TileKernels)
-fi
-DOCKER_ENV+=(
-    -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-    -e CUDA_DEVICE_MAX_CONNECTIONS=1
-    -e NCCL_NVLS_ENABLE=0
-    -e RCCL_MSCCL_ENABLE=0
-    -e HSA_FORCE_FINE_GRAIN_PCIE=1
-    -e TORCHDYNAMO_DISABLE=1
-)
-if [[ "${USE_BOOTSTRAP}" -eq 1 && -n "${BOOTSTRAP_MOUNT}" ]]; then
-    DOCKER_ENV+=(-e BOOTSTRAP_DIR=/bootstrap)
-elif [[ "${IMAGE}" == "lumen/dsv4-lumen:mi308x" ]]; then
-    DOCKER_ENV+=(-e BOOTSTRAP_DIR=/opt/dsv4-bootstrap -e WRITABLE_ROOT=/opt/dsv4-runtime)
-fi
+dsv4_docker_append_kernel_env
+dsv4_docker_append_gemm_env
+dsv4_docker_append_rocm_env
+dsv4_docker_append_bootstrap_env
 
 docker rm -f lumen-dsv4-finetune 2>/dev/null || true
 

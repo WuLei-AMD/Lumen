@@ -94,6 +94,7 @@ echo "  Mode      : native torchrun GRPO (debug-train-only=${DEBUG_TRAIN_ONLY})"
 echo "  Batch     : GBS=${GBS} MBS=${MBS} seq_len=${SEQ_LEN}"
 echo "  HC mult   : ${DSV4_HC_MULT} (MHC_BACKEND=${MHC_BACKEND})"
 echo "  SparseMLA : ${V4_SPARSE_MLA_BACKEND}"
+dsv4_print_gemm_env
 echo "  Ckpt      : ${CKPT_HOST}"
 echo "  Rollout   : ${FAKE_ROLLOUT_DATA}"
 echo "  Log       : ${LOGFILE}"
@@ -132,6 +133,7 @@ if [[ "${DSV4_PROFILE}" == "flash" ]]; then
     dsv4_docker_append_multinode_env
 fi
 dsv4_docker_append_kernel_env
+dsv4_docker_append_gemm_env
 dsv4_docker_append_rocm_env
 dsv4_docker_append_bootstrap_env
 
