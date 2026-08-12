@@ -465,6 +465,9 @@ class LumenColumnParallelLinear(nn.Module):
                         world_size=self.tp_size,
                         skip_set_tensor_parallel_attributes=True,
                     )
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight, is_parallel=True, dim=0, stride=stride
+                )
             else:
                 self.weight = Parameter(
                     torch.empty(
