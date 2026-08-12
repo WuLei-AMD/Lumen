@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import copy
-import os
 
 import einops
 import torch
-import torch.nn as nn
-
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.models.gpt import experimental_attention_variant_module_specs as _eav_specs
+from megatron.core.models.gpt import (
+    experimental_attention_variant_module_specs as _eav_specs,
+)
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
 )
@@ -20,11 +19,11 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer, DSAIndexerSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+from torch import nn
 
 from lumen.models.dsv4.megatron.layers import (
     LumenColumnParallelLinear,
@@ -35,8 +34,8 @@ from lumen.models.dsv4.megatron.layers import (
 from lumen.models.dsv4.megatron.moe_mori import mori_ep_enabled, patch_megatron_moe_mori
 from lumen.models.dsv4.megatron.spec_provider import LumenDSV4SpecProvider
 from lumen.models.dsv4.megatron.v4_indexer import V4Indexer
-from lumen.models.dsv4.ops import (
-    DeepSeekV4Compressor,
+from lumen.models.dsv4.ops.compressor import DeepSeekV4Compressor
+from lumen.ops.dsv4 import (
     all_gather_cp,
     apply_rotary_emb,
     fp8_simulate_qat,
@@ -46,7 +45,7 @@ from lumen.models.dsv4.ops import (
     get_window_topk_idxs_cp,
     wrapped_precompute_freqs_cis,
 )
-from lumen.models.dsv4.ops.sparse_mla_backend import get_sparse_attn_fn
+from lumen.ops.dsv4.sparse_mla import get_sparse_attn_fn
 
 _sparse_attn_fn = get_sparse_attn_fn()
 
@@ -64,8 +63,8 @@ class DeepSeekV4Attention(MegatronModule):
         submodules=None,
         layer_number: int = 1,
         attn_mask_type=None,
-        attention_type: str = None,
-        cp_comm_type: str = None,
+        attention_type: str | None = None,
+        cp_comm_type: str | None = None,
         pg_collection=None,
     ):
         _enable_deepseek_v4_tf32()
@@ -108,7 +107,7 @@ class DeepSeekV4Attention(MegatronModule):
         config_no_sp = copy.copy(config)
         config_no_sp.sequence_parallel = False
 
-        self.attn_sink = nn.Parameter(torch.empty(self.n_local_heads, dtype=torch.float32))
+        self.attn_sink = nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
         self.attn_sink._keep_fp32 = True
         self.attn_sink.tensor_model_parallel = True
         self.attn_sink.partition_dim = 0
@@ -185,23 +184,7 @@ class DeepSeekV4Attention(MegatronModule):
                 cp_group=self.cp_group,
             )
             if self.compress_ratio == 4:
-                indexer_impl = os.environ.get("V4_INDEXER_IMPL", "aiter")
-                topk_backend = config.dsv4_dsa_topk_backend
-                if indexer_impl in ("aiter", "tilelang"):
-                    self.indexer = V4Indexer(config=config, pg_collection=pg_collection)
-                else:
-                    if topk_backend != "torch":
-                        raise ValueError(
-                            "DeepSeek V4 DSA topk backend is only supported with "
-                            f"V4_INDEXER_IMPL=aiter; got {topk_backend=} with {indexer_impl=}."
-                        )
-                    indexer_submodules = DSAIndexerSubmodules(
-                        linear_wq_b=LumenDuplicatedLinear,
-                        linear_wk=LumenDuplicatedLinear,
-                        k_norm=LumenNorm,
-                        linear_weights_proj=LumenDuplicatedLinear,
-                    )
-                    self.indexer = DSAIndexer(config=config, submodules=indexer_submodules)
+                self.indexer = V4Indexer(config=config, pg_collection=pg_collection)
             else:
                 self.indexer = None
 
@@ -269,7 +252,9 @@ class DeepSeekV4Attention(MegatronModule):
         apply_rotary_emb(kv_vanilla[..., -rd:], freqs_cis)
         if self.use_fp8_qat:
             kv_vanilla = kv_vanilla.clone()
-            kv_vanilla[..., : self.nope_head_dim] = fp8_simulate_qat(kv_vanilla[..., : self.nope_head_dim], 64)
+            kv_vanilla[..., : self.nope_head_dim] = fp8_simulate_qat(
+                kv_vanilla[..., : self.nope_head_dim], 64
+            )
 
         seqlen_global = seqlen_local * self.cp_size
         q_positions = get_q_positions_for_cp(
@@ -382,12 +367,12 @@ def _patch_megatron_no_te() -> None:
 
     oc.is_te_min_version = _is_te_min_version
 
-    import megatron.core.transformer.moe.moe_utils as moe_utils
+    from megatron.core.transformer.moe import moe_utils
 
     if not getattr(moe_utils, "HAVE_TE", False):
         moe_utils.te_general_gemm = None
 
-    import megatron.core.jit as jit
+    from megatron.core import jit
 
     jit.disable_jit_fuser()
 

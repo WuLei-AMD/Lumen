@@ -56,9 +56,15 @@ dsv4_docker_append_infiniband_devices() {
 }
 
 dsv4_docker_build_mounts() {
+    if [[ ! -d "${AITER_DIR}/aiter" ]]; then
+        echo "[ERROR] AITER_DIR does not contain the aiter package: ${AITER_DIR}"
+        echo "        Set AITER_DIR to the actively developed AIter checkout."
+        exit 1
+    fi
     DOCKER_DEVICES=()
     DOCKER_MOUNTS=(
         -v "${LUMEN_DIR}:/workspace/Lumen"
+        -v "${AITER_DIR}:/workspace/aiter"
         -v "${MODEL_DIR}:/root/models"
         -v "${DATA_DIR}:/root/datasets"
         -v "${MODEL_DIR}/miopen-cache:/root/.config/miopen"
@@ -69,9 +75,6 @@ dsv4_docker_build_mounts() {
         DOCKER_MOUNTS+=(-v "${DATA_ROOT}:${DATA_ROOT}")
     elif [[ "${DSV4_PROFILE}" == "flash" && -d "${NFS_ROOT}" ]]; then
         DOCKER_MOUNTS+=(-v "${NFS_ROOT}:${NFS_ROOT}")
-    fi
-    if [[ -d "${TILEKERNELS_DIR}" ]]; then
-        DOCKER_MOUNTS+=(-v "${TILEKERNELS_DIR}:/workspace/TileKernels")
     fi
     if [[ -d "${MILES_DIR:-}" ]]; then
         DOCKER_MOUNTS+=(-v "${MILES_DIR}:/workspace/miles")
@@ -99,16 +102,13 @@ dsv4_docker_append_bootstrap_env() {
 
 dsv4_docker_append_kernel_env() {
     DOCKER_ENV+=(
+        -e AITER_DIR=/workspace/aiter
         -e V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND}"
-        -e MHC_BACKEND="${MHC_BACKEND}"
         -e V4_INDEXER_IMPL="${V4_INDEXER_IMPL}"
         -e V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N}"
         -e V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES}"
         -e DSV4_ENABLE_RECOMPUTE="${DSV4_ENABLE_RECOMPUTE:-1}"
     )
-    if [[ -d "${TILEKERNELS_DIR}" ]]; then
-        DOCKER_ENV+=(-e TILEKERNELS_DIR=/workspace/TileKernels)
-    fi
     if [[ -d "${TILELANG_DIR}" ]]; then
         DOCKER_ENV+=(-e TILELANG_DIR="${TILELANG_DIR}")
     fi

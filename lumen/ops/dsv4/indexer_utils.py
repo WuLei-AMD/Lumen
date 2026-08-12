@@ -22,7 +22,7 @@ def mask_logits_with_cu_seqlens(
     cu_seqlen_ke: torch.Tensor,
 ) -> torch.Tensor:
     """Apply per-query ``[ks, ke)`` bounds on compressed KV axis."""
-    seq_len, seq_len_kv = logits.shape
+    _seq_len, seq_len_kv = logits.shape
     p_idx = torch.arange(seq_len_kv, device=logits.device, dtype=torch.int32)[None, :]
     valid = (p_idx >= cu_seqlen_ks[:, None]) & (p_idx < cu_seqlen_ke[:, None])
     return logits.masked_fill(~valid, float("-inf"))

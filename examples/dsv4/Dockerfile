@@ -31,7 +31,7 @@ RUN bash -c 'set -euo pipefail; \
         --exclude=transformer_engine*.dist-info \
         --exclude=transformer_engine*.egg-info \
         /opt/dsv4-bootstrap/site-packages/. /opt/dsv4-runtime/site-packages/; \
-    printf "import os\nos.environ.setdefault('MHC_BACKEND', 'triton')\nimport megatron.core.jit as _jit\n_jit.disable_jit_fuser()\n" \
+    printf "import megatron.core.jit as _jit\n_jit.disable_jit_fuser()\n" \
         > /opt/dsv4-runtime/site-packages/lumen_dsv4_bootstrap.pth'
 
 # Lumen source (submodules must be checked out on host).
@@ -50,7 +50,6 @@ RUN pip install pyarrow -q \
 
 ENV V4_INDEXER_IMPL=aiter
 ENV V4_SPARSE_MLA_BACKEND=triton
-ENV MHC_BACKEND=triton
 ENV BOOTSTRAP_DIR=/opt/dsv4-bootstrap
 ENV WRITABLE_ROOT=/opt/dsv4-runtime
 ENV LD_LIBRARY_PATH="/opt/dsv4-bootstrap/native-libs:${LD_LIBRARY_PATH:-}"

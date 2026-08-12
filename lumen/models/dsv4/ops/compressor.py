@@ -1,14 +1,19 @@
 import einops
 import torch
-import torch.nn as nn
 from megatron.core.transformer.transformer_config import TransformerConfig
+from torch import nn
 from torch.nn import Linear
 
-from lumen.models.dsv4.ops.cp_utils import all_gather_cp, get_freqs_cis_for_cp
-from lumen.models.dsv4.ops.kernel.precision_aligned_ops import linear_bf16_fp32
-from lumen.models.dsv4.ops.qat import fp8_simulate_qat
-from lumen.models.dsv4.ops.rope import apply_rotary_emb, wrapped_precompute_freqs_cis
-from lumen.models.dsv4.ops.utils import rotate_activation
+from lumen.kernels.dsv4.quant.precision_aligned_ops import linear_bf16_fp32
+from lumen.ops.dsv4.cp_utils import all_gather_cp, get_freqs_cis_for_cp
+from lumen.ops.dsv4.rope import apply_rotary_emb, wrapped_precompute_freqs_cis
+from lumen.ops.dsv4.utils import rotate_activation
+
+
+def _fp8_simulate_qat(x: torch.Tensor, block_size: int) -> torch.Tensor:
+    from lumen.ops.dsv4.qat import fp8_simulate_qat
+
+    return fp8_simulate_qat(x, block_size)
 
 
 class RMSNorm(nn.Module):
@@ -82,7 +87,7 @@ class DeepSeekV4Compressor(nn.Module):
         self.cp_size = cp_group.size() if cp_group is not None else 1
         self.cp_rank = cp_group.rank() if cp_group is not None else 0
 
-        self.ape = nn.Parameter(torch.empty(compress_ratio, coff * self.head_dim, dtype=torch.float32))
+        self.ape = nn.Parameter(torch.zeros(compress_ratio, coff * self.head_dim, dtype=torch.float32))
         self.wkv = Linear(self.dim, coff * self.head_dim, bias=False, dtype=torch.bfloat16)
         self.wgate = Linear(self.dim, coff * self.head_dim, bias=False, dtype=torch.bfloat16)
         self.norm = RMSNorm(self.head_dim, norm_eps)
@@ -124,7 +129,7 @@ class DeepSeekV4Compressor(nn.Module):
         assert self.wkv.weight.dtype == torch.bfloat16
         assert self.wgate.weight.dtype == torch.bfloat16
 
-        bsz, seqlen_local, _ = x.size()
+        _, seqlen_local, _ = x.size()
         ratio, overlap, _ = self.compress_ratio, self.overlap, self.head_dim
         dtype = x.dtype
 
@@ -162,11 +167,13 @@ class DeepSeekV4Compressor(nn.Module):
         if self.rotate:
             kv = rotate_activation(kv)
             if self.use_fp8_qat:
-                kv = fp8_simulate_qat(kv, 128)
+                kv = _fp8_simulate_qat(kv, 128)
         else:
             if self.use_fp8_qat:
                 kv = kv.clone()
-                kv[..., : self.nope_head_dim] = fp8_simulate_qat(kv[..., : self.nope_head_dim], 64)
+                kv[..., : self.nope_head_dim] = _fp8_simulate_qat(
+                    kv[..., : self.nope_head_dim], 64
+                )
 
         return kv
 

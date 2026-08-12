@@ -15,7 +15,7 @@
 | 网络 | 按集群设置 `NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME`（MI308X Banff 常用 `ens14np0`） |
 | NCCL workaround | `NCCL_IB_GDR_LEVEL=0`, `NCCL_NET_GDR_LEVEL=LOC`, `MEGATRON_NO_BATCH_P2P_COMM=1` |
 
-**Worker 上还需**：`${LUMEN_DIR}`、`${TILEKERNELS_DIR}` 与 head 同步。
+**Worker 上还需**：`${LUMEN_DIR}` 与 `/workspace/aiter` 中的 AIter 部署与 head 同步。
 
 ### 1.1 本地 checkpoint（推荐，默认 launch 示例）
 
@@ -120,7 +120,7 @@ MODEL_DIR=/data1/${USER}/models \
 WORKER_MODEL_DIR=/mnt/nvme0n1/${USER}/models \
 DATA_ROOT=/nfs/data/${USER} \
 SKIP_PREPARE=1 DSV4_HC_MULT=4 \
-V4_INDEXER_IMPL=aiter V4_SPARSE_MLA_BACKEND=triton MHC_BACKEND=triton \
+V4_INDEXER_IMPL=aiter V4_SPARSE_MLA_BACKEND=triton \
 OPTIMIZER_OFFLOAD_FRACTION=0.75 \
 NCCL_IB_GDR_LEVEL=0 NCCL_NET_GDR_LEVEL=LOC MEGATRON_NO_BATCH_P2P_COMM=1 \
 HSA_OVERRIDE_GFX_VERSION=9.4.2 NCCL_SOCKET_IFNAME=ens14np0 GLOO_SOCKET_IFNAME=ens14np0 \
@@ -154,7 +154,7 @@ bash examples/dsv4/launch_dsv4_2node.sh
 | `DATA_ROOT` | `/nfs/data/${USER}` | 共享 rollout 路径 |
 | `V4_INDEXER_IMPL` | `aiter` | DSA indexer（aiter triton kernel） |
 | `V4_SPARSE_MLA_BACKEND` | `triton` | sparse MLA |
-| `MHC_BACKEND` | `triton` | 需挂载 TileKernels |
+| MHC | AIter | 直接使用 AIter DSV4 fused API |
 | `MEGATRON_NO_BATCH_P2P_COMM` | `1` | 避免 PP P2P hang |
 | `NCCL_IB_GDR_LEVEL` | `0` | IB GDR workaround |
 | `NCCL_NET_GDR_LEVEL` | `LOC` | 配合上项 |
@@ -170,7 +170,7 @@ cd "${LUMEN_DIR}"
 NODE_RANK=0 MASTER_ADDR=<head-ip> \
 MODEL_DIR=/data1/${USER}/models \
 SKIP_PREPARE=1 DSV4_HC_MULT=4 \
-V4_INDEXER_IMPL=aiter V4_SPARSE_MLA_BACKEND=triton MHC_BACKEND=triton \
+V4_INDEXER_IMPL=aiter V4_SPARSE_MLA_BACKEND=triton \
 OPTIMIZER_OFFLOAD_FRACTION=0.75 \
 NCCL_IB_GDR_LEVEL=0 NCCL_NET_GDR_LEVEL=LOC MEGATRON_NO_BATCH_P2P_COMM=1 \
 HSA_OVERRIDE_GFX_VERSION=9.4.2 NCCL_SOCKET_IFNAME=ens14np0 GLOO_SOCKET_IFNAME=ens14np0 \

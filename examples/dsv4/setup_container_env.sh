@@ -18,22 +18,38 @@ setup_dsv4_container_env() {
         export MEGATRON_PATH="${MEGATRON_PATH:-/root/Megatron-LM}"
     fi
 
+    export AITER_DIR="${AITER_DIR:-/workspace/aiter}"
+    if ! PYTHONPATH="${AITER_DIR}:${PYTHONPATH:-}" python3 - <<'PY'
+import os
+from importlib import import_module
+from pathlib import Path
+
+mhc = import_module("aiter.ops.triton.fusions.mhc")
+
+required = ("mhc_pre_dsv4", "mhc_post_dsv4", "mhc_head_dsv4")
+missing = [name for name in required if not callable(getattr(mhc, name, None))]
+if missing:
+    raise SystemExit(
+        "missing required AIter DSV4 MHC APIs: " + ", ".join(missing)
+    )
+
+aiter_dir = Path(os.environ["AITER_DIR"]).resolve()
+module_path = Path(mhc.__file__).resolve()
+if aiter_dir not in module_path.parents:
+    raise SystemExit(
+        f"AIter DSV4 MHC resolved from {module_path}, expected checkout {aiter_dir}"
+    )
+print(f"[setup] OK AIter DSV4 MHC APIs: {module_path}")
+PY
+    then
+        echo "[setup][ERROR] missing required AIter DSV4 MHC APIs in ${AITER_DIR}" >&2
+        return 1
+    fi
+
     if [[ -f examples/dsv4/patch_rocm_megatron_dsv4.py && -d "${MEGATRON_PATH}" ]]; then
         echo "[setup] ensuring ROCm Megatron DSV4 patch on ${MEGATRON_PATH}"
         PYTHONPATH="/workspace/Lumen:${PYTHONPATH:-}" \
             python3 examples/dsv4/patch_rocm_megatron_dsv4.py "${MEGATRON_PATH}"
-    fi
-
-    if [[ -f examples/dsv4/patch_mi308x_tile_kernels.py && -n "${SITE_PKGS:-}" ]]; then
-        TK_PATCH="${SITE_PKGS}/tile_kernels"
-        if [[ -n "${TILEKERNELS_DIR:-}" && -d "${TILEKERNELS_DIR}/tile_kernels" ]]; then
-            TK_PATCH="${TILEKERNELS_DIR}/tile_kernels"
-        fi
-        if [[ "${MHC_BACKEND:-triton}" == "tilelang" ]]; then
-            python3 examples/dsv4/patch_mi308x_tile_kernels.py "${TK_PATCH}"
-        else
-            echo "[setup] skip MI308X tilelang MHC patches (MHC_BACKEND=${MHC_BACKEND:-triton})"
-        fi
     fi
 
     local datasets_dir="${MEGATRON_PATH}/megatron/core/datasets"

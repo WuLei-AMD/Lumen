@@ -54,17 +54,6 @@ preflight_dsv4_multinode() {
     local run_dir="${preflight_root}/runs/${launch_id}"
     mkdir -p "${run_dir}"
 
-    if [[ "${MHC_BACKEND}" == "triton" && ! -d "${TILEKERNELS_DIR}/tile_kernels" ]]; then
-        echo "[preflight][ERROR] MHC_BACKEND=triton but TileKernels missing: ${TILEKERNELS_DIR}/tile_kernels"
-        echo "  Sync TileKernels to this node or set TILEKERNELS_DIR to a valid path."
-        return 1
-    fi
-
-    local tilekernels_mounted=0
-    if [[ -d "${TILEKERNELS_DIR}/tile_kernels" ]]; then
-        tilekernels_mounted=1
-    fi
-
     local _train_iters="${TRAIN_ITERS:-${NUM_ROLLOUT:-10}}"
     local _eval_iters="${EVAL_ITERS:-0}"
     local _megatron_no_batch_p2p="${MEGATRON_NO_BATCH_P2P_COMM:-1}"
@@ -105,10 +94,7 @@ NCCL_IB_GDR_LEVEL=${NCCL_IB_GDR_LEVEL:-}
 NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-}
 NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-ens14np0}
 V4_SPARSE_MLA_BACKEND=${V4_SPARSE_MLA_BACKEND}
-MHC_BACKEND=${MHC_BACKEND}
 V4_INDEXER_IMPL=${V4_INDEXER_IMPL}
-TILEKERNELS_DIR=${TILEKERNELS_DIR}
-TILEKERNELS_MOUNTED=${tilekernels_mounted}
 LUMEN_DIR=${LUMEN_DIR}
 MEGATRON_PATH=${MEGATRON_PATH}
 OPTIMIZER_OFFLOAD_FRACTION=${OPTIMIZER_OFFLOAD_FRACTION}
@@ -176,6 +162,6 @@ EOF
     fi
 
     echo "[preflight] OK — all ${NNODES} nodes agree (PREFLIGHT_ID=${launch_id})"
-    echo "[preflight]   rollout=${_rollout_path} GBS=${GBS} MLA=${V4_SPARSE_MLA_BACKEND} MHC=${MHC_BACKEND} TK_mount=${tilekernels_mounted}"
+    echo "[preflight]   rollout=${_rollout_path} GBS=${GBS} MLA=${V4_SPARSE_MLA_BACKEND} MHC=aiter"
     return 0
 }

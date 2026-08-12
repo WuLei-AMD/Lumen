@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import torch
 
-from lumen.models.dsv4.ops.indexer_utils import (
+from lumen.ops.dsv4.indexer_utils import (
     infer_compress_ratio,
     mask_logits_with_cu_seqlens,
 )
@@ -74,7 +74,7 @@ def _scatter_topk_grad_scores(
     seq_len_kv: int,
 ) -> torch.Tensor:
     """Expand ``[seqlen, topk]`` grads into dense ``[seqlen, seq_len_kv]``."""
-    seqlen, topk = grad_topk.shape
+    seqlen, _topk = grad_topk.shape
     grad_dense = torch.zeros(seqlen, seq_len_kv, device=grad_topk.device, dtype=grad_topk.dtype)
     valid = topk_indices >= 0
     safe_idx = topk_indices.clamp(min=0).long()

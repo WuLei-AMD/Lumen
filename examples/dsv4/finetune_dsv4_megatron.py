@@ -17,11 +17,6 @@ if MEGATRON_PATH not in sys.path:
     sys.path.insert(0, MEGATRON_PATH)
 
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
-os.environ.setdefault("MHC_BACKEND", "triton")
-
-from lumen.models.dsv4.ops.mhc_backend import configure_mhc_backend  # noqa: E402
-
-configure_mhc_backend()
 
 from lumen.models.megatron_patches import install_mmap_checkpoint  # noqa: E402
 
