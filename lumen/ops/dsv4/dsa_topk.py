@@ -2,7 +2,6 @@ import os
 
 import torch
 
-
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
     "large": 2,

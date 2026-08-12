@@ -31,7 +31,7 @@ fi
 echo "[staging] ${BOOTSTRAP_DIR} -> ${STAGING}"
 rm -rf "${STAGING}"
 mkdir -p "${STAGING}"
-# Megatron is a symlink; tilelang/ is huge and unused (MHC_BACKEND=triton).
+# Megatron is a symlink; the host tilelang tree is too large to stage.
 rsync -a \
     --copy-links \
     --exclude 'tilelang/' \
@@ -39,7 +39,7 @@ rsync -a \
     "${BOOTSTRAP_DIR}/" "${STAGING}/"
 
 echo "==> Building ${IMAGE} (base=${LUMEN_IMAGE})"
-docker build -f "${LUMEN_DIR}/Dockerfile.dsv4-lumen" \
+docker build -f "${LUMEN_DIR}/examples/dsv4/Dockerfile" \
     --build-arg "LUMEN_IMAGE=${LUMEN_IMAGE}" \
     -t "${IMAGE}" \
     "${LUMEN_DIR}"

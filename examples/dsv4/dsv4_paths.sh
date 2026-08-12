@@ -4,14 +4,12 @@
 #   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #   source "${SCRIPT_DIR}/dsv4_paths.sh"
 #
-# Override via env: WORKSPACE_ROOT, DATA_ROOT, TILEKERNELS_DIR,
+# Override via env: WORKSPACE_ROOT, AITER_DIR, DATA_ROOT,
 # MODEL_DIR, LOG_DIR, TVM_CACHE_DIR, BOOTSTRAP_DIR, NFS_ROOT, MEGATRON_PATH,
 # MEGATRON_ROCM_DIR, MEGATRON_ROCM_REF.
 
 : "${SCRIPT_DIR:?dsv4_paths.sh: set SCRIPT_DIR before sourcing}"
 
-# shellcheck source=examples/dsv4/dsv4_mhc_env.sh
-source "${SCRIPT_DIR}/dsv4_mhc_env.sh"
 # shellcheck source=examples/dsv4/dsv4_bf16_gemm_env.sh
 source "${SCRIPT_DIR}/dsv4_bf16_gemm_env.sh"
 
@@ -19,7 +17,7 @@ LUMEN_DIR="${LUMEN_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-$(cd "${LUMEN_DIR}/.." && pwd)}"
 
 MILES_DIR="${MILES_DIR:-${WORKSPACE_ROOT}/miles}"
-TILEKERNELS_DIR="${TILEKERNELS_DIR:-${WORKSPACE_ROOT}/TileKernels}"
+AITER_DIR="${AITER_DIR:-${WORKSPACE_ROOT}/aiter}"
 
 if [[ -z "${DATA_ROOT:-}" ]]; then
     for _dsv4_data_candidate in \

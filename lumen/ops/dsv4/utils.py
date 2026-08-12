@@ -5,7 +5,9 @@ try:
 except (ImportError, OSError):
     _hadamard_cuda = None
 
-from lumen.models.dsv4.ops.rope import wrapped_precompute_freqs_cis  # noqa: F401 — DSAIndexer imports from here
+from lumen.ops.dsv4.rope import (
+    wrapped_precompute_freqs_cis,  # noqa: F401 — public compatibility export
+)
 
 
 def _hadamard_torch(x: torch.Tensor, scale: float) -> torch.Tensor:

@@ -14,6 +14,7 @@ from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 
 from lumen.models.dsv4.megatron.fp8 import dsv4_linear_fp8_enabled, enable_fp8_for_dsv4_model
+from lumen.models.dsv4.megatron.pipeline import install_dsv4_pipeline_shape_exchange
 from lumen.models.utils import safe_add_argument
 
 __all__ = [
@@ -144,6 +145,11 @@ def dsv4_gpt_builder(args, pre_process, post_process, vp_stage=None, config=None
 
     if config is None:
         config = core_transformer_config_from_args(args)
+    config.dsv4_mode = True
+    if getattr(args, "pipeline_model_parallel_size", 1) > 1:
+        install_dsv4_pipeline_shape_exchange()
+        config.variable_seq_lengths = True
+        config.batch_p2p_comm = False
 
     if args.spec is not None:
         transformer_layer_spec = import_module(args.spec)
