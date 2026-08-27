@@ -97,7 +97,19 @@ echo "════════════════════════�
 _ssh_opts=(-i "${SSH_KEY}" -o StrictHostKeyChecking=no -o BatchMode=yes -o IdentitiesOnly=yes)
 _rsync_rsh="ssh ${_ssh_opts[*]}"
 ssh "${_ssh_opts[@]}" "${WORKER_SSH}" \
-    "mkdir -p ${LUMEN_DIR}/lumen/models/dsv4/megatron ${LUMEN_DIR}/lumen/models/dsv4/ops ${LUMEN_DIR}/examples/dsv4/tools" 2>/dev/null || true
+    "mkdir -p ${LUMEN_DIR}/lumen/models/dsv4/megatron ${LUMEN_DIR}/lumen/models/dsv4/ops ${LUMEN_DIR}/lumen/modules ${LUMEN_DIR}/lumen/ops/normalization ${LUMEN_DIR}/lumen/models ${LUMEN_DIR}/examples/dsv4/tools" 2>/dev/null || true
+rsync -a -e "${_rsync_rsh}" \
+    "${LUMEN_DIR}/lumen/modules/parallel_linear.py" \
+    "${WORKER_SSH}:${LUMEN_DIR}/lumen/modules/parallel_linear.py" 2>/dev/null || true
+rsync -a -e "${_rsync_rsh}" \
+    "${LUMEN_DIR}/lumen/models/spec_provider.py" \
+    "${WORKER_SSH}:${LUMEN_DIR}/lumen/models/spec_provider.py" 2>/dev/null || true
+rsync -a -e "${_rsync_rsh}" \
+    "${LUMEN_DIR}/lumen/ops/normalization/rmsnorm.py" \
+    "${WORKER_SSH}:${LUMEN_DIR}/lumen/ops/normalization/rmsnorm.py" 2>/dev/null || true
+rsync -a -e "${_rsync_rsh}" \
+    "${LUMEN_DIR}/lumen/ops/normalization/layernorm.py" \
+    "${WORKER_SSH}:${LUMEN_DIR}/lumen/ops/normalization/layernorm.py" 2>/dev/null || true
 rsync -a -e "${_rsync_rsh}" \
     "${LUMEN_DIR}/lumen/models/dsv4/ops/hyper_connection.py" \
     "${WORKER_SSH}:${LUMEN_DIR}/lumen/models/dsv4/ops/hyper_connection.py" 2>/dev/null || true

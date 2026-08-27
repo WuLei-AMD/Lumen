@@ -425,6 +425,7 @@ class LumenLayerNorm(nn.Module):
         eps: float = 1e-5,
         elementwise_affine: bool = True,
         grad_quant_type: Optional[str] = None,
+        config=None,
     ):
         super().__init__()
         self.eps = eps
@@ -432,6 +433,10 @@ class LumenLayerNorm(nn.Module):
         if elementwise_affine:
             self.weight = nn.Parameter(torch.ones(hidden_size))
             self.bias = nn.Parameter(torch.zeros(hidden_size))
+            if config is not None:
+                sp = bool(getattr(config, "sequence_parallel", False))
+                self.weight.sequence_parallel = sp
+                self.bias.sequence_parallel = sp
         else:
             self.register_parameter("weight", None)
             self.register_parameter("bias", None)

@@ -36,11 +36,11 @@ class _LumenNorm:
         if norm_type == "RMSNorm":
             from lumen.ops.normalization import LumenRMSNorm
 
-            return LumenRMSNorm(hidden_size, eps=eps)
+            return LumenRMSNorm(hidden_size, eps=eps, config=config)
         else:
             from lumen.ops.normalization import LumenLayerNorm
 
-            return LumenLayerNorm(hidden_size, eps=eps)
+            return LumenLayerNorm(hidden_size, eps=eps, config=config)
 
 
 class LumenSpecProvider(BackendSpecProvider):

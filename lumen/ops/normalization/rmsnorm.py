@@ -559,11 +559,16 @@ class LumenRMSNorm(nn.Module):
         hidden_size: int,
         eps: float = 1e-6,
         grad_quant_type: Optional[str] = None,
+        config=None,
     ):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.grad_quant_type = grad_quant_type
+        # SP ranks see 1/tp_size of the sequence; Megatron allreduces wgrad
+        # only when this flag is set (_allreduce_layernorm_grads).
+        if config is not None:
+            self.weight.sequence_parallel = bool(getattr(config, "sequence_parallel", False))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return rmsnorm(x, self.weight.to(x.dtype), self.eps, self.grad_quant_type)

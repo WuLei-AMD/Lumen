@@ -555,9 +555,12 @@ class LumenColumnParallelLinear(nn.Module):
             if self.use_sdma and self.tp_size > 1:
                 input_parallel = self._forward_sdma_pre_gemm(input_)
             else:
-                if self.allreduce_dgrad or self.sequence_parallel or self.explicit_expert_comm:
+                if self.sequence_parallel or self.explicit_expert_comm:
                     input_parallel = input_
                 else:
+                    # _do_gemm has no allreduce_dgrad path, so the dgrad all-reduce
+                    # over TP must come from the copy region even when
+                    # self.allreduce_dgrad is set.
                     input_parallel = copy_to_tensor_model_parallel_region(input_, group=self.tp_group)
 
                 if self.sequence_parallel and not self.explicit_expert_comm:
@@ -610,7 +613,7 @@ class LumenColumnParallelLinear(nn.Module):
         )
 
         comm = self._get_sdma_comm()
-        if self.allreduce_dgrad or self.sequence_parallel or self.explicit_expert_comm:
+        if self.sequence_parallel or self.explicit_expert_comm:
             input_parallel = input_
         else:
             input_parallel = sdma_copy_to_tensor_model_parallel_region(input_, comm)
