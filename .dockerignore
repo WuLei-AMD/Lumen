@@ -5,7 +5,7 @@ third_party/aiter/csrc/ck_batched*/
 third_party/aiter/csrc/py_itfs_cu/
 third_party/aiter/csrc/hsa/
 third_party/aiter/aiter/jit/build/
-third_party/aiter/op_tests/
+third_party/aiter/aiter/jit/*.so
 third_party/aiter/benchmarks/
 third_party/aiter/docker/
 **/__pycache__/

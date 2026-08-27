@@ -8,6 +8,7 @@ build/
 .eggs/
 /docs/
 outputs/2026-*/
+examples/qwen3-30b-a3b/results/
 tunableop_results*.csv
 data/
 *.parquet

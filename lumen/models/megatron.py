@@ -405,7 +405,15 @@ def _patch_cross_entropy():
 # ---------------------------------------------------------------------------
 
 
-def lumen_gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, model_name="GPT"):
+def lumen_gpt_builder(
+    args,
+    pre_process,
+    post_process,
+    vp_stage=None,
+    config=None,
+    pg_collection=None,
+    model_name="GPT",
+):
     """Build a GPTModel with Lumen attention replacing the default
     DotProductAttention in every layer.
 
@@ -423,6 +431,7 @@ def lumen_gpt_builder(args, pre_process, post_process, vp_stage=None, config=Non
             post_process,
             vp_stage=vp_stage,
             config=config,
+            pg_collection=pg_collection,
             model_name=model_name,
         )
 
@@ -439,13 +448,12 @@ def lumen_gpt_builder(args, pre_process, post_process, vp_stage=None, config=Non
             config.activation_func_fp8_input_store = True
 
     transformer_layer_spec = get_gpt_layer_local_spec(
-        args.num_experts,
-        args.moe_grouped_gemm,
-        args.qk_layernorm,
-        args.multi_latent_attention,
-        moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
-        normalization=args.normalization,
-        use_kitchen=config.use_kitchen,
+        getattr(args, "num_experts", None),
+        getattr(args, "moe_grouped_gemm", False),
+        getattr(args, "qk_layernorm", False),
+        getattr(args, "multi_latent_attention", False),
+        normalization=getattr(args, "normalization", "RMSNorm"),
+        use_kitchen=getattr(config, "use_kitchen", False),
     )
 
     _patch_core_attention(transformer_layer_spec)
@@ -465,6 +473,7 @@ def lumen_gpt_builder(args, pre_process, post_process, vp_stage=None, config=Non
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
         rope_scaling=args.use_rope_scaling,
+        pg_collection=pg_collection,
         vp_stage=vp_stage,
     )
 
@@ -477,7 +486,15 @@ def lumen_gpt_builder(args, pre_process, post_process, vp_stage=None, config=Non
     return model
 
 
-def lumen_gpt_builder_with_spec(args, pre_process, post_process, vp_stage=None, config=None, model_name="GPT"):
+def lumen_gpt_builder_with_spec(
+    args,
+    pre_process,
+    post_process,
+    vp_stage=None,
+    config=None,
+    pg_collection=None,
+    model_name="GPT",
+):
     """Build a GPTModel using the Lumen spec provider.
 
     Instead of patching individual modules post-hoc, this builder uses
@@ -516,7 +533,6 @@ def lumen_gpt_builder_with_spec(args, pre_process, post_process, vp_stage=None, 
             moe_grouped_gemm=getattr(args, "moe_grouped_gemm", False),
             qk_layernorm=getattr(args, "qk_layernorm", False),
             multi_latent_attention=getattr(args, "multi_latent_attention", False),
-            moe_use_legacy_grouped_gemm=getattr(args, "moe_use_legacy_grouped_gemm", False),
             use_kitchen=getattr(config, "use_kitchen", False),
         )
     finally:
@@ -553,6 +569,7 @@ def lumen_gpt_builder_with_spec(args, pre_process, post_process, vp_stage=None, 
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
         rope_scaling=args.use_rope_scaling,
+        pg_collection=pg_collection,
         vp_stage=vp_stage,
     )
 
@@ -1070,18 +1087,27 @@ def make_lumen_model_provider(
     3. Megatron-specific ``enable_fp8_for_parallel_linear`` (optional)
     """
 
-    def model_provider(pre_process=True, post_process=True, vp_stage=None):
+    def model_provider(
+        pre_process=True,
+        post_process=True,
+        vp_stage=None,
+        config=None,
+        pg_collection=None,
+    ):
+        import inspect
         import os
         from dataclasses import replace as _replace
 
         from lumen.config import LumenConfig
 
-        from dataclasses import replace as _replace
-
-        from lumen.config import LumenConfig
-
         args = get_args()
-        model = model_builder(args, pre_process, post_process, vp_stage)
+        builder_parameters = inspect.signature(model_builder).parameters
+        builder_kwargs = {"vp_stage": vp_stage}
+        if "config" in builder_parameters:
+            builder_kwargs["config"] = config
+        if "pg_collection" in builder_parameters:
+            builder_kwargs["pg_collection"] = pg_collection
+        model = model_builder(args, pre_process, post_process, **builder_kwargs)
 
         # 1. Megatron LoRA (not PEFT — stays separate)
         if getattr(args, "lora_rank", 0) > 0:
@@ -2116,6 +2142,13 @@ def add_common_megatron_args(parser):
         default=False,
         help="Use Lumen parallel linear modules (LumenColumnParallelLinear, "
         "LumenRowParallelLinear, LumenLayerNormLinear) via the Lumen spec provider.",
+    )
+    safe_add_argument(
+        lumen,
+        "--lumen-sonic-moe",
+        action="store_true",
+        default=False,
+        help="Replace Megatron MoE expert MLPs with AITER SonicMoE during LumenConfig.enable().",
     )
     safe_add_argument(
         lumen,
