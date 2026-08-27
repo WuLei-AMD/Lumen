@@ -1,5 +1,7 @@
 # Lumen vs Miles DSV4 Flash native pretrain 对齐与反向排查
 
+当天排查纪要（按发现顺序）：[FLASH_PRETRAIN_DEBUG_20260827.md](./FLASH_PRETRAIN_DEBUG_20260827.md)
+
 本文记录截至 **2026-08-27** 在 2×8 MI308X 上的比对结论，以及在其他机器上复现的步骤。
 
 代码分支（本地）：
