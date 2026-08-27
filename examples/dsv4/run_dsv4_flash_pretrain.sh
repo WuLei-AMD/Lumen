@@ -16,12 +16,16 @@
 #
 # For GRPO full finetune (recommended), use run_dsv4_flash_finetune.sh instead.
 # For 4-layer single-node finetune, use run_dsv4_4layer_finetune.sh instead.
+#
+# Reproducibility: SEED=42 DETERMINISTIC=1 SKIP_PREPARE=1 LOAD_CKPT=0 ...
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=examples/dsv4/dsv4_paths.sh
 source "${SCRIPT_DIR}/dsv4_paths.sh"
+# shellcheck source=examples/dsv4/dsv4_pretrain_repro.sh
+source "${SCRIPT_DIR}/dsv4_pretrain_repro.sh"
 
 IMAGE="${IMAGE:-lumen/dsv4-lumen:mi308x}"
 
@@ -109,9 +113,15 @@ echo "  Ckpt path : ${TORCH_DIST} (used only when LOAD_CKPT=1)"
 echo "  Log       : ${LOGFILE}"
 echo "════════════════════════════════════════════════"
 
+if [[ ! -f "${AITER_DIR}/aiter/__init__.py" ]]; then
+    echo "[ERROR] AITER_DIR invalid (missing aiter package): ${AITER_DIR}"
+    exit 1
+fi
+
 DOCKER_MOUNTS=(
     -v "${LUMEN_DIR}:/workspace/Lumen"
     -v "${AITER_DIR}:/workspace/aiter"
+    -v "${AITER_DIR}:/sgl-workspace/aiter"
     -v "${MODEL_DIR}:/root/models"
     -v "${MODEL_DIR}/miopen-cache:/root/.config/miopen"
     -v "${TVM_CACHE_DIR}:/root/.cache/tvm-ffi"
@@ -141,6 +151,7 @@ DOCKER_ENV=(
     -e SEQ_LEN="${SEQ_LEN}"
     -e SKIP_PREPARE="${SKIP_PREPARE}"
     -e LOAD_CKPT="${LOAD_CKPT}"
+    -e DSV4_CKPT_PATH="${DSV4_CKPT_PATH:-/root/models/DeepSeek-V4-Flash-FP8_torch_dist_Lumen}"
     -e EVAL_ITERS="${EVAL_ITERS}"
     -e DSV4_HC_MULT="${DSV4_HC_MULT}"
     -e NNODES="${NNODES}"
@@ -156,6 +167,9 @@ DOCKER_ENV=(
     -e V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES}"
     -e LUMEN_DSV4_LINEAR_FP8="${LUMEN_DSV4_LINEAR_FP8}"
     -e DSV4_ENABLE_RECOMPUTE="${DSV4_ENABLE_RECOMPUTE:-1}"
+    -e DSV4_ALIGN_RL_ROUTING="${DSV4_ALIGN_RL_ROUTING:-1}"
+    -e DSV4_ROLLOUT_TOKENS_PATH="${DSV4_ROLLOUT_TOKENS_PATH:-/root/models/dsv4_rollout_tokens.pt}"
+    -e DSV4_AUTO_ROLLOUT_TOKENS="${DSV4_AUTO_ROLLOUT_TOKENS:-1}"
     -e HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-9.4.2}"
     -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
     -e CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -163,8 +177,8 @@ DOCKER_ENV=(
     -e RCCL_MSCCL_ENABLE=0
     -e HSA_FORCE_FINE_GRAIN_PCIE=1
     -e TORCHDYNAMO_DISABLE=1
-    -e NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-ens14np0}"
-    -e NCCL_IB_HCA="${NCCL_IB_HCA:-mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7}"
+    -e NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME}"
+    -e NCCL_IB_DISABLE="${NCCL_IB_DISABLE}"
     -e NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
     -e MEGATRON_PATH="${MEGATRON_PATH}"
 )
@@ -182,6 +196,7 @@ if [[ "${USE_BOOTSTRAP}" -eq 1 && -n "${BOOTSTRAP_MOUNT}" ]]; then
 elif [[ "${IMAGE}" == "lumen/dsv4-lumen:mi308x" ]]; then
     DOCKER_ENV+=(-e BOOTSTRAP_DIR=/opt/dsv4-bootstrap -e WRITABLE_ROOT=/opt/dsv4-runtime)
 fi
+dsv4_docker_append_pretrain_repro_env
 
 CONTAINER_NAME="lumen-dsv4-full-node${NODE_RANK}"
 docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true

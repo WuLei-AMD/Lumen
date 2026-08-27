@@ -7,6 +7,7 @@ from functools import partial
 from typing import Optional
 
 import numpy
+import torch
 
 from megatron.core.models.gpt import GPTModel
 from megatron.core.transformer.spec_utils import import_module
@@ -22,8 +23,55 @@ __all__ = [
     "dsv4_forward_step",
     "dsv4_gpt_builder",
     "dsv4_model_provider",
+    "install_dsv4_pretrain_data",
+    "install_dsv4_rollout_token_dataset",
     "install_dsv4_safe_mock_data",
 ]
+
+
+def install_dsv4_rollout_token_dataset(path: str) -> None:
+    """Feed Megatron mock-data from hash-safe rollout-like token sequences."""
+    from megatron.core.datasets.gpt_dataset import MockGPTLowLevelDataset
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    sequences = payload["sequences"]
+    if not sequences:
+        raise RuntimeError(f"empty sequences in rollout token cache: {path}")
+
+    def _extend_seq(seq: list[int], need: int) -> list[int]:
+        if len(seq) >= need:
+            return seq[:need]
+        reps = (need + len(seq) - 1) // len(seq)
+        return (seq * reps)[:need]
+
+    def _rollout_getitem(self, idx: int) -> numpy.ndarray:
+        length = self.sequence_lengths[idx]
+        seq = _extend_seq(sequences[idx % len(sequences)], length)
+        return numpy.array(seq, dtype=numpy.int64)
+
+    def _rollout_get(self, idx: int, offset: int = 0, length: Optional[int] = None) -> numpy.ndarray:
+        if length is None:
+            length = self.sequence_lengths[idx] - offset
+        need = offset + length
+        seq = _extend_seq(sequences[idx % len(sequences)], need)
+        return numpy.array(seq[offset : offset + length], dtype=numpy.int64)
+
+    MockGPTLowLevelDataset.__getitem__ = _rollout_getitem  # type: ignore[method-assign]
+    MockGPTLowLevelDataset.get = _rollout_get  # type: ignore[method-assign]
+    print(
+        f"DSV4 pretrain: patched MockGPTLowLevelDataset from rollout tokens "
+        f"({path}, n={len(sequences)}, source={payload.get('source', '?')})",
+        flush=True,
+    )
+
+
+def install_dsv4_pretrain_data() -> None:
+    """Install mock or rollout token dataset (matches native RL hash-routing inputs)."""
+    rollout_path = os.environ.get("DSV4_ROLLOUT_TOKENS_PATH", "").strip()
+    if rollout_path:
+        install_dsv4_rollout_token_dataset(rollout_path)
+    else:
+        install_dsv4_safe_mock_data()
 
 
 def install_dsv4_safe_mock_data() -> None:

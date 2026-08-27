@@ -17,7 +17,7 @@ LUMEN_DIR="${LUMEN_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-$(cd "${LUMEN_DIR}/.." && pwd)}"
 
 MILES_DIR="${MILES_DIR:-${WORKSPACE_ROOT}/miles}"
-AITER_DIR="${AITER_DIR:-${WORKSPACE_ROOT}/aiter}"
+AITER_DIR="${AITER_DIR:-${LUMEN_DIR}/third_party/aiter}"
 
 if [[ -z "${DATA_ROOT:-}" ]]; then
     for _dsv4_data_candidate in \

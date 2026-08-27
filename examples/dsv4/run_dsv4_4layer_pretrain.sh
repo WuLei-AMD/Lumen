@@ -12,12 +12,17 @@
 #
 # Optional checkpoint prep uses Miles convert scripts only (prepare_dsv4_4layer_checkpoint.py).
 # For 43-layer full Flash pretrain, use run_dsv4_flash_pretrain.sh instead.
+#
+# Reproducibility (skip ckpt, fixed mock input):
+#   SEED=42 DETERMINISTIC=1 SKIP_PREPARE=1 LOAD_CKPT=0 TRAIN_ITERS=3 bash examples/dsv4/run_dsv4_4layer_pretrain.sh
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=examples/dsv4/dsv4_paths.sh
 source "${SCRIPT_DIR}/dsv4_paths.sh"
+# shellcheck source=examples/dsv4/dsv4_pretrain_repro.sh
+source "${SCRIPT_DIR}/dsv4_pretrain_repro.sh"
 
 LOGFILE="${LOG_DIR}/lumen_dsv4_4layer_pretrain_$(date +%Y%m%d_%H%M%S).log"
 
@@ -143,6 +148,7 @@ if [[ "${USE_BOOTSTRAP}" -eq 1 && -n "${BOOTSTRAP_MOUNT}" ]]; then
 elif [[ "${IMAGE}" == "lumen/dsv4-lumen:mi308x" ]]; then
     DOCKER_ENV+=(-e BOOTSTRAP_DIR=/opt/dsv4-bootstrap -e WRITABLE_ROOT=/opt/dsv4-runtime)
 fi
+dsv4_docker_append_pretrain_repro_env
 
 docker rm -f lumen-dsv4-pretrain 2>/dev/null || true
 

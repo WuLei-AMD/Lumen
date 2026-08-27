@@ -23,23 +23,38 @@ if [[ -z "${WORKER_SSH}" && -n "${WORKER_ADDR}" ]]; then
 fi
 WORKER_SSH="${WORKER_SSH:?Set WORKER_SSH (e.g. ${USER}@worker-host) or WORKER_ADDR}"
 SSH_KEY="${SSH_KEY:-${HOME}/.ssh/id_ed25519_conductor}"
+if [[ ! -f "${SSH_KEY}" ]]; then
+    SSH_KEY="${HOME}/.ssh/id_ed25519"
+fi
 PREFLIGHT_ID="$(date +%Y%m%d_%H%M%S)"
 
 COMMON_ENV=(
     "PREFLIGHT_ID=${PREFLIGHT_ID}"
     "MASTER_ADDR=${MASTER_ADDR}"
-    "AITER_DIR=${AITER_DIR}"
+    "DATA_ROOT=${DATA_ROOT:-/data/leiwu}"
+    "LUMEN_DIR=${LUMEN_DIR:-/home/leiwu/Lumen}"
+    "MILES_DIR=${MILES_DIR:-/home/leiwu/miles}"
+    "AITER_DIR=${AITER_DIR:-${LUMEN_DIR:-/home/leiwu/Lumen}/third_party/aiter}"
     "MODEL_DIR=${MODEL_DIR}"
     "LOG_DIR=${LOG_DIR}"
     "SKIP_PREPARE=${SKIP_PREPARE:-1}"
+    "SKIP_PREFLIGHT=${SKIP_PREFLIGHT:-1}"
     "LOAD_CKPT=${LOAD_CKPT:-0}"
+    "DSV4_CKPT_PATH=${DSV4_CKPT_PATH:-/root/models/DeepSeek-V4-Flash-FP8_torch_dist_Lumen}"
     "GBS=${GBS:-8}"
     "TRAIN_ITERS=${TRAIN_ITERS:-10}"
     "EVAL_ITERS=${EVAL_ITERS:-1}"
     "IMAGE=${IMAGE:-lumen/dsv4-lumen:mi308x}"
     "V4_SPARSE_MLA_BACKEND=${V4_SPARSE_MLA_BACKEND:-triton}"
     "OPTIMIZER_OFFLOAD_FRACTION=${OPTIMIZER_OFFLOAD_FRACTION:-0.75}"
+    "DETERMINISTIC=${DETERMINISTIC:-0}"
+    "DSV4_MOCK_TOKEN_BASE=${DSV4_MOCK_TOKEN_BASE:-100}"
+    "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-enp0s20f0u10u4}"
+    "NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}"
 )
+if [[ -n "${SEED:-}" ]]; then
+    COMMON_ENV+=("SEED=${SEED}")
+fi
 
 echo "════════════════════════════════════════════════"
 echo "  2-node launch  PREFLIGHT_ID=${PREFLIGHT_ID}"

@@ -2,7 +2,13 @@
 # Shared in-container bootstrap for DSV4 GRPO finetune (source, do not execute).
 
 setup_dsv4_container_env() {
-    if [[ -d /opt/dsv4-bootstrap && -f /opt/dsv4-bootstrap/.ready ]]; then
+    local miles_dir="${MILES_DIR:-/workspace/miles}"
+
+    # Align hash-gate routing with Miles native RL when RL Megatron fork is present.
+    if [[ "${DSV4_ALIGN_RL_ROUTING:-1}" == "1" && -d /root/Megatron-LM ]]; then
+        unset MEGATRON_PATH PYTHONPATH
+        export MEGATRON_PATH=/root/Megatron-LM
+    elif [[ -d /opt/dsv4-bootstrap && -f /opt/dsv4-bootstrap/.ready ]]; then
         unset MEGATRON_PATH PYTHONPATH
         export BOOTSTRAP_DIR=/opt/dsv4-bootstrap
         # shellcheck source=examples/dsv4/bootstrap_env.sh
@@ -19,6 +25,15 @@ setup_dsv4_container_env() {
     fi
 
     export AITER_DIR="${AITER_DIR:-/workspace/aiter}"
+    export PYTHONPATH="/workspace/Lumen:${PYTHONPATH:-}"
+    if [[ -f /workspace/Lumen/pyproject.toml ]]; then
+        if python3 -c "import lumen" 2>/dev/null; then
+            echo "[setup] using existing lumen editable install"
+        else
+            echo "[setup] installing editable lumen from /workspace/Lumen"
+            pip install -e /workspace/Lumen -q --no-deps 2>/dev/null || pip install -e /workspace/Lumen -q
+        fi
+    fi
     if ! PYTHONPATH="${AITER_DIR}:${PYTHONPATH:-}" python3 - <<'PY'
 import os
 from importlib import import_module
@@ -50,6 +65,15 @@ PY
         echo "[setup] ensuring ROCm Megatron DSV4 patch on ${MEGATRON_PATH}"
         PYTHONPATH="/workspace/Lumen:${PYTHONPATH:-}" \
             python3 examples/dsv4/patch_rocm_megatron_dsv4.py "${MEGATRON_PATH}"
+    fi
+
+    if [[ -d "${miles_dir}" && -f "${miles_dir}/scripts/dsv4/patch_megatron_local_backend.py" && -d "${MEGATRON_PATH}" ]]; then
+        echo "[setup] applying Miles tid2eid routing patch (${MEGATRON_PATH})"
+        python3 "${miles_dir}/scripts/dsv4/patch_megatron_local_backend.py" "${MEGATRON_PATH}"
+        local _ref="${MILES_MEGATRON_REF:-/root/Megatron-LM}"
+        if [[ -f "${miles_dir}/scripts/dsv4/patch_megatron_tid2eid_routing.py" && -d "${_ref}" ]]; then
+            python3 "${miles_dir}/scripts/dsv4/patch_megatron_tid2eid_routing.py" "${MEGATRON_PATH}" "${_ref}"
+        fi
     fi
 
     local datasets_dir="${MEGATRON_PATH}/megatron/core/datasets"

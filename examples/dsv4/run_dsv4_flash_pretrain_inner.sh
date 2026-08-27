@@ -23,17 +23,51 @@ source examples/dsv4/dsv4_flash_megatron_args.sh
 # shellcheck source=examples/dsv4/dsv4_flash_mi300x_parallel.sh
 source examples/dsv4/dsv4_flash_mi300x_parallel.sh
 
+if [[ "${LOAD_CKPT}" != "1" ]]; then
+    DSV4_MODEL_ARGS+=(--dsv4-n-hash-layers 0)
+fi
+
 export LUMEN_DSV4_PRETRAIN=1
+export DSV4_ALIGN_RL_ROUTING="${DSV4_ALIGN_RL_ROUTING:-1}"
+export MILES_DSV4_AITER_HASH_ROUTING="${MILES_DSV4_AITER_HASH_ROUTING:-1}"
+export MILES_DSV4_HASH_ROUTING_CPU="${MILES_DSV4_HASH_ROUTING_CPU:-1}"
+export MILES_DSV4_USE_TORCH_OPTIMIZER="${MILES_DSV4_USE_TORCH_OPTIMIZER:-1}"
+# MI308X: RL Megatron fork may route MHC through miles_plugins (TileLang default).
+# TileKernels MHC needs 98304 B smem > gfx942 65536 B limit; force AIter like Miles pretrain.
+export MILES_DSV4_MHC_BACKEND="${MILES_DSV4_MHC_BACKEND:-aiter}"
 # shellcheck source=examples/dsv4/setup_container_env.sh
 source examples/dsv4/setup_container_env.sh
-setup_dsv4_container_env /workspace/miles
+setup_dsv4_container_env
 
-CKPT="/root/models/${MODEL_NAME}_torch_dist"
+CKPT="${DSV4_CKPT_PATH:-/root/models/${MODEL_NAME}_torch_dist}"
 if [[ ! -f "${CKPT}/latest_checkpointed_iteration.txt" ]]; then
     FALLBACK="/root/models/${MODEL_NAME}_torch_dist_hc${DSV4_HC_MULT}"
     if [[ -f "${FALLBACK}/latest_checkpointed_iteration.txt" ]]; then
         echo "[prepare] using fallback checkpoint ${FALLBACK}"
         CKPT="${FALLBACK}"
+    fi
+    ALT="/root/models/DeepSeek-V4-Flash-FP8_torch_dist_Lumen"
+    if [[ ! -f "${CKPT}/latest_checkpointed_iteration.txt" && -f "${ALT}/latest_checkpointed_iteration.txt" ]]; then
+        echo "[prepare] using Lumen torch_dist ${ALT}"
+        CKPT="${ALT}"
+    fi
+fi
+
+if [[ "${LOAD_CKPT}" == "1" ]]; then
+    export DSV4_ROLLOUT_TOKENS_PATH="${DSV4_ROLLOUT_TOKENS_PATH:-/root/models/dsv4_rollout_tokens.pt}"
+    if [[ ! -f "${DSV4_ROLLOUT_TOKENS_PATH}" && "${DSV4_AUTO_ROLLOUT_TOKENS:-1}" == "1" && -d /workspace/miles ]]; then
+        echo "[prepare] generating rollout tokens for hash routing from ${CKPT} ..."
+        python3 /workspace/miles/scripts/dsv4/generate_dsv4_rollout_tokens.py \
+            --output "${DSV4_ROLLOUT_TOKENS_PATH}" \
+            --torch-dist-checkpoint "${CKPT}" \
+            --num-sequences "${DSV4_ROLLOUT_NUM_SEQUENCES:-256}" \
+            --seq-len "${SEQ_LEN:-2048}" \
+            --hash-layer "${DSV4_ROLLOUT_HASH_LAYER:-0}" || true
+    fi
+    if [[ -f "${DSV4_ROLLOUT_TOKENS_PATH}" ]]; then
+        echo "[pretrain-full] using rollout tokens ${DSV4_ROLLOUT_TOKENS_PATH}"
+    else
+        echo "[pretrain-full][WARN] rollout tokens missing — mock data may hit unmapped tid2eid slots"
     fi
 fi
 
@@ -65,6 +99,11 @@ if [[ "${DSV4_ENABLE_RECOMPUTE:-1}" == "1" ]]; then
     )
 fi
 
+# shellcheck source=examples/dsv4/dsv4_pretrain_repro.sh
+source examples/dsv4/dsv4_pretrain_repro.sh
+dsv4_pretrain_setup_repro
+dsv4_pretrain_print_repro
+
 echo "[pretrain-full] launching torchrun ${NNODES}×${NPROC_PER_NODE} (node_rank=${NODE_RANK}) ..."
 echo "[pretrain-full] parallel: TP=${TP} PP=${PP} EP=${EP} | batch GBS=${GBS} MBS=${MBS} seq=${SEQ_LEN}"
 echo "[pretrain-full] optimizer CPU offload fraction=${OPTIMIZER_OFFLOAD_FRACTION}"
@@ -80,6 +119,7 @@ torchrun \
     "${DSV4_MODEL_ARGS[@]}" \
     --transformer-impl local \
     --disable-jit-fuser \
+    --no-persist-layer-norm \
     --moe-router-freeze-gate \
     --freeze-e-score-correction-bias \
     --tensor-model-parallel-size "${TP}" \
@@ -121,6 +161,7 @@ torchrun \
     --eval-interval 1000000 \
     --eval-iters "${EVAL_ITERS:-1}" \
     --distributed-timeout-minutes "${DISTRIBUTED_TIMEOUT_MINUTES}" \
+    "${DSV4_PRETRAIN_REPRO_ARGS[@]}" \
     "${LOAD_ARGS[@]}" \
     --distributed-backend nccl
 

@@ -54,6 +54,11 @@ if [[ "${DSV4_ENABLE_RECOMPUTE:-1}" == "1" ]]; then
     )
 fi
 
+# shellcheck source=examples/dsv4/dsv4_pretrain_repro.sh
+source examples/dsv4/dsv4_pretrain_repro.sh
+dsv4_pretrain_setup_repro
+dsv4_pretrain_print_repro
+
 echo "[pretrain] launching torchrun (native Megatron, no Ray) ..."
 echo "[pretrain] batch: GBS=${GBS} MBS=${MBS} seq_len=${SEQ_LEN} (hc_mult=${DSV4_HC_MULT})"
 torchrun --nproc_per_node=8 --nnodes=1 \
@@ -92,6 +97,7 @@ torchrun --nproc_per_node=8 --nnodes=1 \
     --save-interval 1000000 \
     --eval-interval 1000000 \
     --eval-iters "${EVAL_ITERS:-1}" \
+    "${DSV4_PRETRAIN_REPRO_ARGS[@]}" \
     "${LOAD_ARGS[@]}" \
     --distributed-backend nccl
 

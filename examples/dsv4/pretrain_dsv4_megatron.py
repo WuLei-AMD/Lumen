@@ -33,10 +33,10 @@ from lumen.models.dsv4.megatron.pretrain import (  # noqa: E402
     dsv4_forward_step,
     dsv4_gpt_builder,
     dsv4_model_provider,
-    install_dsv4_safe_mock_data,
+    install_dsv4_pretrain_data,
 )
 
-install_dsv4_safe_mock_data()
+install_dsv4_pretrain_data()
 
 
 def _build_model_provider():
