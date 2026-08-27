@@ -243,6 +243,631 @@ def patch_moe_router_freeze(megatron_root: str) -> bool:
     return False
 
 
+def patch_skip_none_router_expert_bias(megatron_root: str) -> bool:
+    """Hash-routing layers keep expert_bias=None; skip them in bias updates."""
+    path = os.path.join(
+        megatron_root, "megatron", "core", "distributed", "finalize_model_grads.py"
+    )
+    with open(path) as f:
+        content = f.read()
+    orig = content
+    content = content.replace(
+        "            if config.moe_router_enable_expert_bias and hasattr(module, 'expert_bias'):\n"
+        "                module.local_tokens_per_expert.zero_()",
+        "            if config.moe_router_enable_expert_bias and getattr(\n"
+        "                module, 'local_tokens_per_expert', None\n"
+        "            ) is not None:\n"
+        "                module.local_tokens_per_expert.zero_()",
+        1,
+    )
+    content = content.replace(
+        "            if hasattr(module, 'expert_bias'):\n"
+        "                tokens_per_expert_list.append(module.local_tokens_per_expert)\n"
+        "                expert_bias_list.append(module.expert_bias)",
+        "            if getattr(module, 'expert_bias', None) is not None and getattr(\n"
+        "                module, 'local_tokens_per_expert', None\n"
+        "            ) is not None:\n"
+        "                tokens_per_expert_list.append(module.local_tokens_per_expert)\n"
+        "                expert_bias_list.append(module.expert_bias)",
+        1,
+    )
+    if content != orig:
+        with open(path, "w") as f:
+            f.write(content)
+        return True
+    return False
+
+
+def patch_dsv4_hash_routing(megatron_root: str) -> bool:
+    """Route the first DSV4 MoE layers through ``tid2eid[input_ids]``.
+
+    The converted checkpoint contains ``mlp.router.tid2eid`` for layers
+    ``1..dsv4_n_hash_layers`` (Megatron layer numbers are one-based).  Thread
+    token IDs from GPTModel down to TopKRouter and use the table for expert
+    selection while retaining sqrt-softplus logits as combine weights.
+    """
+    changed = False
+
+    def update(relpath: str, transform) -> None:
+        nonlocal changed
+        path = os.path.join(megatron_root, relpath)
+        with open(path) as f:
+            content = f.read()
+        patched = transform(content)
+        if patched != content:
+            with open(path, "w") as f:
+                f.write(patched)
+            changed = True
+
+    def patch_gpt(content: str) -> str:
+        if "            input_ids=input_ids,\n            **(extra_block_kwargs or {})," in content:
+            return content
+        return content.replace(
+            """            padding_mask=padding_mask,
+            **(extra_block_kwargs or {}),""",
+            """            padding_mask=padding_mask,
+            input_ids=input_ids,
+            **(extra_block_kwargs or {}),""",
+            1,
+        )
+
+    update("megatron/core/models/gpt/gpt_model.py", patch_gpt)
+
+    def patch_block(content: str) -> str:
+        if "        input_ids: Optional[Tensor] = None,\n        *," not in content:
+            content = content.replace(
+                """        sequence_len_offset: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
+        *,""",
+                """        sequence_len_offset: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
+        input_ids: Optional[Tensor] = None,
+        *,""",
+                1,
+            )
+        if "        input_ids: Optional[Tensor] = None,\n    ):\n        \"\"\"Forward method with activation checkpointing." not in content:
+            content = content.replace(
+                """        use_inner_quantization_context: bool,
+        padding_mask: Optional[Tensor] = None,
+    ):
+        \"\"\"Forward method with activation checkpointing.""",
+                """        use_inner_quantization_context: bool,
+        padding_mask: Optional[Tensor] = None,
+        input_ids: Optional[Tensor] = None,
+    ):
+        \"\"\"Forward method with activation checkpointing.""",
+                1,
+            )
+        content = content.replace(
+            """                rotary_pos_emb,
+                padding_mask=None,
+            ):
+                for index in range(start, end):""",
+            """                rotary_pos_emb,
+                padding_mask=None,
+                input_ids=None,
+            ):
+                for index in range(start, end):""",
+            1,
+        )
+        content = content.replace(
+            """                            packed_seq_params=packed_seq_params,
+                            padding_mask=padding_mask,
+                        )
+                return hidden_states, context""",
+            """                            packed_seq_params=packed_seq_params,
+                            padding_mask=padding_mask,
+                            input_ids=input_ids,
+                        )
+                return hidden_states, context""",
+            1,
+        )
+        # Both TE and tensor-parallel checkpoint calls pass the same final pair.
+        content = content.replace(
+            """                    rotary_pos_emb,
+                    padding_mask,
+                )""",
+            """                    rotary_pos_emb,
+                    padding_mask,
+                    input_ids,
+                )""",
+            2,
+        )
+        content = content.replace(
+            """                    use_inner_quantization_context=use_inner_quantization_context,
+                    padding_mask=padding_mask,
+                )""",
+            """                    use_inner_quantization_context=use_inner_quantization_context,
+                    padding_mask=padding_mask,
+                    input_ids=input_ids,
+                )""",
+            1,
+        )
+        content = content.replace(
+            """                            sequence_len_offset=sequence_len_offset,
+                            padding_mask=padding_mask,
+                        )""",
+            """                            sequence_len_offset=sequence_len_offset,
+                            padding_mask=padding_mask,
+                            input_ids=input_ids,
+                        )""",
+            1,
+        )
+        return content
+
+    update("megatron/core/transformer/transformer_block.py", patch_block)
+
+    def patch_transformer_layer_hash(content: str) -> str:
+        if '        input_ids = kwargs.pop("input_ids", None)' not in content:
+            content = content.replace(
+                """        kwargs.pop("dynamic_inference_decode_only", None)
+        hidden_states, context = self._forward_attention(*args, **kwargs)""",
+                """        kwargs.pop("dynamic_inference_decode_only", None)
+        input_ids = kwargs.pop("input_ids", None)
+        hidden_states, context = self._forward_attention(*args, **kwargs)""",
+                1,
+            )
+        content = content.replace(
+            """            kwargs.get("inference_context", None),
+            padding_mask=kwargs.get("padding_mask", None),
+        )
+        return output, context""",
+            """            kwargs.get("inference_context", None),
+            padding_mask=kwargs.get("padding_mask", None),
+            input_ids=input_ids,
+        )
+        return output, context""",
+            1,
+        )
+        content = content.replace(
+            "    def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None):",
+            "    def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None, input_ids=None):",
+        )
+        content = content.replace(
+            """            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
+
+        nvtx_range_pop(suffix="mlp")""",
+            """            mlp_output_with_bias = self.mlp(
+                pre_mlp_layernorm_output,
+                padding_mask=padding_mask,
+                **(dict(input_ids=input_ids) if self.is_moe_layer else {}),
+            )
+
+        nvtx_range_pop(suffix="mlp")""",
+            1,
+        )
+        content = content.replace(
+            """        else:
+            return super()._forward_mlp(hidden_states, padding_mask=padding_mask)""",
+            """        else:
+            return super()._forward_mlp(
+                hidden_states, padding_mask=padding_mask, input_ids=input_ids
+            )""",
+            1,
+        )
+        return content
+
+    update(
+        "megatron/core/transformer/transformer_layer.py",
+        patch_transformer_layer_hash,
+    )
+
+    def patch_moe_layer(content: str) -> str:
+        content = content.replace(
+            """        if input_ids is not None and self.config.sequence_parallel:
+            from megatron.core.tensor_parallel.mappings import split_along_nth_dim
+
+            input_ids = split_along_nth_dim(
+                input_ids,
+                dim=1,
+                group=parallel_state.get_tensor_model_parallel_group(),
+            )""",
+            """        if input_ids is not None and self.config.sequence_parallel:
+            from megatron.core.tensor_parallel.mappings import (
+                scatter_to_sequence_parallel_region,
+            )
+
+            input_ids = scatter_to_sequence_parallel_region(
+                input_ids.transpose(0, 1).contiguous(),
+                group=parallel_state.get_tensor_model_parallel_group(),
+            ).transpose(0, 1).contiguous()""",
+            1,
+        )
+        content = content.replace(
+            """        self.router = submodules.router(
+            config=self.config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer
+        )""",
+            """        self.router = submodules.router(
+            config=self.config,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
+            layer_number=layer_number,
+        )""",
+            1,
+        )
+        content = content.replace(
+            """    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+        \"\"\"Compute token routing for preprocessing.""",
+            """    def route(
+        self,
+        hidden_states: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+    ):
+        \"\"\"Compute token routing for preprocessing.""",
+            1,
+        )
+        content = content.replace(
+            """        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
+        return probs, routing_map""",
+            """        if input_ids is not None and self.config.sequence_parallel:
+            from megatron.core.tensor_parallel.mappings import (
+                scatter_to_sequence_parallel_region,
+            )
+
+            input_ids = scatter_to_sequence_parallel_region(
+                input_ids.transpose(0, 1).contiguous(),
+                group=parallel_state.get_tensor_model_parallel_group(),
+            ).transpose(0, 1).contiguous()
+        probs, routing_map = apply_module(self.router)(
+            hidden_states, padding_mask, input_ids=input_ids
+        )
+        return probs, routing_map""",
+            1,
+        )
+        content = content.replace(
+            """        intermediate_tensors=None,
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
+        \"\"\"Forward pass for the MoE layer.""",
+            """        intermediate_tensors=None,
+        padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+    ):
+        \"\"\"Forward pass for the MoE layer.""",
+            1,
+        )
+        content = content.replace(
+            "        def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):",
+            "        def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None, input_ids=None):",
+            1,
+        )
+        content = content.replace(
+            "                    probs, routing_map = self.route(hidden_states, padding_mask)",
+            "                    probs, routing_map = self.route(hidden_states, padding_mask, input_ids=input_ids)",
+            1,
+        )
+        content = content.replace(
+            """                    hidden_states,
+                    intermediate_tensors,
+                    padding_mask,
+                )""",
+            """                    hidden_states,
+                    intermediate_tensors,
+                    padding_mask,
+                    input_ids,
+                )""",
+            1,
+        )
+        content = content.replace(
+            """                    custom_forward, False, hidden_states, intermediate_tensors, padding_mask
+                )""",
+            """                    custom_forward,
+                    False,
+                    hidden_states,
+                    intermediate_tensors,
+                    padding_mask,
+                    input_ids,
+                )""",
+            1,
+        )
+        content = content.replace(
+            "            outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)",
+            "            outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask, input_ids)",
+            1,
+        )
+        return content
+
+    update("megatron/core/transformer/moe/moe_layer.py", patch_moe_layer)
+
+    def patch_router(content: str) -> str:
+        topk_marker = "class TopKRouter(Router):"
+        prefix, topk = content.split(topk_marker, 1)
+        # Repair trees patched by an earlier version that accidentally added
+        # layer_number to the abstract Router constructor.
+        prefix = prefix.replace(
+            """        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
+        layer_number: Optional[int] = None,
+    ) -> None:""",
+            """        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
+    ) -> None:""",
+            1,
+        )
+        topk = topk.replace(
+            """        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
+    ) -> None:""",
+            """        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
+        layer_number: Optional[int] = None,
+    ) -> None:""",
+            1,
+        )
+        content = prefix + topk_marker + topk
+        old_init = """        self.input_jitter = None
+
+        self.enable_expert_bias = self.config.moe_router_enable_expert_bias
+        if self.enable_expert_bias:"""
+        new_init = """        self.input_jitter = None
+
+        self._routing_mode_initialized = False
+        self.enable_expert_bias = False
+        self.tid2eid = None
+        if layer_number is not None:
+            self._init_routing_mode(layer_number)
+
+        if self.enable_expert_bias:"""
+        content = content.replace(old_init, new_init, 1)
+        # Layer number is often assigned after construction. Do not create or
+        # clear expert_bias in __init__ based on the still-False flag.
+        leftover_init = """        if layer_number is not None:
+            self._init_routing_mode(layer_number)
+
+        if self.enable_expert_bias:
+            self.register_buffer(
+                'local_tokens_per_expert',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                'expert_bias',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+            )
+        else:
+            self.local_tokens_per_expert = None
+            self.expert_bias = None
+"""
+        leftover_new = """        if layer_number is not None:
+            self._init_routing_mode(layer_number)
+"""
+        content = content.replace(leftover_init, leftover_new, 1)
+        routing_mode_body = '''    def _init_routing_mode(self, layer_number: int):
+        if self._routing_mode_initialized:
+            return
+        self._routing_mode_initialized = True
+        self.layer_number = layer_number
+        mode_hash = (
+            getattr(self.config, "dsv4_mode", False)
+            and layer_number <= self.config.dsv4_n_hash_layers
+        )
+
+        self.enable_expert_bias = (
+            self.config.moe_router_enable_expert_bias and not mode_hash
+        )
+        if self.enable_expert_bias:
+            alloc_kwargs = {}
+            if torch.cuda.is_available():
+                alloc_kwargs["device"] = torch.device(
+                    "cuda", torch.cuda.current_device()
+                )
+            self.register_buffer(
+                "local_tokens_per_expert",
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    **alloc_kwargs,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "expert_bias",
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    **alloc_kwargs,
+                ),
+            )
+        else:
+            self.local_tokens_per_expert = None
+            self.expert_bias = None
+        if mode_hash:
+            alloc_kwargs = {}
+            if torch.cuda.is_available():
+                alloc_kwargs["device"] = torch.device(
+                    "cuda", torch.cuda.current_device()
+                )
+            self.tid2eid = torch.nn.Parameter(
+                torch.full(
+                    (int(self.config.vocab_size), int(self.topk)),
+                    -1,
+                    dtype=torch.int32,
+                    **alloc_kwargs,
+                ),
+                requires_grad=False,
+            )
+
+    def set_layer_number(self, layer_number: int):
+        self.layer_number = layer_number
+        self._init_routing_mode(layer_number)
+
+'''
+        if "    def _init_routing_mode(self, layer_number: int):" not in content:
+            anchor = "    def _maintain_float32_expert_bias(self):"
+            content = content.replace(anchor, routing_mode_body + anchor, 1)
+        else:
+            # Re-patch trees that created tid2eid but never allocated expert_bias.
+            old_mode = """    def _init_routing_mode(self, layer_number: int):
+        if self._routing_mode_initialized:
+            return
+        self._routing_mode_initialized = True
+        self.layer_number = layer_number
+        mode_hash = (
+            getattr(self.config, "dsv4_mode", False)
+            and layer_number <= self.config.dsv4_n_hash_layers
+        )
+
+        self.enable_expert_bias = (
+            self.config.moe_router_enable_expert_bias and not mode_hash
+        )
+        if mode_hash:"""
+            new_mode = """    def _init_routing_mode(self, layer_number: int):
+        if self._routing_mode_initialized:
+            return
+        self._routing_mode_initialized = True
+        self.layer_number = layer_number
+        mode_hash = (
+            getattr(self.config, "dsv4_mode", False)
+            and layer_number <= self.config.dsv4_n_hash_layers
+        )
+
+        self.enable_expert_bias = (
+            self.config.moe_router_enable_expert_bias and not mode_hash
+        )
+        if self.enable_expert_bias:
+            alloc_kwargs = {}
+            if torch.cuda.is_available():
+                alloc_kwargs["device"] = torch.device(
+                    "cuda", torch.cuda.current_device()
+                )
+            self.register_buffer(
+                "local_tokens_per_expert",
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    **alloc_kwargs,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "expert_bias",
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    **alloc_kwargs,
+                ),
+            )
+        else:
+            self.local_tokens_per_expert = None
+            self.expert_bias = None
+        if mode_hash:"""
+            content = content.replace(old_mode, new_mode, 1)
+        content = content.replace(
+            "    def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):",
+            """    def routing(
+        self,
+        logits: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+    ):""",
+            1,
+        )
+        content = content.replace(
+            """                fused=self.config.moe_router_fusion,
+                router_replay=self.router_replay,
+            )""",
+            """                fused=self.config.moe_router_fusion,
+                router_replay=self.router_replay,
+                tid2eid=self.tid2eid,
+                input_ids=(
+                    input_ids.reshape(-1)
+                    if self.tid2eid is not None and input_ids is not None
+                    else None
+                ),
+            )""",
+            1,
+        )
+        content = content.replace(
+            "    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):",
+            """    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+    ):""",
+            1,
+        )
+        content = content.replace(
+            "        probs, routing_map = self.routing(logits, padding_mask=padding_mask)",
+            """        probs, routing_map = self.routing(
+            logits, padding_mask=padding_mask, input_ids=input_ids
+        )""",
+            1,
+        )
+        return content
+
+    update("megatron/core/transformer/moe/router.py", patch_router)
+
+    def patch_moe_utils_hash(content: str) -> str:
+        if "    tid2eid: Optional[torch.Tensor] = None," not in content:
+            content = content.replace(
+                """    fused: bool = False,
+    router_replay: Optional['RouterReplay'] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:""",
+                """    fused: bool = False,
+    router_replay: Optional['RouterReplay'] = None,
+    tid2eid: Optional[torch.Tensor] = None,
+    input_ids: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:""",
+                1,
+            )
+        content = content.replace(
+            "        if router_replay is None:\n            return _compute_topk(",
+            "        if router_replay is None or tid2eid is not None:\n            return _compute_topk(",
+            1,
+        )
+        old_sqrt = '''    elif score_function == "sqrtsoftplus":
+        assert num_groups is None
+        assert group_topk is None
+        scores = torch.nn.functional.softplus(logits.float()).sqrt().type_as(logits)
+        if expert_bias is not None:
+            scores_for_routing = scores + expert_bias
+            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+            scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+        else:
+            scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+'''
+        new_sqrt = '''    elif score_function == "sqrtsoftplus":
+        assert num_groups is None
+        assert group_topk is None
+        scores = torch.nn.functional.softplus(logits.float()).sqrt().type_as(logits)
+        if tid2eid is not None:
+            assert not tid2eid.requires_grad
+            assert input_ids is not None and not input_ids.requires_grad
+            top_indices = tid2eid[input_ids].long()
+            assert torch.all(top_indices >= 0)
+        elif expert_bias is not None:
+            scores_for_routing = scores + expert_bias
+            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+        else:
+            _, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+        scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+'''
+        content = content.replace(old_sqrt, new_sqrt, 1)
+        content = content.replace(
+            """    if scaling_factor:
+        probs = probs * scaling_factor""",
+            """    if scaling_factor and tid2eid is None:
+        probs = probs * scaling_factor""",
+            1,
+        )
+        return content
+
+    update("megatron/core/transformer/moe/moe_utils.py", patch_moe_utils_hash)
+    return changed
+
+
 def patch_dist_ckpt_skip_optional_dsv4_norms(megatron_root: str) -> bool:
     """Skip missing optional shards when converted ckpt omits them.
 
@@ -269,31 +894,60 @@ def patch_dist_ckpt_skip_optional_dsv4_norms(megatron_root: str) -> bool:
                     f"{sh_ten.key} from model not in state dict:"
                     f" {sorted(metadata.state_dict_metadata.keys())}"
                 )"""
-    if needle not in content:
-        return False
     replacement = """            if sh_ten.key not in metadata.state_dict_metadata:
-                _optional_skip_suffixes = (
-                    ".self_attention.q_norm.weight",
-                    ".self_attention.kv_norm.weight",
-                    ".self_attention.q_norm._norm.weight",
-                    ".self_attention.kv_norm._norm.weight",
-                    ".mlp.router.expert_bias",
-                )
-                if any(sh_ten.key.endswith(suffix) for suffix in _optional_skip_suffixes):
-                    try:
-                        from megatron.training.utils import print_rank_0
-
-                        print_rank_0(
-                            f"{sh_ten.key} from model not in state dict, will skip"
-                        )
-                    except ImportError:
-                        pass
+                if sh_ten.key.endswith(_LUMEN_OPTIONAL_MISSING_SUFFIXES):
+                    logger.warning(
+                        f"{sh_ten.key} from model not in state dict, will skip"
+                    )
                     continue
                 raise KeyError(
                     f"{sh_ten.key} from model not in state dict:"
                     f" {sorted(metadata.state_dict_metadata.keys())}"
                 )"""
-    content = content.replace(needle, replacement, 1)
+    if needle in content:
+        content = content.replace(needle, replacement, 1)
+
+    # _validate_global_shapes only guards Megatron's own shape check; the keys are
+    # still handed to the PyT DCP planner, which raises on any missing shard.
+    plan_needle = """    def create_local_plan(self) -> LoadPlan:
+        \"\"\"Runs additional shapes validation.\"\"\"
+        self._validate_global_shapes(self.metadata, self.shapes_validation_sharded_tensors)
+
+        with self._temporarily_bypass_shape_validation():"""
+    plan_replacement = """    def _drop_optional_missing_keys(self) -> None:
+        ckpt_keys = self.metadata.state_dict_metadata
+        for key in [
+            key
+            for key in self.state_dict
+            if key not in ckpt_keys and key.endswith(_LUMEN_OPTIONAL_MISSING_SUFFIXES)
+        ]:
+            logger.warning(f"{key} not in checkpoint, keeping initialized value")
+            del self.state_dict[key]
+
+    def create_local_plan(self) -> LoadPlan:
+        \"\"\"Runs additional shapes validation.\"\"\"
+        self._validate_global_shapes(self.metadata, self.shapes_validation_sharded_tensors)
+        self._drop_optional_missing_keys()
+
+        with self._temporarily_bypass_shape_validation():"""
+    if plan_needle in content:
+        content = content.replace(plan_needle, plan_replacement, 1)
+
+    suffix_anchor = "logger = getLogger(__name__)"
+    suffix_decl = """logger = getLogger(__name__)
+
+# DSV4 converted checkpoints omit these model-side buffers: hash-routed layers have
+# no router expert_bias, and flash layers have no q_norm/kv_norm.
+_LUMEN_OPTIONAL_MISSING_SUFFIXES = (
+    ".self_attention.q_norm.weight",
+    ".self_attention.kv_norm.weight",
+    ".self_attention.q_norm._norm.weight",
+    ".self_attention.kv_norm._norm.weight",
+    ".mlp.router.expert_bias",
+)"""
+    if "_LUMEN_OPTIONAL_MISSING_SUFFIXES = (" not in content and suffix_anchor in content:
+        content = content.replace(suffix_anchor, suffix_decl, 1)
+
     if content != orig:
         with open(path, "w") as f:
             f.write(content)
@@ -675,12 +1329,273 @@ def patch_disable_batch_p2p_comm(megatron_root: str) -> bool:
     return True
 
 
+def patch_dump_grad_norm(megatron_root: str) -> bool:
+    """Dump named-param grad-norm membership. Replaces v1 if already patched."""
+    import re
+
+    path = os.path.join(megatron_root, "megatron", "core", "optimizer", "optimizer.py")
+    if not os.path.isfile(path):
+        return False
+    with open(path) as f:
+        content = f.read()
+    if "_DSV4_GN_DUMP_V3" in content:
+        return False
+    marker = "from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32\n"
+    helper = r'''from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
+
+_DSV4_GN_DUMP_V3 = True
+_DSV4_GN_DUMPED = False
+
+
+def _dsv4_gn_bucket(name):
+    n = name.replace("module.", "")
+    if "shared_expert" in n:
+        return "shared_expert"
+    if ".experts." in n or "mlp.experts" in n:
+        return "expert"
+    if any(k in n for k in ("wq_b", "wo_a", "wo_b", "wq_a", "wkv", "attn_sink")):
+        return "attn"
+    if "indexer" in n or "compressor" in n:
+        return "indexer"
+    if any(k in n for k in ("output_layer", "word_embeddings", "embedding")):
+        return "embed_out"
+    if "norm" in n.lower() or ".ln_" in n:
+        return "norm"
+    if "linear_fc" in n:
+        return "mlp_fc"
+    return "other"
+
+
+def _dsv4_dump_grad_norm(opt):
+    """Named TP-filter dump. Env: DSV4_DUMP_GRAD_NORM=1."""
+    import os
+    from collections import defaultdict
+    from pathlib import Path
+
+    global _DSV4_GN_DUMPED
+    if os.environ.get("DSV4_DUMP_GRAD_NORM", "0") != "1" or _DSV4_GN_DUMPED:
+        return
+    children = list(getattr(opt, "chained_optimizers", None) or [opt])
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    try:
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+    except Exception:
+        ep_rank = -1
+    world = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    use_decoupled = bool(
+        getattr(getattr(children[0], "config", None), "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False)
+    )
+
+    def _grad_of(p):
+        if use_decoupled and getattr(p, "decoupled_grad", None) is not None:
+            return p.decoupled_grad
+        if getattr(p, "main_grad", None) is not None:
+            return p.main_grad
+        return p.grad
+
+    chunks = []
+    for child in children:
+        for chunk in getattr(child, "model_chunks", None) or []:
+            if chunk not in chunks:
+                chunks.append(chunk)
+    ptr_to_name = {}
+    named_params = []
+    for chunk in chunks:
+        for name, param in chunk.named_parameters():
+            named_params.append((name, param))
+            ptr_to_name[param.data_ptr()] = name
+            main_p = getattr(param, "main_param", None)
+            if main_p is not None:
+                ptr_to_name[main_p.data_ptr()] = name
+    rows = []
+    buckets = defaultdict(lambda: {"n": 0, "n_tp": 0, "n_inc": 0, "sq": 0.0, "sq_inc": 0.0, "sq_exc": 0.0})
+    sources = []
+    for opt_i, child in enumerate(children):
+        tp_group = getattr(child, "tp_group", None)
+        for pi, param in enumerate(child.get_parameters()):
+            name = ptr_to_name.get(param.data_ptr(), f"opt{opt_i}_p{pi}")
+            sources.append((name, param, tp_group))
+    if not sources:
+        for name, param in named_params:
+            sources.append((name, param, getattr(children[0], "tp_group", None)))
+    for name, param, tp_group in sources:
+        grad = _grad_of(param)
+        is_tp = bool(getattr(param, "tensor_model_parallel", False))
+        is_sp = bool(getattr(param, "sequence_parallel", False))
+        allreduce = getattr(param, "allreduce", True)
+        inc = False
+        gsq = 0.0
+        if grad is not None:
+            gsq = float(grad.detach().float().pow(2).sum().item())
+            inc = param_is_not_shared(param) and tensor_parallel.param_is_not_tensor_parallel_duplicate(
+                param, tp_group
+            )
+        b = _dsv4_gn_bucket(name)
+        buckets[b]["n"] += 1
+        if is_tp:
+            buckets[b]["n_tp"] += 1
+        buckets[b]["sq"] += gsq
+        if inc:
+            buckets[b]["n_inc"] += 1
+            buckets[b]["sq_inc"] += gsq
+        else:
+            buckets[b]["sq_exc"] += gsq
+        rows.append((gsq, name, is_tp, is_sp, allreduce, inc, tuple(param.shape)))
+    if not any(gsq > 0 for gsq, *_ in rows):
+        return
+    _DSV4_GN_DUMPED = True
+    tp_group = getattr(children[0], "tp_group", None)
+    dump_dir = Path(os.environ.get("DSV4_DUMP_GRAD_NORM_DIR", "/tmp/dsv4_gn_dump"))
+    try:
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        out = dump_dir / f"w{world:02d}_pp{pp_rank}_tp{tp_rank}_ep{ep_rank}.txt"
+        lines = [
+            f"world={world} tp={tp_rank} pp={pp_rank} ep={ep_rank} "
+            f"tp_group_rank={tp_group.rank() if tp_group is not None else -1} "
+            f"tp_group_size={tp_group.size() if tp_group is not None else -1} "
+            f"use_decoupled={use_decoupled} n_named={len(rows)}"
+        ]
+        for b in sorted(buckets):
+            s = buckets[b]
+            lines.append(
+                f"bucket {b} n={s['n']} n_tp={s['n_tp']} n_inc={s['n_inc']} "
+                f"sq={s['sq']:.6e} sq_inc={s['sq_inc']:.6e} sq_exc={s['sq_exc']:.6e}"
+            )
+        lines.append("TOP_INC")
+        for gsq, name, is_tp, is_sp, allreduce, inc, shape in sorted(rows, reverse=True)[:25]:
+            if not inc:
+                continue
+            lines.append(
+                f"inc gsq={gsq:.6e} tp={int(is_tp)} sp={int(is_sp)} ar={allreduce} "
+                f"shape={shape} {name}"
+            )
+        lines.append("TOP_EXC")
+        for gsq, name, is_tp, is_sp, allreduce, inc, shape in sorted(rows, reverse=True)[:40]:
+            if inc:
+                continue
+            lines.append(
+                f"exc gsq={gsq:.6e} tp={int(is_tp)} sp={int(is_sp)} ar={allreduce} "
+                f"shape={shape} {name}"
+            )
+        lines.append("TP_FALSE_DENSE")
+        for gsq, name, is_tp, is_sp, allreduce, inc, shape in sorted(rows, reverse=True):
+            if is_tp or "experts" in name:
+                continue
+            if gsq <= 0:
+                continue
+            lines.append(
+                f"notp gsq={gsq:.6e} inc={int(inc)} sp={int(is_sp)} ar={allreduce} "
+                f"shape={shape} {name}"
+            )
+        out.write_text("\n".join(lines) + "\n")
+        tsv = dump_dir / f"w{world:02d}_pp{pp_rank}_tp{tp_rank}_ep{ep_rank}.tsv"
+        with tsv.open("w") as tf:
+            tf.write("gsq\ttp\tsp\tar\tinc\tshape\tname\n")
+            for gsq, name, is_tp, is_sp, allreduce, inc, shape in rows:
+                tf.write(
+                    f"{gsq:.8e}\t{int(is_tp)}\t{int(is_sp)}\t{allreduce}\t{int(inc)}\t{shape}\t{name}\n"
+                )
+        print(f"[dsv4-gn-dump] wrote {out} world={world} pp={pp_rank} tp={tp_rank}", flush=True)
+        for b in sorted(buckets):
+            s = buckets[b]
+            print(
+                f"[dsv4-gn-dump] w={world} pp={pp_rank} tp={tp_rank} bucket={b} "
+                f"n={s['n']} n_tp={s['n_tp']} n_inc={s['n_inc']} "
+                f"sq={s['sq']:.4e} sq_inc={s['sq_inc']:.4e} sq_exc={s['sq_exc']:.4e}",
+                flush=True,
+            )
+    except Exception as err:
+        print(f"[dsv4-gn-dump] failed world={world}: {err}", flush=True)
+
+
+'''
+    if "_dsv4_dump_grad_norm" in content:
+        content2, n = re.subn(
+            r"_DSV4_GN_DUMPED = False\n\n\ndef _dsv4_dump_grad_norm\(opt\):.*?(?=\n\ndef |\nclass )",
+            helper[helper.find("_DSV4_GN_DUMP_V3") :].rstrip() + "\n\n\n",
+            content,
+            count=1,
+            flags=re.S,
+        )
+        if n != 1:
+            return False
+        content = content2
+        if "_dsv4_dump_grad_norm(self)" not in content:
+            return False
+        with open(path, "w") as f:
+            f.write(content)
+        return True
+    if marker not in content:
+        return False
+    content = content.replace(marker, helper, 1)
+    old_main = '''    @torch.no_grad()
+    def get_grad_norm(self):
+        """Compute and return grad norm."""
+        grads_for_norm = self.get_main_grads_for_grad_norm()
+'''
+    new_main = '''    @torch.no_grad()
+    def get_grad_norm(self):
+        """Compute and return grad norm."""
+        _dsv4_dump_grad_norm(self)
+        grads_for_norm = self.get_main_grads_for_grad_norm()
+'''
+    old_chained = '''    @torch.no_grad()
+    def get_grad_norm(self):
+        if len(self.chained_optimizers) == 1:
+'''
+    new_chained = '''    @torch.no_grad()
+    def get_grad_norm(self):
+        _dsv4_dump_grad_norm(self)
+        if len(self.chained_optimizers) == 1:
+'''
+    if old_main not in content or old_chained not in content:
+        return False
+    content = content.replace(old_main, new_main, 1).replace(old_chained, new_chained, 1)
+    with open(path, "w") as f:
+        f.write(content)
+    return True
+
+
+def patch_cpu_offload_torch_gpu_adam(megatron_root: str) -> bool:
+    """Use torch AdamW for both CPU and GPU hybrid-offload partitions.
+
+    Transformer Engine's FusedAdam in the Miles image is gfx950-only.  Matching
+    Miles on MI325 therefore requires the torch/CPUAdam class for the GPU
+    partition as well.
+    """
+    path = os.path.join(megatron_root, "megatron", "core", "optimizer", "__init__.py")
+    if not os.path.isfile(path):
+        return False
+    with open(path) as f:
+        content = f.read()
+    old = (
+        "            if config.optimizer == 'adam':\n"
+        "                gpu_optimizer_cls = Adam\n"
+        "                cpu_optimizer_cls = CPUAdam\n"
+    )
+    new = (
+        "            if config.optimizer == 'adam':\n"
+        "                gpu_optimizer_cls = CPUAdam\n"
+        "                cpu_optimizer_cls = CPUAdam\n"
+    )
+    if "gpu_optimizer_cls = CPUAdam" in content:
+        return False
+    if old not in content:
+        return False
+    with open(path, "w") as f:
+        f.write(content.replace(old, new, 1))
+    return True
+
+
 def main(megatron_root: str) -> None:
     results = {
         "transformer_config.py": patch_transformer_config(megatron_root),
         "moe_sqrtsoftplus": patch_moe_sqrtsoftplus(megatron_root),
         "dsv4_training_config": patch_dsv4_training_config(megatron_root),
         "moe_router_freeze": patch_moe_router_freeze(megatron_root),
+        "dsv4_hash_routing": patch_dsv4_hash_routing(megatron_root),
+        "skip_none_router_expert_bias": patch_skip_none_router_expert_bias(megatron_root),
         "dist_ckpt_skip_dsv4_norms": patch_dist_ckpt_skip_optional_dsv4_norms(megatron_root),
         "shared_expert_clamp": patch_shared_expert_clamp(megatron_root),
         "transformer_block.py": patch_transformer_block(megatron_root),
@@ -688,6 +1603,8 @@ def main(megatron_root: str) -> None:
         "experimental_attention_variant_module_specs.py": patch_eav_specs(megatron_root),
         "tensor_parallel/layers.py": patch_tp_layers(megatron_root),
         "disable_batch_p2p_comm": patch_disable_batch_p2p_comm(megatron_root),
+        "cpu_offload_torch_gpu_adam": patch_cpu_offload_torch_gpu_adam(megatron_root),
+        "dump_grad_norm": patch_dump_grad_norm(megatron_root),
     }
     print(f"Patched ROCm Megatron at {megatron_root}:")
     for name, ok in results.items():

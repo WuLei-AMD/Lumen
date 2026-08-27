@@ -833,6 +833,29 @@ class TestLossFunc:
         assert torch.isclose(report_tensor[0], loss, atol=1e-6)
         assert report_tensor[1].item() == num_tokens.item()
 
+    def test_miles_sample_mean_matches_token_mean_equal_length(self):
+        from lumen.models.dsv4.megatron.pretrain import reduce_miles_sample_mean_nll
+
+        ce = torch.tensor([[1.0, 3.0], [2.0, 4.0]])
+        mask = torch.ones_like(ce)
+        reduced, n = reduce_miles_sample_mean_nll(ce, mask, micro_batch_size=2)
+        assert n.item() == 2
+        assert torch.isclose(reduced, torch.tensor(5.0), atol=1e-5)
+        token_mean = (ce * mask).sum() / mask.sum()
+        assert torch.isclose(reduced / n.float(), token_mean, atol=1e-5)
+
+    def test_miles_sample_mean_differs_from_token_mean_unequal_length(self):
+        from lumen.models.dsv4.megatron.pretrain import reduce_miles_sample_mean_nll
+
+        ce = torch.tensor([[1.0, 3.0], [10.0, 10.0]])
+        mask = torch.tensor([[1.0, 1.0], [1.0, 0.0]])
+        reduced, n = reduce_miles_sample_mean_nll(ce, mask, micro_batch_size=2)
+        sample_mean = reduced / n.float()
+        token_mean = (ce * mask).sum() / mask.sum()
+        assert torch.isclose(sample_mean, torch.tensor(6.0), atol=1e-5)
+        assert torch.isclose(token_mean, torch.tensor(14.0 / 3.0), atol=1e-5)
+        assert not torch.isclose(sample_mean, token_mean, atol=1e-4)
+
     @mock.patch("lumen.models.megatron.get_args")
     def test_all_masked(self, mock_get_args):
         mock_get_args.return_value = SimpleNamespace(val_loss_target=None)

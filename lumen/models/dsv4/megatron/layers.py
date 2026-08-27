@@ -28,6 +28,43 @@ def _dsv4_use_gemm_bf16() -> bool:
     return os.environ.get("LUMEN_DSV4_GEMM_BF16", "1") != "0"
 
 
+def _dsv4_use_local_rmsnorm() -> bool:
+    return os.environ.get("LUMEN_DSV4_LOCAL_RMSNORM", "0") == "1"
+
+
+def _dsv4_dup_torch_linear() -> bool:
+    """Use torch.nn.functional.linear for duplicated wkv/wq_a (Miles LocalDuplicatedLinear)."""
+    return os.environ.get("LUMEN_DSV4_DUP_TORCH_LINEAR", "0") == "1"
+
+
+class LocalRMSNorm(torch.nn.Module):
+    """Megatron-compatible fp32 RMSNorm (matches Miles ``LocalRMSNorm``)."""
+
+    def __init__(
+        self,
+        config,
+        hidden_size,
+        eps=1e-6,
+        persist_layer_norm: bool = False,
+        zero_centered_gamma: bool = False,
+        normalization: str = "RMSNorm",
+        **kwargs,
+    ):
+        super().__init__()
+        del persist_layer_norm, zero_centered_gamma, normalization, kwargs
+        self.eps = eps
+        self.sequence_parallel = bool(getattr(config, "sequence_parallel", False))
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.weight.sequence_parallel = self.sequence_parallel
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig = x.dtype
+        x32 = x.float()
+        var = x32.pow(2).mean(-1, keepdim=True)
+        y = x32 * torch.rsqrt(var + self.eps)
+        return (self.weight.float() * y).to(orig)
+
+
 class LumenNorm(torch.nn.Module):
     """Megatron-compatible RMSNorm/LayerNorm without Transformer Engine."""
 
@@ -81,6 +118,7 @@ __all__ = [
     "LumenColumnParallelGroupedLinear",
     "LumenRowParallelGroupedLinear",
     "LumenNorm",
+    "LocalRMSNorm",
 ]
 
 
@@ -111,7 +149,7 @@ class LumenDuplicatedLinear(MegatronModule):
         self.input_size = input_size
         self.output_size = output_size
         self.skip_bias_add = skip_bias_add
-        self.use_gemm_bf16 = _dsv4_use_gemm_bf16()
+        self.use_gemm_bf16 = _dsv4_use_gemm_bf16() and not _dsv4_dup_torch_linear()
 
         self.scaling_type = "none"
         self.scaling_manager = None

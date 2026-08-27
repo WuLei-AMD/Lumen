@@ -7,6 +7,7 @@ from functools import partial
 from typing import Optional
 
 import numpy
+import torch
 
 from megatron.core.models.gpt import GPTModel
 from megatron.core.transformer.spec_utils import import_module
@@ -23,6 +24,8 @@ __all__ = [
     "dsv4_gpt_builder",
     "dsv4_model_provider",
     "install_dsv4_safe_mock_data",
+    "miles_aligned_lm_loss_func",
+    "reduce_miles_sample_mean_nll",
 ]
 
 
@@ -60,11 +63,74 @@ def install_dsv4_safe_mock_data() -> None:
     )
 
 
+def reduce_miles_sample_mean_nll(
+    per_token_loss: torch.Tensor,
+    loss_mask: torch.Tensor,
+    micro_batch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Miles ``sum_of_sample_mean`` on per-token CE.
+
+    For each of ``micro_batch_size`` samples, take the masked mean NLL, then
+    *sum* those sample means. Megatron later divides by the returned sample
+    count and ``num_microbatches``, which matches Miles
+    ``loss / global_batch_size`` after ``apply_megatron_loss_scaling``.
+
+    When every sample has the same number of unmasked tokens this equals the
+    global token-mean CE (Megatron's default logged ``lm loss``).
+    """
+    losses = per_token_loss.reshape(-1).float()
+    mask = loss_mask.reshape(-1).float()
+    mbs = max(int(micro_batch_size), 1)
+    if losses.numel() == 0:
+        zero = losses.sum()
+        return zero, torch.tensor(1, device=losses.device, dtype=torch.int)
+    if losses.numel() % mbs != 0:
+        # Sequence-parallel shards that are not divisible by MBS: fall back to
+        # one sample so we still return a valid mean rather than crashing.
+        mbs = 1
+    token_ce = losses.view(mbs, -1)
+    token_mask = mask.view(mbs, -1)
+    per_sample = (token_ce * token_mask).sum(dim=-1) / torch.clamp_min(token_mask.sum(dim=-1), 1.0)
+    reduced = per_sample.sum()
+    num_samples = torch.tensor(mbs, device=losses.device, dtype=torch.int)
+    return reduced, num_samples
+
+
+def miles_aligned_lm_loss_func(
+    loss_mask: torch.Tensor,
+    output_tensor: torch.Tensor,
+    model=None,
+):
+    """LM loss using Miles' per-sample mean reduction (not global token mean).
+
+    ``output_tensor`` is Megatron per-token CE. Logging uses
+    ``report['lm loss'] = [sum_of_sample_means, n_samples]`` so the trainer's
+    ``sum / count`` is the Miles metric. Backward uses the same tensor; Megatron
+    divides by ``n_samples`` then ``num_microbatches``.
+    """
+    from megatron.training import get_args
+
+    args = get_args()
+    mbs = getattr(args, "micro_batch_size", 1)
+    if loss_mask is None or output_tensor is None:
+        ref = output_tensor if output_tensor is not None else loss_mask
+        device = ref.device if ref is not None else "cpu"
+        zero = torch.zeros((), device=device)
+        ones = torch.ones((), device=device, dtype=torch.int)
+        return zero, ones, {"lm loss": torch.stack([zero.detach(), ones.float()])}
+
+    reduced, num_samples = reduce_miles_sample_mean_nll(output_tensor, loss_mask, mbs)
+    report = {
+        "lm loss": torch.cat([reduced.detach().view(1), num_samples.float().view(1)])
+    }
+    return reduced, num_samples, report
+
+
 def dsv4_forward_step(data_iterator, model, return_schedule_plan: bool = False):
     """Forward step for DSV4 Megatron training (``position_ids=None``, no attention mask)."""
     from megatron.core.utils import get_attr_wrapped_model
     from megatron.training import get_args, get_timers
-    from pretrain_gpt import get_batch, loss_func, stimer
+    from pretrain_gpt import get_batch, stimer
 
     args = get_args()
     timers = get_timers()
@@ -76,6 +142,8 @@ def dsv4_forward_step(data_iterator, model, return_schedule_plan: bool = False):
             data_iterator, vp_stage
         )
     timers("batch-generator").stop()
+
+    loss_func = miles_aligned_lm_loss_func
 
     with stimer:
         if return_schedule_plan:
@@ -146,6 +214,10 @@ def dsv4_gpt_builder(args, pre_process, post_process, vp_stage=None, config=None
     if config is None:
         config = core_transformer_config_from_args(args)
     config.dsv4_mode = True
+    # ROCm Megatron's TransformerConfig predates the unpadded vocab_size field
+    # used by DSV4 hash routers. tid2eid is [vocab_size, topk] in the checkpoint
+    # even though GPT embeddings use padded_vocab_size.
+    config.vocab_size = int(args.vocab_size)
     if getattr(args, "pipeline_model_parallel_size", 1) > 1:
         install_dsv4_pipeline_shape_exchange()
         config.variable_seq_lengths = True
@@ -205,4 +277,12 @@ def dsv4_model_provider(
     )
     if dsv4_linear_fp8_enabled():
         enable_fp8_for_dsv4_model(model)
+    if os.environ.get("DSV4_DUMP_LAYER_ACT", "0") == "1":
+        from lumen.models.dsv4.megatron.act_dump import install_layer_act_dump
+
+        install_layer_act_dump(model, tag=os.environ.get("DSV4_DUMP_TAG", "lumen"))
+    if os.environ.get("DSV4_DUMP_MHC_DX", "0") == "1":
+        from lumen.models.dsv4.megatron.act_dump import install_mhc_dx_ln_hooks
+
+        install_mhc_dx_ln_hooks(model)
     return model

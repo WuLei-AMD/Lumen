@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import os
 
 import einops
 import torch
@@ -15,7 +16,6 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import (
-    copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
@@ -26,10 +26,12 @@ from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from torch import nn
 
 from lumen.models.dsv4.megatron.layers import (
+    LocalRMSNorm,
     LumenColumnParallelLinear,
     LumenDuplicatedLinear,
     LumenNorm,
     LumenRowParallelLinear,
+    _dsv4_use_local_rmsnorm,
 )
 from lumen.models.dsv4.megatron.moe_mori import mori_ep_enabled, patch_megatron_moe_mori
 from lumen.models.dsv4.megatron.spec_provider import LumenDSV4SpecProvider
@@ -48,6 +50,63 @@ from lumen.ops.dsv4 import (
 from lumen.ops.dsv4.sparse_mla import get_sparse_attn_fn
 
 _sparse_attn_fn = get_sparse_attn_fn()
+_DSV4_ATTN_IO_COUNTS: dict[tuple[int, int], int] = {}
+
+
+def _dsv4_dump_attn_io(layer_id: int, q, kv, topk_idxs, o) -> None:
+    if os.environ.get("DSV4_DUMP_ATTN_IO", "0") != "1":
+        return
+    from pathlib import Path
+
+    from megatron.core import parallel_state
+
+    try:
+        world = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        tp = parallel_state.get_tensor_model_parallel_rank()
+        pp = parallel_state.get_pipeline_model_parallel_rank()
+    except Exception:
+        world, tp, pp = -1, -1, -1
+    key = (world, int(layer_id))
+    _DSV4_ATTN_IO_COUNTS[key] = _DSV4_ATTN_IO_COUNTS.get(key, 0) + 1
+    pass_id = _DSV4_ATTN_IO_COUNTS[key]
+    tk = topk_idxs.detach()
+    n_neg = int((tk < 0).sum().item())
+    chk = int(tk.to(torch.int64).sum().item())
+    qsq = float(q.detach().float().pow(2).sum().item())
+    kvsq = float(kv.detach().float().pow(2).sum().item())
+    osq = float(o.detach().float().pow(2).sum().item())
+    dump_dir = Path(os.environ.get("DSV4_DUMP_ATTN_IO_DIR", "/tmp/dsv4_attn_io"))
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    out = dump_dir / f"w{world:02d}_pp{pp}_tp{tp}.txt"
+    line = (
+        f"pass={pass_id} layer={layer_id} qsq={qsq:.6e} kvsq={kvsq:.6e} osq={osq:.6e} "
+        f"topk_sum={chk} n_neg={n_neg} q={tuple(q.shape)} kv={tuple(kv.shape)} "
+        f"topk={tuple(topk_idxs.shape)}\n"
+    )
+    with out.open("a") as f:
+        f.write(line)
+    if pass_id == 1 and int(layer_id) in (0, 3, 8, 9):
+        print(f"[dsv4-attn-io] w={world} pp={pp} tp={tp} {line.strip()}", flush=True)
+
+
+def _copy_kv_to_tp_fp32(tensor: torch.Tensor, group) -> torch.Tensor:
+    """Identity in fwd; all-reduce dkv in fp32 (Miles ``all_reduce_grad_fp32=True``)."""
+
+    class _CopyToTpFp32(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x):
+            ctx.group = group
+            return x
+
+        @staticmethod
+        def backward(ctx, grad):
+            if grad is None:
+                return None
+            g = grad.contiguous().float()
+            torch.distributed.all_reduce(g, group=ctx.group)
+            return g.to(dtype=grad.dtype)
+
+    return _CopyToTpFp32.apply(tensor)
 
 
 def _enable_deepseek_v4_tf32():
@@ -123,7 +182,8 @@ class DeepSeekV4Attention(MegatronModule):
             skip_weight_param_allocation=False,
             parallel_mode="duplicated",
         )
-        self.q_norm = LumenNorm(config_no_sp, self.q_lora_rank, eps=self.eps)
+        _attn_norm = LocalRMSNorm if _dsv4_use_local_rmsnorm() else LumenNorm
+        self.q_norm = _attn_norm(config_no_sp, self.q_lora_rank, eps=self.eps)
         self.wq_b = LumenColumnParallelLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -145,7 +205,7 @@ class DeepSeekV4Attention(MegatronModule):
             skip_weight_param_allocation=False,
             parallel_mode="duplicated",
         )
-        self.kv_norm = LumenNorm(config_no_sp, self.head_dim, eps=self.eps)
+        self.kv_norm = _attn_norm(config_no_sp, self.head_dim, eps=self.eps)
 
         for p in list(self.wq_a.parameters()) + list(self.wkv.parameters()):
             p.sequence_parallel = False
@@ -237,7 +297,36 @@ class DeepSeekV4Attention(MegatronModule):
         ratio = self.compress_ratio
         rd = self.rope_head_dim
 
-        q_after_wq_a = self.wq_a(x)[0]
+        dump_dx = os.environ.get("DSV4_DUMP_MHC_DX", "0") == "1"
+
+        def _split_x(site: str):
+            y = x.clone()
+            if dump_dx:
+                from lumen.models.dsv4.ops.hyper_connection import _dsv4_hook_dh
+
+                _dsv4_hook_dh(y, site, int(self.layer_id) + 1, "attn")
+            return y
+
+        if dump_dx and not getattr(self, "_logged_dx_split", False):
+            print(
+                f"[dsv4] dx-split hooks on {type(self).__name__} layer={int(self.layer_id)+1} "
+                f"file={__file__}",
+                flush=True,
+            )
+            self._logged_dx_split = True
+
+        x_wq = _split_x("dx_wq")
+        x_wkv = _split_x("dx_wkv")
+        x_idx = _split_x("dx_idx")
+        x_cmp = _split_x("dx_cmp")
+
+        q_after_wq_a = self.wq_a(x_wq)[0]
+        try:
+            from lumen.models.dsv4.ops.hyper_connection import _dsv4_mark_dh
+
+            q_after_wq_a = _dsv4_mark_dh(q_after_wq_a, "after_wq_a", int(self.layer_id) + 1, "attn")
+        except Exception:
+            pass
         qr = q = self.q_norm(q_after_wq_a)
         q_after_wq_b = self.wq_b(q)[0]
         q = q_after_wq_b.unflatten(-1, (self.n_local_heads, self.head_dim))
@@ -246,7 +335,13 @@ class DeepSeekV4Attention(MegatronModule):
         q = q.clone()
         apply_rotary_emb(q[..., -rd:], freqs_cis)
 
-        kv_after_wkv = self.wkv(x)[0]
+        kv_after_wkv = self.wkv(x_wkv)[0]
+        try:
+            from lumen.models.dsv4.ops.hyper_connection import _dsv4_mark_dh
+
+            kv_after_wkv = _dsv4_mark_dh(kv_after_wkv, "after_wkv", int(self.layer_id) + 1, "attn")
+        except Exception:
+            pass
         kv_vanilla = self.kv_norm(kv_after_wkv)
         kv_vanilla = kv_vanilla.clone()
         apply_rotary_emb(kv_vanilla[..., -rd:], freqs_cis)
@@ -266,7 +361,7 @@ class DeepSeekV4Attention(MegatronModule):
         if self.compress_ratio:
             kv_compress_offset = seqlen_global
             if self.indexer is not None:
-                x_sbd = einops.rearrange(x, "b s d -> s b d")
+                x_sbd = einops.rearrange(x_idx, "b s d -> s b d")
                 qr_sbd = einops.rearrange(qr, "b s d -> s b d")
                 if isinstance(self.indexer, V4Indexer):
                     compress_topk_idxs = self.indexer(x_sbd, qr_sbd, sp_inputs_already_gathered=True)
@@ -286,10 +381,18 @@ class DeepSeekV4Attention(MegatronModule):
 
         kv_compress = None
         if self.compress_ratio:
-            x_sbd = einops.rearrange(x, "b s d -> s b d")
+            x_sbd = einops.rearrange(x_cmp, "b s d -> s b d")
             kv_compress_sbd = self.compressor(x_sbd)
             if kv_compress_sbd is not None:
                 kv_compress = einops.rearrange(kv_compress_sbd, "s b d -> b s d")
+                try:
+                    from lumen.models.dsv4.ops.hyper_connection import _dsv4_mark_dh
+
+                    kv_compress = _dsv4_mark_dh(
+                        kv_compress, "after_compressor", int(self.layer_id) + 1, "attn"
+                    )
+                except Exception:
+                    pass
 
         attn_sink = self.attn_sink
         if attn_sink.dtype != torch.float32:
@@ -300,22 +403,36 @@ class DeepSeekV4Attention(MegatronModule):
             if kv_compress is not None:
                 kv_compress = all_gather_cp(kv_compress, dim=1, cp_group=self.cp_group)
 
+        _mark = None
+        if dump_dx:
+            try:
+                from lumen.models.dsv4.ops.hyper_connection import _dsv4_mark_dh as _mark
+            except Exception:
+                _mark = None
+        lid = int(self.layer_id) + 1
+
         if kv_compress is not None:
+            if _mark is not None:
+                kv_vanilla = _mark(kv_vanilla, "dkv_van_precat", lid, "attn")
+                kv_compress = _mark(kv_compress, "dkv_cmp_precat", lid, "attn")
             kv = torch.cat([kv_vanilla, kv_compress], dim=1)
             assert kv_compress_offset == kv_vanilla.size(1)
         else:
             kv = kv_vanilla
 
-        try:
-            kv = copy_to_tensor_model_parallel_region(
-                kv, group=self.tp_group, all_reduce_grad_fp32=True
-            )
-        except TypeError:
-            kv = copy_to_tensor_model_parallel_region(kv, group=self.tp_group)
+        if _mark is not None:
+            kv = _mark(kv, "dkv_before_tp", lid, "attn")
+        kv = _copy_kv_to_tp_fp32(kv, self.tp_group)
+        if _mark is not None:
+            kv = _mark(kv, "dkv_mla_in", lid, "attn")
+            q = _mark(q, "mla_dq", lid, "attn")
 
         o = _sparse_attn_fn(q, kv, attn_sink, topk_idxs, self.softmax_scale)
+        _dsv4_dump_attn_io(self.layer_id, q, kv, topk_idxs, o)
 
         apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)
+        if _mark is not None:
+            o = _mark(o, "after_mla_o", lid, "attn")
 
         o = o.view(bsz, seqlen_local, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
@@ -326,6 +443,13 @@ class DeepSeekV4Attention(MegatronModule):
 
         if self.sequence_parallel:
             output = scatter_to_sequence_parallel_region(output, group=self.tp_group)
+
+        try:
+            from lumen.models.dsv4.ops.hyper_connection import _dsv4_hook_dh
+
+            _dsv4_hook_dh(output, "after_attn_out", int(self.layer_id) + 1, "attn")
+        except Exception:
+            pass
 
         return output, None
 
@@ -387,6 +511,11 @@ def get_dsv4_spec(args, config, vp_stage):
         --spec lumen.models.dsv4.megatron.spec get_dsv4_spec
     """
     config.dsv4_dsa_topk_backend = getattr(args, "dsv4_dsa_topk_backend", "torch")
+    if os.environ.get("LUMEN_DSV4_LOCAL_RMSNORM", "0") == "1":
+        print("[dsv4] transformer+q/kv_norm=LocalRMSNorm (fp32, Miles-style)", flush=True)
+    if os.environ.get("LUMEN_DSV4_DUP_TORCH_LINEAR", "0") == "1":
+        print("[dsv4] duplicated linear (wkv/wq_a)=F.linear (Miles-style)", flush=True)
+    print("[dsv4] kv TP copy uses fp32 allreduce (Miles all_reduce_grad_fp32)", flush=True)
     _patch_megatron_no_te()
     if mori_ep_enabled():
         patch_megatron_moe_mori()

@@ -104,6 +104,7 @@ dsv4_docker_append_kernel_env() {
     DOCKER_ENV+=(
         -e AITER_DIR=/workspace/aiter
         -e V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND}"
+        -e DSV4_FORCE_MLA_BACKEND="${DSV4_FORCE_MLA_BACKEND:-}"
         -e V4_INDEXER_IMPL="${V4_INDEXER_IMPL}"
         -e V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N}"
         -e V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES}"

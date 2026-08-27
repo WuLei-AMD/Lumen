@@ -1,5 +1,6 @@
 """Lumen backend spec provider for DSV4 transformer blocks (MoE/MLP, no TE)."""
 
+import os
 from typing import Optional, Tuple
 
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -10,12 +11,19 @@ from lumen.models.dsv4.megatron.layers import (
     LumenColumnParallelLinear,
     LumenRowParallelGroupedLinear,
     LumenRowParallelLinear,
+    LocalRMSNorm,
+    _dsv4_use_local_rmsnorm,
 )
 from lumen.models.spec_provider import LumenSpecProvider
 
 
 class LumenDSV4SpecProvider(LumenSpecProvider):
     """Backend for DSV4 MoE/MLP/dense layers — Lumen linear/norm with tuned BF16 GEMM."""
+
+    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False):
+        if _dsv4_use_local_rmsnorm():
+            return LocalRMSNorm
+        return super().layer_norm(rms_norm, for_qk)
 
     def column_parallel_linear(self):
         return LumenColumnParallelLinear

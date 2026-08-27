@@ -920,8 +920,10 @@ def _get_fast_gemm_fn(op_name):
     return fn
 
 
-def gemm_bf16(a, w, bias=None):
-    """BF16 GEMM: Y = X @ W^T via AITER tuned_gemm (hipBLASLt / ASM / Triton)."""
+def _gemm_bf16_forward(a, w, bias=None):
+    """Raw BF16 GEMM forward without relying on AIter autograd registration."""
+    if not a.is_cuda:
+        return torch.nn.functional.linear(a, w, bias)
     if _FAST_GEMM_DISPATCH:
         fn = _get_fast_gemm_fn("gemm_bf16")
         if fn is not None:
@@ -930,6 +932,46 @@ def gemm_bf16(a, w, bias=None):
     if _probe_aiter_tuned_gemm_bf16():
         backends.append((Backend.ASM, lambda: _gemm_bf16_tuned(a, w, bias)))
     return try_backends(backends, op_name="gemm_bf16")
+
+
+class _AIterBF16Linear(torch.autograd.Function):
+    """Differentiable AIter GEMM used by Lumen and Miles gfx942 training."""
+
+    @staticmethod
+    def forward(ctx, input_, weight, bias):
+        input_2d = input_.reshape(-1, input_.shape[-1])
+        ctx.save_for_backward(input_2d, weight)
+        ctx.input_shape = input_.shape
+        ctx.has_bias = bias is not None
+        output = _gemm_bf16_forward(input_2d, weight, bias)
+        return output.reshape(*input_.shape[:-1], weight.shape[0])
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        input_2d, weight = ctx.saved_tensors
+        grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1]).contiguous()
+
+        grad_input = grad_weight = grad_bias = None
+        if ctx.needs_input_grad[0]:
+            grad_input_2d = _gemm_bf16_forward(
+                grad_output_2d,
+                weight.transpose(0, 1).contiguous(),
+            )
+            grad_input = grad_input_2d.reshape(ctx.input_shape)
+        if ctx.needs_input_grad[1]:
+            grad_weight = _gemm_bf16_forward(
+                grad_output_2d.transpose(0, 1).contiguous(),
+                input_2d.transpose(0, 1).contiguous(),
+            )
+        if ctx.has_bias and ctx.needs_input_grad[2]:
+            grad_bias = grad_output_2d.float().sum(dim=0).to(grad_output.dtype)
+        return grad_input, grad_weight, grad_bias
+
+
+def gemm_bf16(a, w, bias=None):
+    """Differentiable BF16 ``Y = X @ W.T`` via AIter tuned GEMM."""
+    return _AIterBF16Linear.apply(a, w, bias)
 
 
 def dispatch_gemm(a, w, scale_a=None, scale_w=None, scaling_type="none", bias=None):
