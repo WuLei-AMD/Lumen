@@ -22,6 +22,21 @@ built from source; it does not inherit Miles or Primus.
 The Lumen AITER submodule must point to the SonicMoE-enabled
 `lumen/qwen3-30b-a3b` revision.
 
+To reproduce the measured MI350X experiments without rebuilding the image,
+use the published Docker Hub tag:
+
+```bash
+docker pull zhangdanyangamd/lumen:qwen3-30b-a3b-350x-pretrain260828
+
+IMAGE_NAME=zhangdanyangamd/lumen:qwen3-30b-a3b-350x-pretrain260828 \
+  bash examples/qwen3-30b-a3b/run_docker.sh
+```
+
+The published image digest is
+`sha256:ef5c8632b852f3a04ebc3a9d600e6ef2dc66d4d39e78be41ae97b347ddc6bfd3`.
+Set the same `IMAGE_NAME` for benchmark commands that invoke
+`run_docker.sh`, or set `IMAGE` when using `run_qwen3_30b_a3b_fsdp.sh`.
+
 ## SequentialMLP versus TEGroupedMLP
 
 ```bash
