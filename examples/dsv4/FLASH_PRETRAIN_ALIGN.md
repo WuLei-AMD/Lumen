@@ -133,18 +133,18 @@ allreduce 被跳过。
 
 两个缺陷方向相反、部分对冲（A 抬高、B 压低）。
 
-**验修结果（duplicated 记账已修，LN 还未打到正确的 class）：**
+**验修结果（2026-08-28 GPU 复验 SP RMSNorm）：**
 
 | | lm loss | grad_norm |
 |--|---------|-----------|
 | Miles Triton bwd | 12.8385 | **17.03** |
-| Lumen + dgrad + duplicated 修复 | 12.8353 | **16.730** |
+| Lumen + dgrad + duplicated（LN 未修） | 12.8353 | **16.730** |
+| Lumen + dgrad + duplicated + `LumenRMSNorm` SP | 12.8357 | **17.189** |
 
-bucket 比值 Lumen/Miles：`attn` 1.007、`shared_expert` 1.003、`compressor` 1.006；
-**`norm` 仍 0.476**。原因：transformer 的 `input_layernorm` / `final_layernorm`
-默认走 `lumen.ops.normalization.LumenRMSNorm`（`LUMEN_DSV4_LOCAL_RMSNORM=0`），
-不是 `layers.LumenNorm`。已在 `LumenRMSNorm` / `_LumenNorm` factory 补
-`weight.sequence_parallel`，**尚未用 GPU 复验**。按 dump 推算修完 gn ≈ **17.17**。
+bucket 比值 Lumen/Miles 全部 ~1.00–1.02：`attn` 1.014、`shared_expert` 1.004、
+`compressor` 1.010、**`norm` 1.007**（此前 0.476）。`final_layernorm` gsq
+6.237 vs 6.243。全局 gn 比值 **1.009**。剩余 <1% 视为数值差（BF16 GEMM 等），
+不再当作独立 bug。
 
 ### 1.6 Miles 代码修复（`dsv4_mi325` 已合）
 

@@ -10,7 +10,7 @@
 
 - **Miles `grad_norm` ~31 vs Lumen ~16**：几乎全是 TileLang sparse MLA backward 的 **`dkv` 算错**（fwd 没问题）。
 - 修完 Miles bwd 之后，两边还差一截，差在 **Lumen 自己**：`wq_b` 缺 TP dgrad allreduce、duplicated 权重被当成 TP 重复计入 `grad_norm`、SP RMSNorm 的 wgrad 没 allreduce。
-- 当天能 GPU 验证到的最后数字：**Lumen 16.730 vs Miles 17.03**（比值 0.982）。剩下 `norm` bucket 约 0.48，代码已改到真正生效的 `LumenRMSNorm`，**没再占卡复验**。
+- 2026-08-28 补上 `LumenRMSNorm` 的 SP 标记并复验：**Lumen 17.189 vs Miles 17.03**（比值 **1.009**）。`norm` bucket 0.48 → **1.007**。反向 `grad_norm` 按参数桶已对齐。
 
 ---
 
@@ -25,6 +25,7 @@
 | Miles 改 Triton bwd | ~16.40 | **17.13** | TileLang `dkv` 是 2× 主因 |
 | Lumen 补 dgrad allreduce | **19.09** | 17.03 | `after_wq_a` 从 0.24× 回到 ~1.00；gn 暂时变高 |
 | Lumen 再修 duplicated 记账 | **16.730** | 17.03 | `attn` bucket 1.30 → 1.007；LN 仍偏小 |
+| Lumen 再修 `LumenRMSNorm` SP | **17.189** | 17.03 | `norm` 0.48 → 1.007；全局 1.009× |
 
 PP 是反的：Lumen last-PP / `grad norm` 在 **worker log**；Miles 在 **head log**。
 
@@ -117,14 +118,14 @@ SP 下每个 TP rank 只看到 1/4 序列，LN 的 wgrad 是偏和，要靠 Mega
 
 `spec_provider._LumenNorm` → **`lumen.ops.normalization.LumenRMSNorm`**
 
-`LumenRMSNorm` 原来不收 `config`，也不设 `sequence_parallel`。已改 factory 传入 config，并在 `LumenRMSNorm` / `LumenLayerNorm` 上打标记。**当天没有再跑 1-step。** 按 dump 推算修完 gn ≈ **17.17**（vs Miles 17.03）。
+`LumenRMSNorm` 原来不收 `config`，也不设 `sequence_parallel`。已改 factory 传入 config，并在 `LumenRMSNorm` / `LumenLayerNorm` 上打标记。**2026-08-28 复验**：`norm` bucket 1.007，`final_layernorm` gsq 6.237 vs 6.243，全局 gn **17.189 vs 17.03**。
 
 ---
 
 ## 还没做完
 
-1. GPU 复验 `LumenRMSNorm.sequence_parallel` 之后 `norm` bucket 是否到 ~1.0、gn 是否到 ~17.1。
-2. L22 PP 边界 ~0.64 未解释。
+1. ~~GPU 复验 `LumenRMSNorm.sequence_parallel`~~ **已做（2026-08-28）**：gn 17.189 vs 17.03，`norm` 1.007。
+2. L22 PP 边界激活 dump ≈ 0.64 未解释（**不影响**全局 `grad_norm` 对齐）。
 3. TileLang `dkv` kernel 本身没修，只是 Miles bwd 绕开了。
 
 ---
