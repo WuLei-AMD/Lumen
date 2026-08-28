@@ -5,6 +5,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,6 +23,7 @@ MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 EPShardedMoeBlock = MODULE.EPShardedMoeBlock
+SonicLocalExperts = MODULE._SonicLocalExperts
 create_parallel_groups = MODULE.create_parallel_groups
 
 
@@ -112,6 +114,84 @@ def test_ep_sharded_moe_ep1_matches_huggingface_layout():
         sharded_down_grad,
         reference.experts.down_proj.grad,
     )
+
+
+def test_sonic_blas_ep1_matches_huggingface_layout(monkeypatch):
+    monkeypatch.setenv("SONIC_MOE_GEMM_BACKEND", "blas")
+    torch.manual_seed(11)
+    reference = _FakeBlock()
+    sharded = EPShardedMoeBlock(
+        copy.deepcopy(reference),
+        ep_rank=0,
+        ep_size=1,
+        ep_group=None,
+        expert_backend="sonic",
+    )
+
+    reference_input = torch.randn(2, 3, 6, requires_grad=True)
+    sharded_input = reference_input.detach().clone().requires_grad_(True)
+    reference_output = reference(reference_input)
+    sharded_output = sharded(sharded_input)
+    torch.testing.assert_close(sharded_output, reference_output)
+
+    reference_output.square().sum().backward()
+    sharded_output.square().sum().backward()
+    torch.testing.assert_close(sharded_input.grad, reference_input.grad)
+    reference_gate, reference_up = reference.experts.gate_up_proj.grad.chunk(2, dim=1)
+    torch.testing.assert_close(
+        sharded.local_experts.w1.grad,
+        torch.stack((reference_gate, reference_up), dim=2).flatten(1, 2),
+    )
+    torch.testing.assert_close(
+        sharded.local_experts.w2.grad,
+        reference.experts.down_proj.grad,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a ROCm GPU")
+def test_sonic_triton_forward_and_gradients(monkeypatch):
+    pytest.importorskip("aiter.ops.triton.sonicmoe")
+    monkeypatch.setenv("SONIC_MOE_GEMM_BACKEND", "triton")
+    torch.manual_seed(17)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    experts = _FakeExperts()
+    experts.gate_up_proj = nn.Parameter(
+        torch.randn(4, 128, 128, device=device, dtype=dtype) * 0.02
+    )
+    experts.down_proj = nn.Parameter(
+        torch.randn(4, 128, 64, device=device, dtype=dtype) * 0.02
+    )
+    sonic = SonicLocalExperts(experts, 0, 4)
+
+    hidden = torch.randn(19, 128, device=device, dtype=dtype, requires_grad=True)
+    expert_ids = torch.tensor(
+        [0, 2, 1, 3, 1, 0, 2, 2, 3, 0, 1, 3, 2, 0, 1, 1, 3, 2, 0],
+        device=device,
+    )
+    weights = torch.rand(19, device=device, dtype=dtype, requires_grad=True)
+    reference_hidden = hidden.detach().clone().requires_grad_(True)
+    reference_weights = weights.detach().clone().requires_grad_(True)
+    reference_w1 = sonic.w1.detach().clone().requires_grad_(True)
+    reference_w2 = sonic.w2.detach().clone().requires_grad_(True)
+
+    reference_output = torch.empty_like(reference_hidden)
+    for expert_id in range(4):
+        positions = torch.where(expert_ids == expert_id)[0]
+        gate = F.linear(reference_hidden[positions], reference_w1[expert_id, 0::2])
+        up = F.linear(reference_hidden[positions], reference_w1[expert_id, 1::2])
+        result = F.linear(F.silu(gate) * up, reference_w2[expert_id])
+        reference_output[positions] = result * reference_weights[positions, None]
+    sonic_output = sonic.forward_all(hidden, expert_ids, weights)
+    torch.testing.assert_close(sonic_output, reference_output, rtol=0.05, atol=0.02)
+
+    output_gradient = torch.randn_like(sonic_output)
+    sonic_output.backward(output_gradient)
+    reference_output.backward(output_gradient)
+    torch.testing.assert_close(hidden.grad, reference_hidden.grad, rtol=0.08, atol=0.03)
+    torch.testing.assert_close(weights.grad, reference_weights.grad, rtol=0.08, atol=0.03)
+    torch.testing.assert_close(sonic.w1.grad, reference_w1.grad, rtol=0.08, atol=0.03)
+    torch.testing.assert_close(sonic.w2.grad, reference_w2.grad, rtol=0.08, atol=0.03)
 
 
 def test_single_rank_parallel_groups_do_not_require_distributed_init():

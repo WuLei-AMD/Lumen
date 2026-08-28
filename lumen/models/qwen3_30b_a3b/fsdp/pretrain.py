@@ -18,6 +18,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -62,7 +63,11 @@ class ParallelGroups:
     dp_size: int
 
 
-def create_parallel_groups(ep_size: int, dp_size: Optional[int] = None) -> ParallelGroups:
+def create_parallel_groups(
+    ep_size: int,
+    dp_size: Optional[int] = None,
+    timeout_minutes: int = 60,
+) -> ParallelGroups:
     """Create expert- and data-parallel groups for the current process."""
     if not dist.is_initialized():
         if ep_size != 1 or dp_size not in (None, 1):
@@ -83,16 +88,17 @@ def create_parallel_groups(ep_size: int, dp_size: Optional[int] = None) -> Paral
     dp_rank = global_rank // ep_size
 
     ep_group = None
+    timeout = timedelta(minutes=timeout_minutes)
     for row in range(dp_size):
         ranks = list(range(row * ep_size, (row + 1) * ep_size))
-        group = dist.new_group(ranks)
+        group = dist.new_group(ranks, timeout=timeout)
         if global_rank in ranks:
             ep_group = group
 
     dp_group = None
     for column in range(ep_size):
         ranks = [row * ep_size + column for row in range(dp_size)]
-        group = dist.new_group(ranks)
+        group = dist.new_group(ranks, timeout=timeout)
         if global_rank in ranks:
             dp_group = group
 
@@ -216,6 +222,123 @@ class _TEGroupedLocalExperts(nn.Module):
         return output
 
 
+class _SonicLocalExperts(nn.Module):
+    """Local HF expert slice backed by AITER SonicMoE."""
+
+    def __init__(self, experts: nn.Module, start: int, end: int):
+        super().__init__()
+        self.num_experts = end - start
+        gate, up = experts.gate_up_proj[start:end].detach().chunk(2, dim=1)
+        self.w1 = nn.Parameter(
+            torch.stack((gate, up), dim=2).flatten(1, 2).contiguous()
+        )
+        self.w2 = nn.Parameter(
+            experts.down_proj[start:end].detach().contiguous()
+        )
+        self.gemm_backend = os.environ.get("SONIC_MOE_GEMM_BACKEND", "triton")
+        if self.gemm_backend not in {"triton", "blas"}:
+            raise ValueError(
+                "SONIC_MOE_GEMM_BACKEND must be either 'triton' or 'blas'"
+            )
+
+    def _forward_blas(
+        self,
+        sorted_hidden: torch.Tensor,
+        sorted_weights: torch.Tensor,
+        split_sizes: list[int],
+    ) -> torch.Tensor:
+        outputs = []
+        for expert_id, (tokens, weights) in enumerate(
+            zip(
+                torch.split(sorted_hidden, split_sizes),
+                torch.split(sorted_weights, split_sizes),
+            )
+        ):
+            gate = F.linear(tokens, self.w1[expert_id, 0::2])
+            up = F.linear(tokens, self.w1[expert_id, 1::2])
+            output = F.linear(F.silu(gate) * up, self.w2[expert_id])
+            outputs.append(output * weights.unsqueeze(-1))
+        return torch.cat(outputs, dim=0)
+
+    def forward_all(
+        self,
+        hidden_states: torch.Tensor,
+        expert_ids: torch.Tensor,
+        routing_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate all received expert assignments in one SonicMoE call."""
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+
+        sonicmoe = None
+        common = None
+        if self.gemm_backend == "triton":
+            from aiter.ops.triton import sonicmoe
+
+            common = (
+                self.w1.permute(1, 2, 0),
+                None,
+                self.w2.permute(1, 2, 0),
+                None,
+            )
+            if not hasattr(sonicmoe, "moe_pre_routed_inputs"):
+                row_ids = torch.arange(
+                    hidden_states.shape[0],
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                )
+                kernel_weights = torch.ones_like(row_ids, dtype=torch.float32)
+                output, _expert_frequency = sonicmoe.moe_general_routing_inputs(
+                    hidden_states,
+                    kernel_weights,
+                    row_ids,
+                    expert_ids.to(dtype=torch.int32),
+                    *common,
+                    self.num_experts,
+                    torch.cuda.current_stream().cuda_stream,
+                    sonicmoe.SonicMoEActivationType.SWIGLU,
+                    False,
+                    False,
+                )
+                return output * routing_weights.unsqueeze(-1)
+
+        order = torch.argsort(expert_ids, stable=True)
+        sorted_hidden = hidden_states[order]
+        sorted_weights = routing_weights[order]
+        counts = torch.bincount(expert_ids, minlength=self.num_experts)
+
+        if self.gemm_backend == "blas":
+            sorted_output = self._forward_blas(
+                sorted_hidden,
+                sorted_weights,
+                counts.tolist(),
+            )
+        else:
+            # Apply routing weights outside SonicMoE. This keeps router-score
+            # gradients in native PyTorch and is compatible with AITER
+            # revisions whose general-routing score backward differs.
+            kernel_weights = torch.ones(
+                sorted_hidden.shape[0],
+                dtype=torch.float32,
+                device=sorted_hidden.device,
+            )
+            sorted_output, _expert_frequency = sonicmoe.moe_pre_routed_inputs(
+                sorted_hidden,
+                kernel_weights,
+                counts.to(dtype=torch.int32),
+                *common,
+                torch.cuda.current_stream().cuda_stream,
+                sonicmoe.SonicMoEActivationType.SWIGLU,
+                False,
+                False,
+            )
+            sorted_output = sorted_output * sorted_weights.unsqueeze(-1)
+
+        output = torch.empty_like(sorted_output)
+        output.index_copy_(0, order, sorted_output)
+        return output
+
+
 class _ModuleListLocalExperts(nn.Module):
     """Local slice of older Transformers Qwen3 expert modules."""
 
@@ -243,6 +366,7 @@ class EPShardedMoeBlock(nn.Module):
         self.ep_rank = ep_rank
         self.ep_size = ep_size
         self.ep_group = ep_group
+        self._sonic_first_forward = expert_backend == "sonic"
 
         experts = original_block.experts
         num_experts = getattr(experts, "num_experts", None)
@@ -261,6 +385,12 @@ class EPShardedMoeBlock(nn.Module):
         if hasattr(experts, "gate_up_proj") and hasattr(experts, "down_proj"):
             if expert_backend == "te_grouped":
                 self.local_experts = _TEGroupedLocalExperts(
+                    experts,
+                    self.local_expert_start,
+                    end,
+                )
+            elif expert_backend == "sonic":
+                self.local_experts = _SonicLocalExperts(
                     experts,
                     self.local_expert_start,
                     end,
@@ -376,6 +506,10 @@ class EPShardedMoeBlock(nn.Module):
                     positions,
                     expert_output * recv_weights[positions].unsqueeze(-1),
                 )
+
+        if self._sonic_first_forward and self.ep_size > 1:
+            dist.barrier(group=self.ep_group)
+            self._sonic_first_forward = False
 
         returned = self._exchange_tensor(
             local_output, recv_splits, send_splits, differentiable=True
@@ -534,7 +668,7 @@ def build_model(args: argparse.Namespace) -> nn.Module:
     if args.model_name_or_path:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
-            torch_dtype=torch.float32,
+            dtype=torch.bfloat16,
             attn_implementation="sdpa",
             low_cpu_mem_usage=True,
         )
@@ -637,13 +771,20 @@ class FSDPTrainer:
                 "Qwen3-30B-A3B uses full-parameter training"
             )
         if not dist.is_initialized():
-            dist.init_process_group("nccl")
+            dist.init_process_group(
+                "nccl",
+                timeout=timedelta(minutes=args.distributed_timeout_minutes),
+            )
         self.rank = dist.get_rank()
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(self.local_rank)
         torch.manual_seed(args.seed)
 
-        self.groups = create_parallel_groups(args.ep_size, args.dp_size)
+        self.groups = create_parallel_groups(
+            args.ep_size,
+            args.dp_size,
+            timeout_minutes=args.distributed_timeout_minutes,
+        )
         self.model = build_model(args)
         self.model = shard_moe_experts(
             self.model,
@@ -795,6 +936,7 @@ class FSDPTrainer:
         data_iterator = iter(self.train_loader)
         for step in range(1, self.args.max_steps + 1):
             torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats(self.local_rank)
             start = time.perf_counter()
             self.optimizer.zero_grad()
             accumulated_loss = 0.0
@@ -820,18 +962,34 @@ class FSDPTrainer:
             self.optimizer.step()
             self.scheduler.step()
             torch.cuda.synchronize()
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            peak_memory_mb = torch.tensor(
+                torch.cuda.max_memory_allocated(self.local_rank) / (1024**2),
+                dtype=torch.float64,
+                device=f"cuda:{self.local_rank}",
+            )
+            dist.all_reduce(peak_memory_mb, op=dist.ReduceOp.MAX)
+            global_batch_size = (
+                self.args.micro_batch_size
+                * self.args.gradient_accumulation_steps
+                * self.groups.dp_size
+            )
+            throughput = global_batch_size * 1000 / elapsed_ms
 
             if step % self.args.log_interval == 0:
                 _rank0_log(
                     "step %d/%d | loss %.6f | lm_loss %.6f | aux_loss %.6f | "
-                    "lr %.2e | step_time_ms %.1f",
+                    "lr %.2e | step_time_ms %.1f | throughput_samples_per_sec %.3f | "
+                    "peak_memory_mb %.1f",
                     step,
                     self.args.max_steps,
                     accumulated_loss / self.args.gradient_accumulation_steps,
                     accumulated_lm_loss / self.args.gradient_accumulation_steps,
                     accumulated_aux_loss / self.args.gradient_accumulation_steps,
                     self.scheduler.get_last_lr()[0],
-                    (time.perf_counter() - start) * 1000,
+                    elapsed_ms,
+                    throughput,
+                    peak_memory_mb.item(),
                 )
             if (
                 self.val_loader is not None
@@ -881,7 +1039,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--dp-size", type=int, default=None)
     parser.add_argument(
         "--expert-backend",
-        choices=["sequential", "te_grouped"],
+        choices=["sequential", "te_grouped", "sonic"],
         default="te_grouped",
     )
     parser.add_argument(
@@ -912,6 +1070,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--eval-interval", type=int, default=50)
     parser.add_argument("--val-samples", type=int, default=200)
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--distributed-timeout-minutes", type=int, default=60)
     return parser.parse_args()
 
 
