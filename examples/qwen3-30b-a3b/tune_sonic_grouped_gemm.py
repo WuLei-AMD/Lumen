@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -16,13 +17,12 @@ from aiter.ops.triton._triton_kernels.moe.sonicmoe.grouped_gemm_triton import (
 
 
 NUM_EXPERTS = 16
-TOKENS = 32768
 DTYPE = torch.bfloat16
 
 
-def _offsets(device: torch.device) -> torch.Tensor:
+def _offsets(device: torch.device, tokens: int) -> torch.Tensor:
     counts = torch.full(
-        (NUM_EXPERTS,), TOKENS // NUM_EXPERTS, dtype=torch.int32, device=device
+        (NUM_EXPERTS,), tokens // NUM_EXPERTS, dtype=torch.int32, device=device
     )
     return torch.cat(
         (
@@ -49,9 +49,20 @@ def _new_configs(kernel, before: set) -> list[dict]:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tokens", type=int, default=131072)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path(__file__).with_name("sonic_grouped_gemm_qwen3_gbs256_tuned.json"),
+    )
+    args = parser.parse_args()
+    if args.tokens % NUM_EXPERTS:
+        raise ValueError("--tokens must be divisible by 16")
+
     device = torch.device("cuda")
-    offsets = _offsets(device)
-    identity = torch.arange(TOKENS, dtype=torch.int32, device=device)
+    offsets = _offsets(device, args.tokens)
+    identity = torch.arange(args.tokens, dtype=torch.int32, device=device)
     results = {}
 
     forward_specs = [
@@ -61,7 +72,7 @@ def main() -> None:
         ("up_backward_input", 1536, 2048, False),
     ]
     for name, k_dim, n_dim, use_gather in forward_specs:
-        a = torch.randn(TOKENS, k_dim, dtype=DTYPE, device=device)
+        a = torch.randn(args.tokens, k_dim, dtype=DTYPE, device=device)
         b = torch.randn(NUM_EXPERTS, k_dim, n_dim, dtype=DTYPE, device=device)
         before = set(_grouped_gemm_kernel.cache)
         grouped_gemm(a, b, offsets, A_idx=identity if use_gather else None)
@@ -82,8 +93,8 @@ def main() -> None:
         ("dw2", 768, 2048, False),
     ]
     for name, k_dim, n_dim, use_gather in dw_specs:
-        a = torch.randn(TOKENS, k_dim, dtype=DTYPE, device=device)
-        b = torch.randn(TOKENS, n_dim, dtype=DTYPE, device=device)
+        a = torch.randn(args.tokens, k_dim, dtype=DTYPE, device=device)
+        b = torch.randn(args.tokens, n_dim, dtype=DTYPE, device=device)
         out = torch.empty(
             NUM_EXPERTS, k_dim, n_dim, dtype=DTYPE, device=device
         )
@@ -108,9 +119,8 @@ def main() -> None:
         del a, b, out
         torch.cuda.empty_cache()
 
-    output = Path(__file__).with_name("sonic_grouped_gemm_qwen3_tuned.json")
-    output.write_text(json.dumps(results, indent=2) + "\n")
-    print(output.read_text())
+    args.output.write_text(json.dumps(results, indent=2) + "\n")
+    print(args.output.read_text())
 
 
 if __name__ == "__main__":

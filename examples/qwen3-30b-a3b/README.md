@@ -92,6 +92,9 @@ two-dimensional DP×EP layout:
 
 - Experts are partitioned across each EP row and tokens are dispatched with
   differentiable all-to-all collectives.
+- `--expert-backend` selects `sequential`, `te_grouped`, or `sonic`. The Sonic
+  path supports both AITER general-routing and pre-routed APIs and keeps its
+  gate/up weights in the interleaved layout required for correct gradients.
 - Each decoder layer, including its local expert slice, is sharded by FSDP2
   across the corresponding DP column.
 - Both BF16 and Lumen FP8 blockwise2d full-parameter training are supported.
@@ -127,3 +130,21 @@ router normalization, and normalized auxiliary-loss coefficient), run:
 TRAIN_STEPS=100 COMMAND="bash run_fsdp.sh" \
   bash examples/qwen3-30b-a3b/run_docker.sh
 ```
+
+To run the GBS=256 comparison at the largest validated microbatch on one
+8×MI350X node:
+
+```bash
+GBS=256 MBS=4 SEQ_LEN=4096 EXPERT_BACKEND=sonic \
+TRAIN_STEPS=20 COMMAND="bash run_fsdp.sh" \
+  bash examples/qwen3-30b-a3b/run_docker.sh
+```
+
+At sequence length 4096, MBS 32, 16, and 8 exceed the 288 GiB device-memory
+limit with activation checkpointing disabled. MBS 4 is the largest divisor of
+GBS 256 that completed the one-step memory probe.
+
+`run_docker.sh` defaults to
+`zhangdanyangamd/lumen:qwen3-30b-a3b-350x-pretrain260828` and overlays the
+local FSDP implementation while preserving the image's bundled SonicMoE AITER
+sources.

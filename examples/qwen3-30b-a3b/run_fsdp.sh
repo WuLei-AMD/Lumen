@@ -5,6 +5,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG=${CONFIG:-"${SCRIPT_DIR}/config_MI350X_1x8x1.sh"}
 source "${CONFIG}"
+EXPERT_BACKEND=${EXPERT_BACKEND:-te_grouped}
+MODEL_ARGS=()
+if [ -n "${MODEL_PATH:-}" ]; then
+    MODEL_ARGS=(--model-name-or-path "${MODEL_PATH}")
+fi
+
+case "${EXPERT_BACKEND}" in
+    sequential|te_grouped|sonic) ;;
+    *)
+        echo "ERROR: EXPERT_BACKEND must be sequential, te_grouped, or sonic" >&2
+        exit 2
+        ;;
+esac
 
 mkdir -p "$(dirname "${DATA_PATH}")" "${RESULTS_DIR}"
 if [ ! -s "${DATA_PATH}" ]; then
@@ -23,7 +36,8 @@ with path.open("w") as output:
 PY
 fi
 
-LOG_FILE="${RESULTS_DIR}/qwen3-30b-a3b-fsdp-bf16-seq${SEQ_LEN}-mbs${MBS}.log"
+RUN_SUFFIX=${RUN_SUFFIX:-}
+LOG_FILE="${RESULTS_DIR}/qwen3-30b-a3b-fsdp-${EXPERT_BACKEND}${RUN_SUFFIX:+-${RUN_SUFFIX}}-bf16-seq${SEQ_LEN}-mbs${MBS}-gbs${GBS}.log"
 DP=$((NGPU / EP))
 if [ $((NGPU % EP)) -ne 0 ]; then
     echo "ERROR: NGPU=${NGPU} must be divisible by EP=${EP}" >&2
@@ -42,6 +56,7 @@ torchrun \
     --master_addr="${MASTER_ADDR}" \
     --master_port="${MASTER_PORT}" \
     "${SCRIPT_DIR}/pretrain_qwen3_30b_a3b_fsdp.py" \
+    "${MODEL_ARGS[@]}" \
     --tokenizer-name-or-path "${TOKENIZER_PATH}" \
     --train-data-path "${DATA_PATH}" \
     --val-data-path "${DATA_PATH}" \
@@ -64,7 +79,7 @@ torchrun \
     --aux-loss-coeff 1e-3 \
     --ep-size "${EP}" \
     --dp-size "${DP}" \
-    --expert-backend te_grouped \
+    --expert-backend "${EXPERT_BACKEND}" \
     --sharding full_shard \
     --no-gradient-checkpointing \
     --num-workers 2 \

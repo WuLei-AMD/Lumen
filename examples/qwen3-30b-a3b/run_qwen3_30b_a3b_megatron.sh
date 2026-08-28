@@ -6,6 +6,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CONFIG=${CONFIG:-"${SCRIPT_DIR}/config_MI350X_1x8x1.sh"}
 source "${CONFIG}"
+LOAD_ARGS=()
+if [ -n "${MEGATRON_LOAD_PATH:-}" ]; then
+    LOAD_ARGS=(
+        --load "${MEGATRON_LOAD_PATH}"
+        --ckpt-format torch
+        --finetune
+        --no-load-optim
+        --no-load-rng
+        --exit-on-missing-checkpoint
+    )
+fi
 
 case "${MOE_IMPL}" in
     sequential)
@@ -38,7 +49,15 @@ if [ "${ENABLE_PROFILER:-0}" = "1" ]; then
 fi
 
 mkdir -p "$(dirname "${DATA_PATH}")" "${RESULTS_DIR}"
-if [ ! -s "${DATA_PATH}" ]; then
+REQUIRED_DOCUMENTS=$((GBS * (TRAIN_STEPS + 4)))
+if [ "${REQUIRED_DOCUMENTS}" -lt 128 ]; then
+    REQUIRED_DOCUMENTS=128
+fi
+CURRENT_DOCUMENTS=0
+if [ -s "${DATA_PATH}" ]; then
+    CURRENT_DOCUMENTS=$(wc -l < "${DATA_PATH}")
+fi
+if [ "${CURRENT_DOCUMENTS}" -lt "${REQUIRED_DOCUMENTS}" ]; then
     python3 - "${DATA_PATH}" "${SEQ_LEN}" "${GBS}" "${TRAIN_STEPS}" <<'PY'
 import json
 import pathlib
@@ -58,7 +77,8 @@ print(f"Generated {documents} mock documents at {path}")
 PY
 fi
 
-RUN_NAME="qwen3-30b-a3b-${MOE_IMPL}-seq${SEQ_LEN}-mbs${MBS}"
+RUN_SUFFIX=${RUN_SUFFIX:-}
+RUN_NAME="qwen3-30b-a3b-${MOE_IMPL}${RUN_SUFFIX:+-${RUN_SUFFIX}}-seq${SEQ_LEN}-mbs${MBS}-gbs${GBS}"
 LOG_FILE="${RESULTS_DIR}/${RUN_NAME}.log"
 
 echo "Qwen3-30B-A3B: MOE_IMPL=${MOE_IMPL}, TP=${TP}, EP=${EP}, seq=${SEQ_LEN}"
@@ -79,6 +99,7 @@ torchrun \
     --group-query-attention \
     --num-query-groups 4 \
     --kv-channels 128 \
+    --make-vocab-size-divisible-by 1187 \
     --seq-length "${SEQ_LEN}" \
     --max-position-embeddings 4096 \
     --use-rotary-position-embeddings \
@@ -138,6 +159,7 @@ torchrun \
     --save-interval 1000000 \
     --log-interval 1 \
     --log-throughput \
+    "${LOAD_ARGS[@]}" \
     "${PROFILE_ARGS[@]}" \
     2>&1 | tee "${LOG_FILE}"
 
