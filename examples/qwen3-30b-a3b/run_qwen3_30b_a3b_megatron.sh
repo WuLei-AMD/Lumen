@@ -69,7 +69,7 @@ torchrun \
     --node_rank="${NODE_RANK}" \
     --master_addr="${MASTER_ADDR}" \
     --master_port="${MASTER_PORT}" \
-    "${SCRIPT_DIR}/pretrain_qwen3_30b_a3b.py" \
+    "${SCRIPT_DIR}/pretrain_qwen3_30b_a3b_megatron.py" \
     --backend megatron \
     --lumen-attn-backend "${LUMEN_ATTN_BACKEND}" \
     --num-layers 48 \

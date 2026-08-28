@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 IMAGE_NAME=${IMAGE_NAME:-lumen/qwen3-30b-a3b:latest}
-COMMAND=${COMMAND:-"bash run_pretrain.sh"}
+COMMAND=${COMMAND:-"bash run_qwen3_30b_a3b_megatron.sh"}
 
 docker run --rm --init \
     --device=/dev/kfd \

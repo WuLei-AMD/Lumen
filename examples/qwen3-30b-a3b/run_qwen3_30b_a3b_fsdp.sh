@@ -15,27 +15,26 @@
 #   HOST_MODEL=/mnt/raid0/models/Qwen3-30B-A3B \
 #   HOST_DATA=/mnt/raid0/danyzhan/datasets/alpaca \
 #   TRAIN_FILE=train.jsonl VAL_FILE=test.jsonl \
-#     bash run_qwen3_30b_a3b_fsdp_mi308.sh
+#     bash run_qwen3_30b_a3b_fsdp.sh
 #
 # Example (worker node):
 #   NODE_RANK=1 MASTER_ADDR=10.0.0.1 MASTER_PORT=29500 \
 #   HOST_MODEL=/mnt/raid0/models/Qwen3-30B-A3B \
 #   HOST_DATA=/mnt/raid0/danyzhan/datasets/alpaca \
 #   TRAIN_FILE=train.jsonl VAL_FILE=test.jsonl \
-#     bash run_qwen3_30b_a3b_fsdp_mi308.sh
+#     bash run_qwen3_30b_a3b_fsdp.sh
 #
 # Single-node DP=1 EP=8 (backward compatible):
 #   NNODES=1 DP_SIZE=1 EP_SIZE=8 \
 #   HOST_MODEL=/mnt/raid0/models/Qwen3-30B-A3B \
 #   HOST_DATA=/mnt/raid0/danyzhan/datasets/alpaca \
 #   TRAIN_FILE=train.jsonl VAL_FILE=test.jsonl \
-#     bash run_qwen3_30b_a3b_fsdp_mi308.sh
+#     bash run_qwen3_30b_a3b_fsdp.sh
 #
-# Fastest config (memory permitting):
-#   MODE=fp8_blockwise2d \
-#   SHARDING=shard_grad_op GRAD_CKPT=0 \
+# Throughput-oriented config (memory permitting):
+#   MODE=fp8_blockwise2d SHARDING=shard_grad_op GRAD_CKPT=0 \
 #   AITER_ATTN=1 LUMEN_NORM=1 FUSE_ROPE=1 \
-#     bash run_qwen3_30b_a3b_fsdp_mi308.sh
+#     bash run_qwen3_30b_a3b_fsdp.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -67,7 +66,6 @@ GRAD_CKPT="${GRAD_CKPT:-1}"
 FP8_SCALING="${FP8_SCALING:-blockwise2d}"
 
 # ---- Optimization flags ----
-FSDP_FP8_PARAM_STORAGE="${FSDP_FP8_PARAM_STORAGE:-}"
 AITER_ATTN="${AITER_ATTN:-}"
 LUMEN_NORM="${LUMEN_NORM:-}"
 FUSE_ROPE="${FUSE_ROPE:-}"
@@ -123,7 +121,6 @@ cd /workspace/Lumen/examples/qwen3-30b-a3b
 
 EXTRA=""
 # Optimization flags
-[[ -n "'"${FSDP_FP8_PARAM_STORAGE}"'" ]] && EXTRA="${EXTRA} --fsdp-fp8-param-storage"
 [[ -n "'"${AITER_ATTN}"'" ]]          && EXTRA="${EXTRA} --aiter-attn"
 [[ -n "'"${LUMEN_NORM}"'" ]]          && EXTRA="${EXTRA} --lumen-norm"
 [[ -n "'"${FUSE_ROPE}"'" ]]           && EXTRA="${EXTRA} --fuse-rope"
@@ -135,8 +132,9 @@ torchrun \
     --node_rank='"${NODE_RANK}"' \
     --master_addr='"${MASTER_ADDR}"' \
     --master_port='"${MASTER_PORT}"' \
-    train_qwen3_30b_a3b_fsdp_ep8.py \
+    pretrain_qwen3_30b_a3b_fsdp.py \
     --model-name-or-path /model-qwen3-moe \
+    --data-format alpaca \
     --train-data-path "/data/'"${TRAIN_FILE}"'" \
     --val-data-path "/data/'"${VAL_FILE}"'" \
     --mode '"${MODE}"' \

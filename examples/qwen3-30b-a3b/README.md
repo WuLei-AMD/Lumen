@@ -84,3 +84,46 @@ EP=8, MBS=1, GBS=8, and gradient-accumulation fusion disabled:
 SonicMoE tuning removes host synchronization from grouped-GEMM grid
 calculation and preserves expert-major physical weight layout. E2E profiling
 should focus next on integration/optimizer scheduling rather than GEMM tiles.
+
+## Transformers + FSDP2
+
+The FSDP case uses the HuggingFace `Qwen3MoeForCausalLM` implementation with a
+two-dimensional DP×EP layout:
+
+- Experts are partitioned across each EP row and tokens are dispatched with
+  differentiable all-to-all collectives.
+- Each decoder layer, including its local expert slice, is sharded by FSDP2
+  across the corresponding DP column.
+- Both BF16 and Lumen FP8 blockwise2d full-parameter training are supported.
+
+Run DP=1, EP=8 on one eight-GPU node:
+
+```bash
+NNODES=1 DP_SIZE=1 EP_SIZE=8 \
+HOST_MODEL=/path/to/Qwen3-30B-A3B \
+HOST_DATA=/path/to/alpaca \
+TRAIN_FILE=train.jsonl VAL_FILE=test.jsonl \
+bash examples/qwen3-30b-a3b/run_qwen3_30b_a3b_fsdp.sh
+```
+
+For two eight-GPU nodes, run the same command on both nodes with `NNODES=2`,
+`DP_SIZE=2`, a shared `MASTER_ADDR`, and `NODE_RANK=0`/`1`. Set
+`MODE=fp8_blockwise2d` to enable Lumen FP8. The Python entry point can also be
+launched directly:
+
+```bash
+torchrun --nproc_per_node=8 \
+  pretrain_qwen3_30b_a3b_fsdp.py \
+  --model-name-or-path /path/to/Qwen3-30B-A3B \
+  --train-data-path /path/to/train.jsonl \
+  --ep-size 8 --dp-size 1
+```
+
+For a from-scratch BF16 accuracy run aligned with the Megatron TE flow
+(same architecture, sequence/global batch sizes, optimizer, LR schedule,
+router normalization, and normalized auxiliary-loss coefficient), run:
+
+```bash
+TRAIN_STEPS=100 COMMAND="bash run_fsdp.sh" \
+  bash examples/qwen3-30b-a3b/run_docker.sh
+```

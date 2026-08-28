@@ -10,7 +10,7 @@ for implementation in sequential te_grouped; do
     MOE_IMPL="${implementation}" \
     RESULTS_DIR="${RESULTS_DIR}" \
     TRAIN_STEPS="${TRAIN_STEPS}" \
-        bash "${SCRIPT_DIR}/run_pretrain.sh"
+        bash "${SCRIPT_DIR}/run_qwen3_30b_a3b_megatron.sh"
 done
 
 python3 - "${RESULTS_DIR}" <<'PY'

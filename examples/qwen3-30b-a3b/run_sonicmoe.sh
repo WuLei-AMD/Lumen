@@ -3,4 +3,4 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MOE_IMPL=sonic bash "${SCRIPT_DIR}/run_pretrain.sh"
+MOE_IMPL=sonic bash "${SCRIPT_DIR}/run_qwen3_30b_a3b_megatron.sh"

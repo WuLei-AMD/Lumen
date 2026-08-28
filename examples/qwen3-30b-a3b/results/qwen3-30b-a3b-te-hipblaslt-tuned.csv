@@ -1,0 +1,4 @@
+dev_cap,m,n,k,trans_a,trans_b,type_a,type_b,type_d,bias_type,aux_type,lda,ldb,ldd,scale_mode,epi,comp,scale_type,ws_min,ws_max,algo_id,aidx
+905,128,4096,2048,T,N,bfloat16,bfloat16,float32,-,-,2048,2048,128,0,-,f32,float32,0,67108864,442703,1
+905,2048,4096,128,N,N,float32,float32,float32,-,-,2048,128,2048,0,-,f32,float32,0,67108864,484628,19
+905,2048,128,4096,N,T,float32,float32,float32,-,-,2048,128,2048,0,-,f32,float32,4194304,67108864,483965,21
