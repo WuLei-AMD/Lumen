@@ -2,13 +2,9 @@
 # Runtime env setup inside lumen/tests:latest for DSV4 smoke.
 set -euo pipefail
 
-: "${MHC_BACKEND:=triton}"
-export MHC_BACKEND
-
 BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-/bootstrap}"
 LUMEN_DIR="${LUMEN_DIR:-/workspace/Lumen}"
-AITER_ROOT="${AITER_ROOT:-${LUMEN_DIR}/third_party/aiter}"
-TILEKERNELS_DIR="${TILEKERNELS_DIR:-}"
+AITER_DIR="${AITER_DIR:-/workspace/aiter}"
 WRITABLE_ROOT="${WRITABLE_ROOT:-/tmp/lumen-dsv4-runtime}"
 LUMEN_DSV4_NATIVE_FINETUNE="${LUMEN_DSV4_NATIVE_FINETUNE:-0}"
 LUMEN_DSV4_PRETRAIN="${LUMEN_DSV4_PRETRAIN:-0}"
@@ -24,7 +20,7 @@ export MEGATRON_PATH="${MEGATRON_PATH:-${BOOTSTRAP_DIR}/Megatron-LM}"
 mkdir -p "${WRITABLE_ROOT}"
 
 SITE_PKGS="${SITE_PKGS:-${WRITABLE_ROOT}/site-packages}"
-if [[ ! -d "${SITE_PKGS}/tile_kernels" ]]; then
+if [[ ! -d "${SITE_PKGS}" ]]; then
     echo "[bootstrap_env] copying site-packages -> ${SITE_PKGS} (no TE)"
     rm -rf "${SITE_PKGS}"
     mkdir -p "${SITE_PKGS}"
@@ -47,7 +43,6 @@ if [[ ! -f "${SITE_PKGS}/lumen_dsv4_bootstrap.pth" ]]; then
     cat > "${SITE_PKGS}/lumen_dsv4_bootstrap.pth" <<'PY'
 import os
 
-os.environ.setdefault("MHC_BACKEND", "triton")
 import megatron.core.jit as _jit
 _jit.disable_jit_fuser()
 PY
@@ -74,7 +69,7 @@ _dsv4_prepend_pythonpath() {
     fi
 }
 
-# FP8 QAT uses tile_kernels.quant (TileLang JIT); prefer host mount, else in-image copy.
+# FP8 QAT uses tile_kernels.quant (TileLang JIT) from the runtime environment.
 _dsv4_resolve_tilelang_dir() {
     if [[ -n "${TILELANG_DIR:-}" && -d "${TILELANG_DIR}/tilelang" ]]; then
         return
@@ -98,7 +93,7 @@ _dsv4_resolve_tilelang_dir
 _dsv4_prepend_pythonpath "${PYTHON_EXTRAS_DIR:-}"
 _dsv4_prepend_pythonpath "${TILELANG_DIR:-}"
 
-export PYTHONPATH="${LUMEN_DIR}:${AITER_ROOT}:${MEGATRON_PATH}:${SITE_PKGS}:${PYTHONPATH:-}"
+export PYTHONPATH="${LUMEN_DIR}:${AITER_DIR}:${MEGATRON_PATH}:${SITE_PKGS}:${PYTHONPATH:-}"
 if [[ "${_dsv4_megatron_only}" == "1" && -d "${MILES_DIR}" ]]; then
     export PYTHONPATH="${MILES_DIR}:${PYTHONPATH}"
 fi
@@ -141,23 +136,13 @@ if [[ "${LUMEN_DSV4_MOE_MORI:-0}" == "1" ]]; then
     fi
 fi
 
-if [[ -n "${TILEKERNELS_DIR:-}" && -d "${TILEKERNELS_DIR}/tile_kernels/mhc" && -n "${SITE_PKGS:-}" ]]; then
-    _tk_dest="${SITE_PKGS}/tile_kernels"
-    echo "[bootstrap_env] overlay local mHC: ${TILEKERNELS_DIR}/tile_kernels -> ${_tk_dest}"
-    mkdir -p "${_tk_dest}/mhc" "${_tk_dest}/modeling/mhc"
-    rsync -a "${TILEKERNELS_DIR}/tile_kernels/mhc/" "${_tk_dest}/mhc/"
-    rsync -a "${TILEKERNELS_DIR}/tile_kernels/modeling/mhc/" "${_tk_dest}/modeling/mhc/"
-    if [[ -d "${TILEKERNELS_DIR}/tile_kernels/torch/mhc" ]]; then
-        mkdir -p "${_tk_dest}/torch/mhc"
-        rsync -a "${TILEKERNELS_DIR}/tile_kernels/torch/mhc/" "${_tk_dest}/torch/mhc/"
-    fi
-fi
-
 python - <<'PY'
 import importlib
 import os
 
-required = ["tile_kernels", "megatron.core"]
+required = ["megatron.core"]
+if os.environ.get("LUMEN_DSV4_LINEAR_FP8", "0") == "1":
+    required.append("tile_kernels")  # QAT-only dependency; MHC uses AIter.
 if os.environ.get("LUMEN_DSV4_NATIVE_FINETUNE", "0") == "1" or os.environ.get("LUMEN_DSV4_PRETRAIN", "0") == "1":
     if os.path.isdir(os.environ.get("MILES_DIR", "/workspace/miles")):
         required.append("miles")
@@ -203,24 +188,22 @@ for m in optional:
 if os.environ.get("V4_SPARSE_MLA_BACKEND", "triton").lower() == "triton":
     try:
         from aiter.ops.triton.attention.sparse_mla_dsv4_train import sparse_mla_dsv4_train
-        from lumen.models.dsv4.ops.kernel.triton_sparse_mla import sparse_attn_triton
+        from lumen.kernels.dsv4.sparse_mla.triton_sparse_mla import sparse_attn_triton
 
         print(f"[bootstrap_env] OK sparse MLA triton: {sparse_mla_dsv4_train.__name__} -> {sparse_attn_triton.__name__}")
     except Exception as e:
         print(f"[bootstrap_env] FAIL sparse MLA triton: {e}")
         raise SystemExit(1)
 
-_mhc_backend = os.environ.setdefault("MHC_BACKEND", "triton").lower()
 try:
-    from lumen.models.dsv4.ops.mhc_backend import configure_mhc_backend, log_mhc_backend
+    from aiter.ops.triton.fusions.mhc import mhc_head_dsv4, mhc_post_dsv4, mhc_pre_dsv4
 
-    configure_mhc_backend(_mhc_backend)
-    import tile_kernels
-
-    print(f"[bootstrap_env] tile_kernels: {tile_kernels.__file__}")
-    print(f"[bootstrap_env] OK MHC backend={log_mhc_backend()} (MHC_BACKEND={_mhc_backend})")
+    print(
+        "[bootstrap_env] OK AIter DSV4 MHC: "
+        f"{mhc_pre_dsv4.__name__}, {mhc_post_dsv4.__name__}, {mhc_head_dsv4.__name__}"
+    )
 except Exception as e:
-    print(f"[bootstrap_env] FAIL MHC/tile_kernels: {e}")
+    print(f"[bootstrap_env] FAIL AIter DSV4 MHC: {e}")
     raise SystemExit(1)
 
 _gemm_bf16 = os.environ.get("LUMEN_DSV4_GEMM_BF16", "1")

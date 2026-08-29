@@ -337,7 +337,7 @@ def install_dsv4_profiler() -> None:
         (
             f"torch.profiler steps {prof_start}-{prof_end} | "
             f"MLA={os.environ.get('V4_SPARSE_MLA_BACKEND', '?')} "
-            f"MHC={os.environ.get('MHC_BACKEND', '?')} "
+            "MHC=aiter "
             f"seq={os.environ.get('SEQ_LEN', '?')} "
             f"GBS={os.environ.get('GBS', '?')}"
         ),

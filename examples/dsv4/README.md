@@ -34,13 +34,12 @@ Pretrain-only 脚本（`run_dsv4_*pretrain*`）仍默认 `GBS=8`、`SEQ_LEN=2048
 | 硬件 | 8× MI308X（flash 需 2 节点各 8 卡），宿主机可访问 `/dev/kfd` |
 | Docker | 已安装，当前用户可运行 |
 | 基础镜像 | `lumen/tests:latest`（构建 DSV4 镜像用） |
-| TileKernels | `${WORKSPACE_ROOT}/TileKernels`（bootstrap 安装 `tile_kernels`，triton MHC） |
+| AIter | 训练容器内 `/workspace/aiter`，提供 DSV4 MHC Triton API |
 
 默认路径由 `dsv4_paths.sh` 解析：
 
 ```text
 WORKSPACE_ROOT=..
-TILEKERNELS_DIR=${WORKSPACE_ROOT}/TileKernels
 DATA_ROOT=                     # /nfs/data/$USER → /mnt/data/$USER → ${WORKSPACE_ROOT}/dsv4-data
 MODEL_DIR=${DATA_ROOT}/models
 LOG_DIR=${DATA_ROOT}/logs
@@ -139,7 +138,7 @@ NODE_RANK=1 MASTER_ADDR=<head-ip> MODEL_DIR=/mnt/nvme0n1/${USER}/models \
 | `FAKE_ROLLOUT_DATA` | `${DATA_ROOT}/models/fake_rollout.pt`（双节点）或 `/root/models/fake_rollout.pt` | debug-train-only rollout |
 | `V4_INDEXER_IMPL` | `aiter` | DSA indexer（aiter triton kernel；`tilelang` 仅作兼容别名） |
 | `V4_SPARSE_MLA_BACKEND` | `triton` | sparse MLA |
-| `MHC_BACKEND` | `triton` | Hyper-Connection（TileKernels `tile_kernels/mhc/*_triton.py`；可选 `tilelang`） |
+| MHC | AIter | Hyper-Connection 直接调用 AIter DSV4 fused API，无运行时 backend 选择 |
 | `OPTIMIZER_OFFLOAD_FRACTION` | `0.75` | Flash 全模型 CPU Adam offload |
 
 ---
@@ -158,3 +157,6 @@ run_dsv4.sh (host)
 ```
 
 双节点操作细节见 [runbook.md](./runbook.md)。
+
+`tile_kernels` 仍仅供 `lumen/ops/dsv4/qat.py` 的 FP8 QAT quant kernels 使用，
+不再参与 Hyper-Connection。

@@ -6,8 +6,8 @@ Provides both a low-level per-sample interface and a batched autograd Function.
 """
 import torch
 
-from lumen.models.dsv4.ops.kernel.tilelang_indexer_bwd import batched_indexer_bwd
-from lumen.models.dsv4.ops.kernel.tilelang_indexer_fwd import (
+from lumen.kernels.dsv4.indexer.tilelang_indexer_bwd import batched_indexer_bwd
+from lumen.kernels.dsv4.indexer.tilelang_indexer_fwd import (
     _make_causal_cu_seqlens,
     batched_indexer_fwd,
 )

@@ -9,8 +9,8 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 from lumen.models.dsv4.megatron.layers import LumenDuplicatedLinear
-from lumen.models.dsv4.ops import (
-    DeepSeekV4Compressor,
+from lumen.models.dsv4.ops.compressor import DeepSeekV4Compressor
+from lumen.ops.dsv4 import (
     all_gather_cp,
     apply_rotary_emb,
     fp8_simulate_qat,
@@ -18,9 +18,9 @@ from lumen.models.dsv4.ops import (
     get_freqs_cis_for_cp,
     wrapped_precompute_freqs_cis,
 )
-from lumen.models.dsv4.ops.indexer_backend import get_batched_indexer_fwd
-from lumen.models.dsv4.ops.indexer_utils import make_causal_cu_seqlens
-from lumen.models.dsv4.ops.utils import rotate_activation
+from lumen.ops.dsv4.indexer import get_batched_indexer_fwd
+from lumen.ops.dsv4.indexer_utils import make_causal_cu_seqlens
+from lumen.ops.dsv4.utils import rotate_activation
 
 
 class V4Indexer(MegatronModule):

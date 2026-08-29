@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Prepare DSV4 runtime bootstrap: local TileKernels + pip packages + ROCm Megatron-LM.
+# Prepare DSV4 runtime bootstrap: pip packages + ROCm Megatron-LM.
 #
 # Usage:
 #   bash examples/dsv4/prepare_bootstrap.sh
 #
 # Output:
 #   ${BOOTSTRAP_DIR}/Megatron-LM  -> symlink to ${MEGATRON_ROCM_DIR}
-#   ${BOOTSTRAP_DIR}/site-packages/{tile_kernels,mbridge,...}
+#   ${BOOTSTRAP_DIR}/site-packages/{mbridge,...}
 #
 # Env (optional docker extract fallback):
 #   BOOTSTRAP_EXTRACT_IMAGE     docker image with /opt/venv site-packages
@@ -35,21 +35,6 @@ _prepare_rocm_megatron_bootstrap() {
     rm -rf "${BOOTSTRAP_DIR}/Megatron-LM"
     ln -sfn "${MEGATRON_ROCM_DIR}" "${BOOTSTRAP_DIR}/Megatron-LM"
     echo "${MEGATRON_ROCM_REF}" > "${MEGATRON_STAMP}"
-}
-
-_install_tile_kernels_local() {
-    if [[ ! -d "${TILEKERNELS_DIR}/tile_kernels" ]]; then
-        echo "[ERROR] TILEKERNELS_DIR missing tile_kernels package: ${TILEKERNELS_DIR}"
-        echo "        Clone https://github.com/deepseek-ai/TileKernels next to Lumen or set TILEKERNELS_DIR."
-        return 1
-    fi
-    echo "[bootstrap] tile_kernels from ${TILEKERNELS_DIR}"
-    rm -rf "${SITE_PACKAGES}/tile_kernels"
-    mkdir -p "${SITE_PACKAGES}/tile_kernels"
-    rsync -a "${TILEKERNELS_DIR}/tile_kernels/" "${SITE_PACKAGES}/tile_kernels/"
-    if [[ ! -f "${SITE_PACKAGES}/tile_kernels/_version.py" ]]; then
-        echo '__version__ = "0.0.0+local"' > "${SITE_PACKAGES}/tile_kernels/_version.py"
-    fi
 }
 
 _install_pip_packages() {
@@ -105,13 +90,13 @@ _copy_from_extract_source() {
 
 _install_site_packages() {
     mkdir -p "${SITE_PACKAGES}"
-    _install_tile_kernels_local || return 1
     _install_pip_packages
 
     local extract_source=""
     if extract_source="$(_resolve_extract_source)"; then
         echo "[bootstrap] optional docker overlay from ${extract_source}"
-        for pkg in compressed_tensors ring_flash_attn torch_memory_saver tvm_ffi mooncake; do
+        # tile_kernels remains a runtime dependency only for DSV4 FP8 QAT.
+        for pkg in tile_kernels compressed_tensors ring_flash_attn torch_memory_saver tvm_ffi mooncake; do
             _copy_from_extract_source "${pkg}" "${extract_source}" || true
         done
         if [[ "${extract_source}" == image:* ]]; then

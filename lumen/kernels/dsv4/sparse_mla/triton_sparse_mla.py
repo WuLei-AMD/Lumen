@@ -7,7 +7,6 @@ Calls ``sparse_mla_dsv4_train`` from ``third_party/aiter`` (fwd + bwd autograd).
 from __future__ import annotations
 
 import torch
-
 from aiter.ops.triton.attention.sparse_mla_dsv4_train import sparse_mla_dsv4_train
 
 
