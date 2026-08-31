@@ -6,9 +6,9 @@
 
 """Qwen3-30B-A3B training with HuggingFace Transformers and PyTorch FSDP2.
 
-The distributed layout is a two-dimensional ``DP x EP`` mesh. Experts are
-partitioned across each expert-parallel row before FSDP2 shards every decoder
-layer across the corresponding data-parallel column.
+All ranks form the dense/data-parallel group and also participate in
+expert-parallel rows. Experts with the same local index are synchronized only
+across expert-data-parallel replicas.
 """
 
 import argparse
@@ -51,16 +51,94 @@ def _rank0_log(message: str, *args) -> None:
         logger.info(message, *args)
 
 
+@torch.no_grad()
+def _clip_grad_norm_mixed_mesh(
+    parameters,
+    max_norm: float,
+) -> torch.Tensor:
+    """Clip an FSDP2 model whose parameters use different device meshes."""
+    grads = [parameter.grad for parameter in parameters if parameter.grad is not None]
+    if not grads:
+        return torch.zeros((), device=torch.cuda.current_device())
+
+    local_squared_norm = torch.zeros(
+        (),
+        device=grads[0].device,
+        dtype=torch.float32,
+    )
+    for grad in grads:
+        local_grad = grad.to_local() if hasattr(grad, "to_local") else grad
+        local_squared_norm += local_grad.float().square().sum()
+
+    if dist.is_initialized():
+        dist.all_reduce(local_squared_norm, op=dist.ReduceOp.SUM)
+    total_norm = local_squared_norm.sqrt()
+    clip_coefficient = min(max_norm / (total_norm.item() + 1e-6), 1.0)
+    if clip_coefficient < 1.0:
+        for grad in grads:
+            grad.mul_(clip_coefficient)
+    return total_norm
+
+
 @dataclass(frozen=True)
 class ParallelGroups:
-    """Process groups and coordinates for a DP x EP rank grid."""
+    """Dense-DP, EP, and expert-DP process groups and coordinates."""
 
     ep_group: Optional[dist.ProcessGroup]
     dp_group: Optional[dist.ProcessGroup]
+    expert_dp_group: Optional[dist.ProcessGroup]
     ep_rank: int
     dp_rank: int
+    expert_dp_rank: int
     ep_size: int
     dp_size: int
+    expert_dp_size: int
+
+
+@dataclass(frozen=True)
+class _ParallelRankLayout:
+    """Rank membership used to construct the parallel process groups."""
+
+    ep_ranks: tuple[int, ...]
+    dp_ranks: tuple[int, ...]
+    expert_dp_ranks: tuple[int, ...]
+    ep_rank: int
+    dp_rank: int
+    expert_dp_rank: int
+    expert_dp_size: int
+
+
+def _parallel_rank_layout(
+    world_size: int,
+    global_rank: int,
+    ep_size: int,
+    dp_size: Optional[int] = None,
+) -> _ParallelRankLayout:
+    """Return Megatron-compatible overlapping DP and EP rank membership."""
+    if ep_size < 1 or world_size % ep_size:
+        raise ValueError(f"ep_size={ep_size} must divide world_size={world_size}")
+    if dp_size is not None and dp_size != world_size:
+        raise ValueError(
+            f"dp_size={dp_size} must equal world_size={world_size}; "
+            "dense/data parallelism overlaps expert parallelism"
+        )
+    if not 0 <= global_rank < world_size:
+        raise ValueError(f"global_rank={global_rank} must be in [0, {world_size})")
+
+    expert_dp_size = world_size // ep_size
+    ep_row = global_rank // ep_size
+    ep_rank = global_rank % ep_size
+    return _ParallelRankLayout(
+        ep_ranks=tuple(range(ep_row * ep_size, (ep_row + 1) * ep_size)),
+        dp_ranks=tuple(range(world_size)),
+        expert_dp_ranks=tuple(
+            replica * ep_size + ep_rank for replica in range(expert_dp_size)
+        ),
+        ep_rank=ep_rank,
+        dp_rank=global_rank,
+        expert_dp_rank=ep_row,
+        expert_dp_size=expert_dp_size,
+    )
 
 
 def create_parallel_groups(
@@ -68,41 +146,56 @@ def create_parallel_groups(
     dp_size: Optional[int] = None,
     timeout_minutes: int = 60,
 ) -> ParallelGroups:
-    """Create expert- and data-parallel groups for the current process."""
+    """Create overlapping dense-DP, EP, and expert-DP process groups."""
     if not dist.is_initialized():
         if ep_size != 1 or dp_size not in (None, 1):
-            raise RuntimeError("torch.distributed must be initialized when DP or EP is greater than one")
-        return ParallelGroups(None, None, 0, 0, 1, 1)
+            raise RuntimeError(
+                "torch.distributed must be initialized when DP or EP is greater than one"
+            )
+        return ParallelGroups(
+            ep_group=None,
+            dp_group=None,
+            expert_dp_group=None,
+            ep_rank=0,
+            dp_rank=0,
+            expert_dp_rank=0,
+            ep_size=1,
+            dp_size=1,
+            expert_dp_size=1,
+        )
 
     world_size = dist.get_world_size()
-    if ep_size < 1 or world_size % ep_size:
-        raise ValueError(f"ep_size={ep_size} must divide world_size={world_size}")
-    inferred_dp_size = world_size // ep_size
-    if dp_size is not None and dp_size != inferred_dp_size:
-        raise ValueError(
-            f"world_size={world_size} must equal dp_size*ep_size={dp_size}*{ep_size}"
-        )
-    dp_size = inferred_dp_size
     global_rank = dist.get_rank()
-    ep_rank = global_rank % ep_size
-    dp_rank = global_rank // ep_size
+    layout = _parallel_rank_layout(world_size, global_rank, ep_size, dp_size)
 
     ep_group = None
     timeout = timedelta(minutes=timeout_minutes)
-    for row in range(dp_size):
+    for row in range(layout.expert_dp_size):
         ranks = list(range(row * ep_size, (row + 1) * ep_size))
         group = dist.new_group(ranks, timeout=timeout)
         if global_rank in ranks:
             ep_group = group
 
-    dp_group = None
+    expert_dp_group = None
     for column in range(ep_size):
-        ranks = [row * ep_size + column for row in range(dp_size)]
+        ranks = [
+            row * ep_size + column for row in range(layout.expert_dp_size)
+        ]
         group = dist.new_group(ranks, timeout=timeout)
         if global_rank in ranks:
-            dp_group = group
+            expert_dp_group = group
 
-    return ParallelGroups(ep_group, dp_group, ep_rank, dp_rank, ep_size, dp_size)
+    return ParallelGroups(
+        ep_group=ep_group,
+        dp_group=dist.group.WORLD,
+        expert_dp_group=expert_dp_group,
+        ep_rank=layout.ep_rank,
+        dp_rank=layout.dp_rank,
+        expert_dp_rank=layout.expert_dp_rank,
+        ep_size=ep_size,
+        dp_size=world_size,
+        expert_dp_size=layout.expert_dp_size,
+    )
 
 
 class _LocalExpertMLP(nn.Module):
@@ -154,8 +247,25 @@ class _FusedLocalExperts(nn.Module):
             ]
         )
 
-    def forward(self, expert_id: int, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.experts[expert_id](hidden_states)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        expert_ids: torch.Tensor,
+        routing_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate all assignments through one FSDP-wrapped module call."""
+        output = torch.zeros_like(hidden_states)
+        for expert_id, expert in enumerate(self.experts):
+            positions = torch.where(expert_ids == expert_id)[0]
+            if positions.numel() == 0:
+                continue
+            expert_output = expert(hidden_states[positions])
+            output.index_copy_(
+                0,
+                positions,
+                expert_output * routing_weights[positions].unsqueeze(-1),
+            )
+        return output
 
 
 class _TEGroupedLocalExperts(nn.Module):
@@ -221,6 +331,14 @@ class _TEGroupedLocalExperts(nn.Module):
         output.index_copy_(0, order, sorted_output)
         return output
 
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        expert_ids: torch.Tensor,
+        routing_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.forward_all(hidden_states, expert_ids, routing_weights)
+
 
 class _SonicLocalExperts(nn.Module):
     """Local HF expert slice backed by AITER SonicMoE."""
@@ -230,35 +348,61 @@ class _SonicLocalExperts(nn.Module):
         self.num_experts = end - start
         gate, up = experts.gate_up_proj[start:end].detach().chunk(2, dim=1)
         self.w1 = nn.Parameter(
-            torch.stack((gate, up), dim=2).flatten(1, 2).contiguous()
+            torch.stack((gate, up), dim=2)
+            .flatten(1, 2)
+            .transpose(1, 2)
+            .contiguous()
         )
         self.w2 = nn.Parameter(
-            experts.down_proj[start:end].detach().contiguous()
+            experts.down_proj[start:end].detach().transpose(1, 2).contiguous()
         )
         self.gemm_backend = os.environ.get("SONIC_MOE_GEMM_BACKEND", "triton")
-        if self.gemm_backend not in {"triton", "blas"}:
+        if self.gemm_backend != "triton":
             raise ValueError(
-                "SONIC_MOE_GEMM_BACKEND must be either 'triton' or 'blas'"
+                "SONIC_MOE_GEMM_BACKEND must be 'triton'; select its GEMM backend "
+                "with SONIC_MOE_GROUPED_GEMM_BACKEND="
+                "triton|hipblaslt|multistream|auto"
             )
 
-    def _forward_blas(
+    def forward_grouped(
         self,
-        sorted_hidden: torch.Tensor,
-        sorted_weights: torch.Tensor,
-        split_sizes: list[int],
+        hidden_states: torch.Tensor,
+        counts: torch.Tensor,
     ) -> torch.Tensor:
-        outputs = []
-        for expert_id, (tokens, weights) in enumerate(
-            zip(
-                torch.split(sorted_hidden, split_sizes),
-                torch.split(sorted_weights, split_sizes),
+        """Evaluate expert-major assignments without an internal permutation."""
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+
+        from aiter.ops.triton import sonicmoe
+
+        common = (
+            self.w1,
+            None,
+            self.w2,
+            None,
+        )
+        if not hasattr(sonicmoe, "moe_pre_routed_inputs"):
+            raise RuntimeError(
+                "This SonicMoE build lacks moe_pre_routed_inputs, which is required "
+                "for the grouped GEMM backend"
             )
-        ):
-            gate = F.linear(tokens, self.w1[expert_id, 0::2])
-            up = F.linear(tokens, self.w1[expert_id, 1::2])
-            output = F.linear(F.silu(gate) * up, self.w2[expert_id])
-            outputs.append(output * weights.unsqueeze(-1))
-        return torch.cat(outputs, dim=0)
+
+        kernel_weights = torch.ones(
+            hidden_states.shape[0],
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        output, _expert_frequency = sonicmoe.moe_pre_routed_inputs(
+            hidden_states,
+            kernel_weights,
+            counts.to(dtype=torch.int32),
+            *common,
+            torch.cuda.current_stream().cuda_stream,
+            sonicmoe.SonicMoEActivationType.SWIGLU,
+            False,
+            False,
+        )
+        return output
 
     def forward_all(
         self,
@@ -270,73 +414,33 @@ class _SonicLocalExperts(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
 
-        sonicmoe = None
-        common = None
-        if self.gemm_backend == "triton":
-            from aiter.ops.triton import sonicmoe
-
-            common = (
-                self.w1.permute(1, 2, 0),
-                None,
-                self.w2.permute(1, 2, 0),
-                None,
-            )
-            if not hasattr(sonicmoe, "moe_pre_routed_inputs"):
-                row_ids = torch.arange(
-                    hidden_states.shape[0],
-                    dtype=torch.int32,
-                    device=hidden_states.device,
-                )
-                kernel_weights = torch.ones_like(row_ids, dtype=torch.float32)
-                output, _expert_frequency = sonicmoe.moe_general_routing_inputs(
-                    hidden_states,
-                    kernel_weights,
-                    row_ids,
-                    expert_ids.to(dtype=torch.int32),
-                    *common,
-                    self.num_experts,
-                    torch.cuda.current_stream().cuda_stream,
-                    sonicmoe.SonicMoEActivationType.SWIGLU,
-                    False,
-                    False,
-                )
-                return output * routing_weights.unsqueeze(-1)
-
         order = torch.argsort(expert_ids, stable=True)
         sorted_hidden = hidden_states[order]
         sorted_weights = routing_weights[order]
         counts = torch.bincount(expert_ids, minlength=self.num_experts)
 
-        if self.gemm_backend == "blas":
-            sorted_output = self._forward_blas(
-                sorted_hidden,
-                sorted_weights,
-                counts.tolist(),
-            )
-        else:
-            # Apply routing weights outside SonicMoE. This keeps router-score
-            # gradients in native PyTorch and is compatible with AITER
-            # revisions whose general-routing score backward differs.
-            kernel_weights = torch.ones(
-                sorted_hidden.shape[0],
-                dtype=torch.float32,
-                device=sorted_hidden.device,
-            )
-            sorted_output, _expert_frequency = sonicmoe.moe_pre_routed_inputs(
-                sorted_hidden,
-                kernel_weights,
-                counts.to(dtype=torch.int32),
-                *common,
-                torch.cuda.current_stream().cuda_stream,
-                sonicmoe.SonicMoEActivationType.SWIGLU,
-                False,
-                False,
-            )
-            sorted_output = sorted_output * sorted_weights.unsqueeze(-1)
+        # Keep score gradients in native PyTorch. Fusing this multiplication
+        # into Sonic changes BF16 rounding and is not faster end to end.
+        sorted_output = self.forward_grouped(sorted_hidden, counts)
+        sorted_output = sorted_output * sorted_weights.unsqueeze(-1)
 
         output = torch.empty_like(sorted_output)
         output.index_copy_(0, order, sorted_output)
         return output
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        expert_ids: Optional[torch.Tensor] = None,
+        routing_weights: Optional[torch.Tensor] = None,
+        *,
+        counts: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if counts is not None:
+            return self.forward_grouped(hidden_states, counts)
+        if expert_ids is None or routing_weights is None:
+            raise ValueError("expert_ids and routing_weights are required")
+        return self.forward_all(hidden_states, expert_ids, routing_weights)
 
 
 class _ModuleListLocalExperts(nn.Module):
@@ -346,8 +450,25 @@ class _ModuleListLocalExperts(nn.Module):
         super().__init__()
         self.experts = nn.ModuleList(list(experts[start:end]))
 
-    def forward(self, expert_id: int, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.experts[expert_id](hidden_states)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        expert_ids: torch.Tensor,
+        routing_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate all assignments through one FSDP-wrapped module call."""
+        output = torch.zeros_like(hidden_states)
+        for expert_id, expert in enumerate(self.experts):
+            positions = torch.where(expert_ids == expert_id)[0]
+            if positions.numel() == 0:
+                continue
+            expert_output = expert(hidden_states[positions])
+            output.index_copy_(
+                0,
+                positions,
+                expert_output * routing_weights[positions].unsqueeze(-1),
+            )
+        return output
 
 
 class EPShardedMoeBlock(nn.Module):
@@ -366,6 +487,9 @@ class EPShardedMoeBlock(nn.Module):
         self.ep_rank = ep_rank
         self.ep_size = ep_size
         self.ep_group = ep_group
+        self._lumen_fused_router = False
+        self._lumen_moe_dispatch_overlap = False
+        self._lumen_moe_global_expert_layout = False
         self._sonic_first_forward = expert_backend == "sonic"
 
         experts = original_block.experts
@@ -402,12 +526,46 @@ class EPShardedMoeBlock(nn.Module):
         else:
             raise TypeError(f"Unsupported Qwen3 expert container: {type(experts).__name__}")
 
+    def enable_lumen_fused_router(self) -> None:
+        """Enable the router implementation installed by LumenConfig."""
+        self._lumen_fused_router = True
+
+    def enable_lumen_moe_dispatch_overlap(self) -> None:
+        """Overlap count exchange with token permutation and payload packing."""
+        self._lumen_moe_dispatch_overlap = True
+
+    def enable_lumen_moe_global_expert_layout(self) -> None:
+        """Use Megatron-style expert-major dispatch with SonicMoE."""
+        if not hasattr(self.local_experts, "forward_grouped"):
+            raise ValueError(
+                "The global-expert dispatcher currently requires expert_backend=sonic"
+            )
+        self._lumen_moe_global_expert_layout = True
+
     def _route(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         gate_output = self.gate(hidden_states)
         if isinstance(gate_output, tuple) and len(gate_output) >= 3:
             return gate_output[1], gate_output[2]
 
         router_logits = gate_output
+        if self._lumen_fused_router:
+            from lumen.ops.moe import fused_topk_with_score_function
+
+            _, routing_probs = fused_topk_with_score_function(
+                router_logits,
+                self.top_k,
+                True,
+                None,
+                None,
+                None,
+                "softmax",
+                None,
+            )
+            routing_weights, selected_experts = torch.topk(
+                routing_probs, self.top_k, dim=-1
+            )
+            return routing_weights.to(hidden_states.dtype), selected_experts
+
         routing_scores = F.softmax(router_logits, dim=-1, dtype=torch.float32)
         routing_weights, selected_experts = torch.topk(routing_scores, self.top_k, dim=-1)
         if getattr(self.gate, "norm_topk_prob", getattr(self, "norm_topk_prob", False)):
@@ -449,11 +607,104 @@ class EPShardedMoeBlock(nn.Module):
         )
         return output
 
+    def _gather_expert_counts(self, local_counts: torch.Tensor) -> torch.Tensor:
+        """Gather each sender's global-expert histogram on the EP group."""
+        if self.ep_size == 1:
+            return local_counts.unsqueeze(0)
+        gathered = torch.empty(
+            self.ep_size * self.num_experts,
+            dtype=local_counts.dtype,
+            device=local_counts.device,
+        )
+        dist.all_gather_into_tensor(
+            gathered,
+            local_counts.contiguous(),
+            group=self.ep_group,
+        )
+        return gathered.view(self.ep_size, self.num_experts)
+
+    def _forward_global_expert_layout(
+        self,
+        hidden_flat: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dispatch expert-major tokens and avoid receiver-side token sorting."""
+        from lumen.ops.moe.dispatch_layout import transpose_variable_chunks
+
+        token_ids = (
+            torch.arange(hidden_flat.shape[0], device=hidden_flat.device)
+            .unsqueeze(1)
+            .expand_as(selected_experts)
+            .reshape(-1)
+        )
+        flat_experts = selected_experts.reshape(-1)
+        flat_weights = routing_weights.reshape(-1)
+        order = torch.argsort(flat_experts, stable=True)
+        send_token_ids = token_ids[order]
+        send_weights = flat_weights[order]
+
+        local_counts = torch.bincount(flat_experts, minlength=self.num_experts)
+        global_counts = self._gather_expert_counts(local_counts)
+        recv_counts_by_sender = global_counts[
+            :,
+            self.local_expert_start : self.local_expert_start
+            + self.experts_per_rank,
+        ].contiguous()
+        send_splits = (
+            local_counts.view(self.ep_size, self.experts_per_rank)
+            .sum(dim=1)
+            .tolist()
+        )
+        recv_splits = recv_counts_by_sender.sum(dim=1).tolist()
+
+        recv_hidden = self._exchange_tensor(
+            hidden_flat[send_token_ids],
+            send_splits,
+            recv_splits,
+            differentiable=True,
+        )
+        grouped_hidden = transpose_variable_chunks(
+            recv_hidden,
+            recv_counts_by_sender,
+            source_layout="sender_major",
+            fused=False,
+        )
+        grouped_output = self.local_experts(
+            grouped_hidden,
+            counts=recv_counts_by_sender.sum(dim=0),
+        )
+        local_output = transpose_variable_chunks(
+            grouped_output,
+            recv_counts_by_sender,
+            source_layout="expert_major",
+            fused=False,
+        )
+        returned = self._exchange_tensor(
+            local_output,
+            recv_splits,
+            send_splits,
+            differentiable=True,
+        )
+        final_output = torch.zeros_like(hidden_flat)
+        final_output.index_add_(
+            0,
+            send_token_ids,
+            returned * send_weights.unsqueeze(-1),
+        )
+        return final_output
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Route tokens to local experts and restore their original ordering."""
         input_shape = hidden_states.shape
         hidden_flat = hidden_states.reshape(-1, input_shape[-1])
         routing_weights, selected_experts = self._route(hidden_flat)
+        if self._lumen_moe_global_expert_layout:
+            return self._forward_global_expert_layout(
+                hidden_flat,
+                routing_weights,
+                selected_experts,
+            ).reshape(input_shape)
 
         token_ids = (
             torch.arange(hidden_flat.shape[0], device=hidden_flat.device)
@@ -465,47 +716,47 @@ class EPShardedMoeBlock(nn.Module):
         flat_weights = routing_weights.reshape(-1)
         destinations = torch.div(flat_experts, self.experts_per_rank, rounding_mode="floor")
         local_expert_ids = flat_experts.remainder(self.experts_per_rank)
+        send_counts = torch.bincount(destinations, minlength=self.ep_size)
+        pending_counts = None
+        if self._lumen_moe_dispatch_overlap and self.ep_size > 1:
+            from lumen.ops.moe.dispatch_overlap import begin_count_exchange
+
+            pending_counts = begin_count_exchange(send_counts, self.ep_group)
         order = torch.argsort(destinations, stable=True)
 
-        destinations = destinations[order]
         send_token_ids = token_ids[order]
         send_hidden = hidden_flat[send_token_ids]
         send_expert_ids = local_expert_ids[order]
         send_weights = flat_weights[order]
 
-        send_counts = torch.bincount(destinations, minlength=self.ep_size)
-        recv_counts = self._exchange_counts(send_counts)
-        send_splits = send_counts.tolist()
-        recv_splits = recv_counts.tolist()
-
-        recv_hidden = self._exchange_tensor(
-            send_hidden, send_splits, recv_splits, differentiable=True
+        # Exchange tokens and their two scalar metadata fields together. Local
+        # expert ids are small integers and are exactly representable in BF16.
+        send_payload = torch.cat(
+            (
+                send_hidden,
+                send_weights.to(send_hidden.dtype).unsqueeze(-1),
+                send_expert_ids.to(send_hidden.dtype).unsqueeze(-1),
+            ),
+            dim=-1,
         )
-        recv_weights = self._exchange_tensor(
-            send_weights, send_splits, recv_splits, differentiable=True
-        )
-        recv_expert_ids = self._exchange_tensor(
-            send_expert_ids, send_splits, recv_splits, differentiable=False
-        )
-
-        if hasattr(self.local_experts, "forward_all"):
-            local_output = self.local_experts.forward_all(
-                recv_hidden,
-                recv_expert_ids,
-                recv_weights,
-            )
+        if pending_counts is not None:
+            send_splits, recv_splits = pending_counts.wait_for_splits()
         else:
-            local_output = torch.zeros_like(recv_hidden)
-            for expert_id in range(self.experts_per_rank):
-                positions = torch.where(recv_expert_ids == expert_id)[0]
-                if positions.numel() == 0:
-                    continue
-                expert_output = self.local_experts(expert_id, recv_hidden[positions])
-                local_output.index_copy_(
-                    0,
-                    positions,
-                    expert_output * recv_weights[positions].unsqueeze(-1),
-                )
+            recv_counts = self._exchange_counts(send_counts)
+            send_splits = send_counts.tolist()
+            recv_splits = recv_counts.tolist()
+        recv_payload = self._exchange_tensor(
+            send_payload, send_splits, recv_splits, differentiable=True
+        )
+        recv_hidden = recv_payload[:, :-2]
+        recv_weights = recv_payload[:, -2]
+        recv_expert_ids = recv_payload[:, -1].to(torch.int64)
+
+        local_output = self.local_experts(
+            recv_hidden,
+            recv_expert_ids,
+            recv_weights,
+        )
 
         if self._sonic_first_forward and self.ep_size > 1:
             dist.barrier(group=self.ep_group)
@@ -545,18 +796,27 @@ def shard_moe_experts(
     return model
 
 
-def apply_fsdp2(model: nn.Module, groups: ParallelGroups, sharding: str) -> nn.Module:
-    """Shard decoder layers over each data-parallel process group."""
+def apply_fsdp2(
+    model: nn.Module,
+    groups: ParallelGroups,
+    sharding: str,
+) -> nn.Module:
+    """Shard shared parameters over dense DP and experts over expert DP."""
     from torch.distributed.device_mesh import DeviceMesh
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
-    if groups.dp_group is None:
+    if groups.dp_group is None or groups.expert_dp_group is None:
         raise RuntimeError("FSDP2 requires an initialized torch.distributed process group")
 
-    mesh = DeviceMesh.from_group(
+    dense_mesh = DeviceMesh.from_group(
         groups.dp_group,
         "cuda",
         mesh_dim_names=("dp",),
+    )
+    expert_mesh = DeviceMesh.from_group(
+        groups.expert_dp_group,
+        "cuda",
+        mesh_dim_names=("expert_dp",),
     )
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16,
@@ -568,22 +828,36 @@ def apply_fsdp2(model: nn.Module, groups: ParallelGroups, sharding: str) -> nn.M
 
     layers = list(model.model.layers)
     for layer in layers:
+        local_experts = getattr(getattr(layer, "mlp", None), "local_experts", None)
+        if local_experts is not None:
+            fully_shard(
+                local_experts,
+                mesh=expert_mesh,
+                mp_policy=mp_policy,
+                reshard_after_forward=reshard_after_forward,
+            )
+            local_experts.set_gradient_divide_factor(1.0)
         fully_shard(
             layer,
-            mesh=mesh,
+            mesh=dense_mesh,
             mp_policy=mp_policy,
             reshard_after_forward=reshard_after_forward,
         )
+        layer.set_gradient_divide_factor(1.0)
     fully_shard(
         model,
-        mesh=mesh,
+        mesh=dense_mesh,
         mp_policy=mp_policy,
         reshard_after_forward=reshard_after_forward,
     )
+    model.set_gradient_divide_factor(1.0)
     _rank0_log(
-        "FSDP2 wrapped %d layers over DP=%d (reshard_after_forward=%s)",
+        "FSDP2 wrapped %d layers over dense DP=%d and experts over expert DP=%d "
+        "(EP=%d, reshard_after_forward=%s)",
         len(layers),
         groups.dp_size,
+        groups.expert_dp_size,
+        groups.ep_size,
         reshard_after_forward,
     )
     return model
@@ -668,7 +942,10 @@ def build_model(args: argparse.Namespace) -> nn.Module:
     if args.model_name_or_path:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
-            dtype=torch.bfloat16,
+            # Preserve FP32 sharded/master parameters for AdamW, matching
+            # Megatron's distributed optimizer. FSDP mixed precision casts the
+            # all-gathered compute parameters to BF16.
+            dtype=torch.float32,
             attn_implementation="sdpa",
             low_cpu_mem_usage=True,
         )
@@ -729,34 +1006,43 @@ def build_model(args: argparse.Namespace) -> nn.Module:
     return model
 
 
-def _enable_lumen(model: nn.Module, args: argparse.Namespace) -> nn.Module:
-    if args.mode == "bf16" and not args.aiter_attn and not args.lumen_norm:
+def _enable_lumen(
+    model: nn.Module,
+    args: argparse.Namespace,
+    dp_group: Optional[dist.ProcessGroup] = None,
+) -> nn.Module:
+    if (
+        args.mode == "bf16"
+        and not args.aiter_attn
+        and not args.lumen_norm
+        and not args.fused_router
+        and not args.lumen_moe_dispatch_overlap
+        and not args.lumen_moe_global_expert_layout
+    ):
         return model
 
     from lumen.config import LumenConfig
 
-    lumen_args = argparse.Namespace(
-        linear_fp8=args.mode == "fp8_blockwise2d",
-        linear_fp8_format="fp8_e4m3",
-        linear_fp8_scaling=args.fp8_scaling,
-        linear_fp8_block_size=128,
-        linear_fp8_amax_algo="max",
-        linear_fp8_amax_history=16,
-        linear_fp8_reduce_amax=False,
-        linear_fp8_activation=True,
-        linear_fp8_wgrad=True,
-        linear_fp8_cache_frozen_weight=False,
-        linear_fp8_bpreshuffle=False,
-        grad_quant_type=None,
+    config = LumenConfig(
+        format="fp8_e4m3",
+        scaling=args.fp8_scaling if args.mode == "fp8_blockwise2d" else "none",
+        block_size=128,
+        amax_algo="max",
+        history_len=16,
+        reduce_amax=False,
+        quantize_activation=True,
+        fp8_wgrad=True,
+        cache_frozen_weight=False,
+        bpreshuffle_gemm=False,
+        quantize_grad=None,
         first_last_layers_bf16=False,
         lumen_norm=args.lumen_norm,
         hf_attn_patch=args.aiter_attn,
-        lora_rank=0,
-        lora_alpha=0,
-        lora_dropout=0.0,
+        fused_router=args.fused_router,
+        moe_dispatch_overlap=args.lumen_moe_dispatch_overlap,
+        moe_global_expert_layout=args.lumen_moe_global_expert_layout,
     )
-    config = LumenConfig.from_args(lumen_args)
-    _manager, model = config.enable(model)
+    _manager, model = config.enable(model, dp_group=dp_group)
     return model
 
 
@@ -795,15 +1081,30 @@ class FSDPTrainer:
             self.model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
-        self.model = _enable_lumen(self.model, args)
+        self.model = _enable_lumen(self.model, args, self.groups.dp_group)
         self.model = apply_fsdp2(self.model, self.groups, args.sharding)
 
+        decay_parameters = []
+        no_decay_parameters = []
+        for parameter in self.model.parameters():
+            if parameter.ndim <= 1:
+                no_decay_parameters.append(parameter)
+            else:
+                decay_parameters.append(parameter)
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            [
+                {
+                    "params": decay_parameters,
+                    "weight_decay": args.weight_decay,
+                },
+                {
+                    "params": no_decay_parameters,
+                    "weight_decay": 0.0,
+                },
+            ],
             lr=args.lr,
             betas=(args.adam_beta1, args.adam_beta2),
             eps=args.adam_eps,
-            weight_decay=args.weight_decay,
         )
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
@@ -836,19 +1137,28 @@ class FSDPTrainer:
             else:
                 from lumen.models.llama31.dataset import PretrainTextDataset
 
+                virtual_num_samples = (
+                    self.args.max_steps
+                    * self.args.micro_batch_size
+                    * self.args.gradient_accumulation_steps
+                    * self.groups.dp_size
+                    if train
+                    else None
+                )
                 dataset = PretrainTextDataset(
                     data_path=path,
                     seq_length=self.args.seq_length,
                     tokenizer=tokenizer,
                     is_hf_tokenizer=True,
                     max_samples=max_samples,
+                    virtual_num_samples=virtual_num_samples,
                 )
             sampler = DistributedSampler(
                 dataset,
                 num_replicas=self.groups.dp_size,
                 rank=self.groups.dp_rank,
-                shuffle=train,
-                seed=self.args.seed,
+                shuffle=train and self.args.shuffle_data,
+                seed=self.args.data_seed,
             )
             return DataLoader(
                 dataset,
@@ -934,7 +1244,21 @@ class FSDPTrainer:
         """Run the configured training loop."""
         self.model.train()
         data_iterator = iter(self.train_loader)
+        profiler = None
+        profile_output = os.environ.get("LUMEN_PROFILE_OUTPUT")
+        profile_step = int(os.environ.get("LUMEN_PROFILE_STEP", "1"))
         for step in range(1, self.args.max_steps + 1):
+            if profile_output and self.rank == 0 and step == profile_step:
+                profiler = torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=False,
+                )
+                profiler.start()
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats(self.local_rank)
             start = time.perf_counter()
@@ -943,22 +1267,56 @@ class FSDPTrainer:
             accumulated_lm_loss = 0.0
             accumulated_aux_loss = 0.0
             for micro_step in range(self.args.gradient_accumulation_steps):
-                self.model.set_requires_gradient_sync(
-                    micro_step == self.args.gradient_accumulation_steps - 1
-                )
                 try:
                     batch = next(data_iterator)
                 except StopIteration:
                     data_iterator = iter(self.train_loader)
                     batch = next(data_iterator)
+                dump_dir = os.environ.get("QWEN_PARITY_DUMP_DIR")
+                if dump_dir:
+                    dump_path = (
+                        Path(dump_dir)
+                        / f"fsdp-batch{step - 1}-micro{micro_step}-rank{self.rank}.pt"
+                    )
+                    if not dump_path.exists():
+                        dump_path.parent.mkdir(parents=True, exist_ok=True)
+                        torch.save(
+                            {
+                                "input_ids": batch["input_ids"].cpu(),
+                                "labels": batch.get("labels", torch.empty(0)).cpu(),
+                            },
+                            dump_path,
+                        )
                 loss, lm_loss, aux_loss = self._loss_components(batch)
-                (loss / self.args.gradient_accumulation_steps).backward()
+                if os.environ.get("QWEN_PARITY_LOG_LOCAL_LOSS", "0") == "1":
+                    logger.warning(
+                        "Qwen parity local loss: rank=%d step=%d micro=%d lm_loss=%.9f",
+                        self.rank,
+                        step,
+                        micro_step,
+                        lm_loss.item(),
+                    )
+                # Both dense-DP and expert-DP FSDP groups use SUM reductions.
+                # Scaling each rank's local loss by dense DP produces the
+                # global-batch mean for shared and EP-local expert parameters.
+                (
+                    loss
+                    / (
+                        self.args.gradient_accumulation_steps
+                        * self.groups.dp_size
+                    )
+                ).backward()
                 accumulated_loss += loss.item()
                 accumulated_lm_loss += lm_loss.item()
                 accumulated_aux_loss += aux_loss.item()
 
             if self.args.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+                grad_norm = _clip_grad_norm_mixed_mesh(
+                    self.model.parameters(),
+                    self.args.max_grad_norm,
+                )
+            else:
+                grad_norm = torch.zeros((), device=f"cuda:{self.local_rank}")
             self.optimizer.step()
             self.scheduler.step()
             torch.cuda.synchronize()
@@ -977,15 +1335,29 @@ class FSDPTrainer:
             throughput = global_batch_size * 1000 / elapsed_ms
 
             if step % self.args.log_interval == 0:
+                loss_metrics = torch.tensor(
+                    [
+                        accumulated_loss,
+                        accumulated_lm_loss,
+                        accumulated_aux_loss,
+                    ],
+                    dtype=torch.float64,
+                    device=f"cuda:{self.local_rank}",
+                )
+                if self.groups.dp_size > 1:
+                    dist.all_reduce(loss_metrics, group=self.groups.dp_group)
+                    loss_metrics /= self.groups.dp_size
                 _rank0_log(
                     "step %d/%d | loss %.6f | lm_loss %.6f | aux_loss %.6f | "
-                    "lr %.2e | step_time_ms %.1f | throughput_samples_per_sec %.3f | "
+                    "grad_norm %.3f | lr %.2e | step_time_ms %.1f | "
+                    "throughput_samples_per_sec %.3f | "
                     "peak_memory_mb %.1f",
                     step,
                     self.args.max_steps,
-                    accumulated_loss / self.args.gradient_accumulation_steps,
-                    accumulated_lm_loss / self.args.gradient_accumulation_steps,
-                    accumulated_aux_loss / self.args.gradient_accumulation_steps,
+                    loss_metrics[0].item() / self.args.gradient_accumulation_steps,
+                    loss_metrics[1].item() / self.args.gradient_accumulation_steps,
+                    loss_metrics[2].item() / self.args.gradient_accumulation_steps,
+                    grad_norm.item(),
                     self.scheduler.get_last_lr()[0],
                     elapsed_ms,
                     throughput,
@@ -997,6 +1369,22 @@ class FSDPTrainer:
                 and step % self.args.eval_interval == 0
             ):
                 _rank0_log("step %d | val_loss %.4f", step, self.validate())
+            if profiler is not None:
+                profiler.step()
+                if step == profile_step:
+                    profiler.stop()
+                    output_path = Path(profile_output)
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    profiler.export_chrome_trace(str(output_path))
+                    summary_path = output_path.with_suffix(".txt")
+                    summary_path.write_text(
+                        profiler.key_averages().table(
+                            sort_by="self_cuda_time_total",
+                            row_limit=200,
+                        )
+                    )
+                    _rank0_log("Wrote kernel profile to %s", output_path)
+                    profiler = None
 
 
 def get_args() -> argparse.Namespace:
@@ -1036,7 +1424,12 @@ def get_args() -> argparse.Namespace:
         help="Normalize selected expert weights; enabled to match the Megatron TE flow.",
     )
     parser.add_argument("--ep-size", type=int, default=8)
-    parser.add_argument("--dp-size", type=int, default=None)
+    parser.add_argument(
+        "--dp-size",
+        type=int,
+        default=None,
+        help="Dense/data-parallel size; must equal the distributed world size.",
+    )
     parser.add_argument(
         "--expert-backend",
         choices=["sequential", "te_grouped", "sonic"],
@@ -1059,6 +1452,9 @@ def get_args() -> argparse.Namespace:
     )
     parser.add_argument("--aiter-attn", action="store_true")
     parser.add_argument("--lumen-norm", action="store_true")
+    parser.add_argument("--fused-router", action="store_true")
+    parser.add_argument("--lumen-moe-dispatch-overlap", action="store_true")
+    parser.add_argument("--lumen-moe-global-expert-layout", action="store_true")
     parser.add_argument("--fuse-rope", action="store_true")
     parser.add_argument(
         "--fsdp-fp8-param-storage",
@@ -1066,10 +1462,21 @@ def get_args() -> argparse.Namespace:
         help="Unsupported for full-parameter training; accepted to provide a clear error.",
     )
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--shuffle-data",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument("--eval-interval", type=int, default=50)
     parser.add_argument("--val-samples", type=int, default=200)
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument(
+        "--data-seed",
+        type=int,
+        default=0,
+        help="Sampler seed; Megatron's cyclic sampler starts at epoch seed 0.",
+    )
     parser.add_argument("--distributed-timeout-minutes", type=int, default=60)
     return parser.parse_args()
 

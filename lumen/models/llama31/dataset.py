@@ -49,6 +49,8 @@ class PretrainTextDataset(Dataset):
             ``tokenize()`` / ``eod``.
         is_hf_tokenizer: ``True`` for HuggingFace-style tokenizers.
         max_samples: If set, cap ``__len__`` at this value.
+        virtual_num_samples: If set, expose at least this many samples by
+            cycling over the tokenized chunks.
     """
 
     def __init__(
@@ -58,11 +60,13 @@ class PretrainTextDataset(Dataset):
         tokenizer,
         is_hf_tokenizer: bool = False,
         max_samples: Optional[int] = None,
+        virtual_num_samples: Optional[int] = None,
     ):
         self.seq_length = seq_length
         self.tokenizer = tokenizer
         self.is_hf_tokenizer = is_hf_tokenizer
         self._chunks: List[List[int]] = []
+        self._virtual_num_samples = virtual_num_samples
 
         if data_path is None:
             self._max_samples = max_samples or 0
@@ -92,7 +96,9 @@ class PretrainTextDataset(Dataset):
     def __len__(self) -> int:
         n = len(self._chunks)
         if self._max_samples is not None:
-            return min(n, self._max_samples)
+            n = min(n, self._max_samples)
+        if self._virtual_num_samples is not None and n:
+            n = max(n, self._virtual_num_samples)
         return n
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:

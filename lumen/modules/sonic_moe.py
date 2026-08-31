@@ -9,12 +9,13 @@
 from __future__ import annotations
 
 import os
-from typing import Iterable
+from typing import Iterable, MutableMapping
 
 import torch
 import torch.nn as nn
 
-from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
+from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
+from megatron.core.utils import get_pg_rank
 
 
 def _expert_weights(experts: nn.Module) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
@@ -34,13 +35,128 @@ def _expert_weights(experts: nn.Module) -> tuple[list[torch.Tensor], list[torch.
     raise TypeError(f"Unsupported Megatron expert implementation: {type(experts).__name__}")
 
 
+def _pop_expert_weights(
+    state_dict: MutableMapping[str, torch.Tensor],
+    prefix: str,
+    stem: str,
+    count: int,
+) -> list[torch.Tensor] | None:
+    """Remove and return per-expert checkpoint tensors for one linear layer."""
+    sequential_keys = [
+        f"{prefix}local_experts.{index}.{stem}.weight" for index in range(count)
+    ]
+    grouped_keys = [
+        f"{prefix}{stem}.weight{index}" for index in range(count)
+    ]
+    keys = sequential_keys if all(key in state_dict for key in sequential_keys) else grouped_keys
+    if not all(key in state_dict for key in keys):
+        return None
+
+    weights = [state_dict.pop(key) for key in keys]
+    for index in range(count):
+        for extra_key in (
+            f"{prefix}local_experts.{index}.{stem}._extra_state",
+            f"{prefix}{stem}._extra_state{'' if index == 0 else index}",
+        ):
+            state_dict.pop(extra_key, None)
+    return weights
+
+
+def _stacked_expert_factory(
+    tensor: torch.Tensor,
+    *,
+    prefix: str,
+    layer_name: str,
+    ep_rank: int,
+    ep_size: int,
+    replica_id: tuple[int, int, int],
+    sharded_offsets: tuple,
+    split_swiglu: bool,
+    singleton_local_shards: bool,
+) -> ShardedTensorFactory:
+    """Expose stacked Sonic weights using Megatron's per-expert checkpoint layout."""
+    local_key = f"{prefix}{'w1' if layer_name == 'linear_fc1' else 'w2'}"
+    num_local_experts = tensor.shape[0]
+    num_global_experts = ep_size * num_local_experts
+
+    @torch.no_grad()
+    def build_fn(key, data, factory_replica_id, flattened_range):
+        if flattened_range is not None:
+            raise ValueError("Flattened optimizer ranges are not supported for SonicMoE")
+        shards = []
+        for local_index in range(num_local_experts):
+            global_index = ep_rank * num_local_experts + local_index
+            expert_tensor = data[local_index].transpose(0, 1)
+            if singleton_local_shards:
+                checkpoint_key = (
+                    f"{prefix}experts.{global_index}.{layer_name}.weight"
+                )
+                expert_offsets = sharded_offsets
+                prepend_axis_num = len(sharded_offsets)
+            else:
+                checkpoint_key = f"{prefix}experts.{layer_name}.weight"
+                expert_offsets = (
+                    *sharded_offsets,
+                    (len(sharded_offsets), global_index, num_global_experts),
+                )
+                prepend_axis_num = len(sharded_offsets) + 1
+
+            if split_swiglu:
+                gate, up = torch.chunk(expert_tensor, 2, dim=0)
+                for part, value in enumerate((gate, up)):
+                    part_key = (
+                        f"{checkpoint_key}_{'w' if part == 0 else 'v'}"
+                        if singleton_local_shards
+                        else checkpoint_key
+                    )
+                    shards.append(
+                        ShardedTensor.from_rank_offsets(
+                            part_key,
+                            value,
+                            *expert_offsets,
+                            (prepend_axis_num, part, 2),
+                            replica_id=factory_replica_id,
+                            prepend_axis_num=prepend_axis_num,
+                        )
+                    )
+            else:
+                shards.append(
+                    ShardedTensor.from_rank_offsets(
+                        checkpoint_key,
+                        expert_tensor,
+                        *expert_offsets,
+                        replica_id=factory_replica_id,
+                        prepend_axis_num=prepend_axis_num,
+                    )
+                )
+        return shards
+
+    def merge_fn(loaded):
+        if split_swiglu:
+            experts = [
+                torch.cat((loaded[index], loaded[index + 1]), dim=0)
+                for index in range(0, len(loaded), 2)
+            ]
+        else:
+            experts = list(loaded)
+        return torch.stack(experts, dim=0).transpose(1, 2).contiguous()
+
+    return ShardedTensorFactory(
+        key=local_key,
+        data=tensor,
+        build_fn=build_fn,
+        merge_fn=merge_fn,
+        replica_id=replica_id,
+    )
+
+
 class SonicMoEExperts(nn.Module):
     """Megatron expert interface backed by AITER SonicMoE.
 
     Megatron dispatches and permutes token/expert assignments before invoking
-    this module. SonicMoE's general-routing entry point consumes those
-    assignments and performs both expert GEMMs, SwiGLU, routed-weight
-    multiplication, and their backward passes.
+    this module. SonicMoE's pre-routed entry point consumes those assignments
+    and performs both expert GEMMs, SwiGLU, routed-weight multiplication, and
+    their backward passes.
     """
 
     def __init__(self, experts: nn.Module):
@@ -51,9 +167,11 @@ class SonicMoEExperts(nn.Module):
         self.tp_group = getattr(experts, "tp_group", None)
         self.dp_group = getattr(experts, "dp_group", None)
         self.gemm_backend = os.environ.get("SONIC_MOE_GEMM_BACKEND", "triton")
-        if self.gemm_backend not in {"triton", "blas"}:
+        if self.gemm_backend != "triton":
             raise ValueError(
-                "SONIC_MOE_GEMM_BACKEND must be either 'triton' or 'blas'"
+                "SONIC_MOE_GEMM_BACKEND must be 'triton'; select its GEMM backend "
+                "with SONIC_MOE_GROUPED_GEMM_BACKEND="
+                "triton|hipblaslt|multistream|auto"
             )
 
         if getattr(self.config, "add_bias_linear", False):
@@ -65,42 +183,87 @@ class SonicMoEExperts(nn.Module):
             raise ValueError("SonicMoE integration currently requires expert tensor parallel size 1")
 
         fc1, fc2 = _expert_weights(experts)
-        # Keep parameters physically expert-major. The zero-copy views passed
-        # to SonicMoE below expose its [out_features, in_features, experts]
-        # API without interleaving experts in storage.
-        self.w1 = nn.Parameter(torch.stack([weight.detach() for weight in fc1], dim=0).contiguous())
-        self.w2 = nn.Parameter(torch.stack([weight.detach() for weight in fc2], dim=0).contiguous())
+        self.w1 = nn.Parameter(
+            torch.stack([weight.detach() for weight in fc1], dim=0)
+            .transpose(1, 2)
+            .contiguous()
+        )
+        self.w2 = nn.Parameter(
+            torch.stack([weight.detach() for weight in fc2], dim=0)
+            .transpose(1, 2)
+            .contiguous()
+        )
         for parameter in self.parameters():
             parameter.allreduce = False
+        self._register_load_state_dict_pre_hook(self._remap_checkpoint_state)
 
-    def _forward_blas(
+    def _remap_checkpoint_state(
         self,
-        hidden_states: torch.Tensor,
-        probs: torch.Tensor,
-        tokens_per_expert,
-    ) -> tuple[torch.Tensor, None]:
-        """Run pre-routed local experts with rocBLAS-backed linear operations."""
-        if isinstance(tokens_per_expert, torch.Tensor):
-            split_sizes = tokens_per_expert.tolist()
-        else:
-            split_sizes = list(tokens_per_expert)
-
-        hidden_chunks = torch.split(hidden_states, split_sizes)
-        prob_chunks = torch.split(probs.reshape(-1), split_sizes)
-        outputs = []
-        for expert_id, (tokens, expert_probs) in enumerate(
-            zip(hidden_chunks, prob_chunks)
-        ):
-            intermediate = torch.nn.functional.linear(tokens, self.w1[expert_id])
-            activated = weighted_bias_swiglu_impl(
-                intermediate,
-                None,
-                expert_probs.reshape(-1, 1),
-                False,
+        state_dict: MutableMapping[str, torch.Tensor],
+        prefix: str,
+        *args,
+    ) -> None:
+        """Map SequentialMLP or TEGroupedMLP checkpoint keys to Sonic storage."""
+        w1_key = f"{prefix}w1"
+        w2_key = f"{prefix}w2"
+        if w1_key not in state_dict:
+            weights = _pop_expert_weights(
+                state_dict, prefix, "linear_fc1", self.num_local_experts
             )
-            output = torch.nn.functional.linear(activated, self.w2[expert_id])
-            outputs.append(output)
-        return torch.cat(outputs, dim=0), None
+            if weights is not None:
+                state_dict[w1_key] = (
+                    torch.stack(weights, dim=0).transpose(1, 2).contiguous()
+                )
+        if w2_key not in state_dict:
+            weights = _pop_expert_weights(
+                state_dict, prefix, "linear_fc2", self.num_local_experts
+            )
+            if weights is not None:
+                state_dict[w2_key] = (
+                    torch.stack(weights, dim=0).transpose(1, 2).contiguous()
+                )
+        for key, parameter in ((w1_key, self.w1), (w2_key, self.w2)):
+            value = state_dict.get(key)
+            if value is not None and value.shape != parameter.shape:
+                transposed = value.transpose(1, 2)
+                if transposed.shape == parameter.shape:
+                    state_dict[key] = transposed.contiguous()
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """Return SequentialMLP-compatible distributed checkpoint shards."""
+        metadata = metadata or {}
+        singleton_local_shards = metadata.get("singleton_local_shards", False)
+        ep_rank = get_pg_rank(self.ep_group)
+        ep_size = self.ep_group.size() if self.ep_group is not None else 1
+        replica_id = (
+            0,
+            get_pg_rank(self.tp_group),
+            get_pg_rank(self.dp_group),
+        )
+        return {
+            f"{prefix}w1": _stacked_expert_factory(
+                self.w1,
+                prefix=prefix,
+                layer_name="linear_fc1",
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+                replica_id=replica_id,
+                sharded_offsets=sharded_offsets,
+                split_swiglu=True,
+                singleton_local_shards=singleton_local_shards,
+            ),
+            f"{prefix}w2": _stacked_expert_factory(
+                self.w2,
+                prefix=prefix,
+                layer_name="linear_fc2",
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+                replica_id=replica_id,
+                sharded_offsets=sharded_offsets,
+                split_swiglu=False,
+                singleton_local_shards=singleton_local_shards,
+            ),
+        }
 
     def forward(
         self,
@@ -108,18 +271,15 @@ class SonicMoEExperts(nn.Module):
         tokens_per_expert,
         permuted_probs: torch.Tensor,
     ):
-        cpu_counts = tokens_per_expert
         if isinstance(tokens_per_expert, tuple):
             cpu_counts, gpu_counts = tokens_per_expert
-            tokens_per_expert = gpu_counts if gpu_counts is not None else cpu_counts
+            tokens_per_expert = cpu_counts if cpu_counts is not None else gpu_counts
 
-        if self.gemm_backend == "blas":
-            return self._forward_blas(
-                permuted_local_hidden_states, permuted_probs, cpu_counts
-            )
-
-        device = permuted_local_hidden_states.device
-        counts = torch.as_tensor(tokens_per_expert, dtype=torch.int32, device=device)
+        # Keep Megatron's dispatcher-produced host counts on the CPU. The
+        # pre-routed entry point creates the GPU offsets needed by Triton while
+        # the multi-stream hipBLASLt backend reuses host offsets, matching
+        # TEGroupedMLP's one-D2H-per-layer metadata boundary.
+        counts = torch.as_tensor(tokens_per_expert, dtype=torch.int32)
 
         from aiter.ops.triton.sonicmoe import (
             SonicMoEActivationType,
@@ -130,9 +290,9 @@ class SonicMoEExperts(nn.Module):
             permuted_local_hidden_states,
             permuted_probs.reshape(-1).float(),
             counts,
-            self.w1.permute(1, 2, 0),
+            self.w1,
             None,
-            self.w2.permute(1, 2, 0),
+            self.w2,
             None,
             torch.cuda.current_stream().cuda_stream,
             SonicMoEActivationType.SWIGLU,

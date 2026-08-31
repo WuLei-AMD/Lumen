@@ -48,6 +48,11 @@ if [ "${ENABLE_PROFILER:-0}" = "1" ]; then
     )
 fi
 
+OVERLAP_ARGS=()
+if [ "${MEGATRON_OVERLAP:-1}" = "1" ]; then
+    OVERLAP_ARGS=(--overlap-grad-reduce --overlap-param-gather)
+fi
+
 mkdir -p "$(dirname "${DATA_PATH}")" "${RESULTS_DIR}"
 REQUIRED_DOCUMENTS=$((GBS * (TRAIN_STEPS + 4)))
 if [ "${REQUIRED_DOCUMENTS}" -lt 128 ]; then
@@ -117,7 +122,7 @@ torchrun \
     --moe-router-topk 8 \
     --moe-router-dtype fp32 \
     --moe-router-load-balancing-type aux_loss \
-    --moe-aux-loss-coeff 1e-3 \
+    --moe-aux-loss-coeff "${AUX_LOSS_COEFF:-1e-3}" \
     --moe-token-dispatcher-type alltoall \
     --moe-permute-fusion \
     --expert-model-parallel-size "${EP}" \
@@ -141,8 +146,7 @@ torchrun \
     --bf16 \
     --no-gradient-accumulation-fusion \
     --use-distributed-optimizer \
-    --overlap-grad-reduce \
-    --overlap-param-gather \
+    "${OVERLAP_ARGS[@]}" \
     --attention-dropout 0.0 \
     --hidden-dropout 0.0 \
     --no-masked-softmax-fusion \
@@ -152,6 +156,8 @@ torchrun \
     --train-data-path "${DATA_PATH}" \
     --valid-data-path "${DATA_PATH}" \
     --test-data-path "${DATA_PATH}" \
+    --dataloader-type cyclic \
+    --no-data-sharding \
     --split 98,1,1 \
     --num-workers 2 \
     --eval-interval 1000000 \

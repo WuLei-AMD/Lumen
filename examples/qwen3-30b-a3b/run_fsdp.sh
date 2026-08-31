@@ -6,10 +6,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG=${CONFIG:-"${SCRIPT_DIR}/config_MI350X_1x8x1.sh"}
 source "${CONFIG}"
 EXPERT_BACKEND=${EXPERT_BACKEND:-te_grouped}
+SHARDING=${SHARDING:-full_shard}
+LUMEN_NORM=${LUMEN_NORM:-1}
+FUSED_ROUTER=${FUSED_ROUTER:-0}
+MOE_DISPATCH_OVERLAP=${MOE_DISPATCH_OVERLAP:-0}
+MOE_GLOBAL_EXPERT_LAYOUT=${MOE_GLOBAL_EXPERT_LAYOUT:-0}
 MODEL_ARGS=()
 if [ -n "${MODEL_PATH:-}" ]; then
     MODEL_ARGS=(--model-name-or-path "${MODEL_PATH}")
 fi
+FEATURE_ARGS=()
+[ "${LUMEN_NORM}" = "1" ] && FEATURE_ARGS+=(--lumen-norm)
+[ "${FUSED_ROUTER}" = "1" ] && FEATURE_ARGS+=(--fused-router)
+[ "${MOE_DISPATCH_OVERLAP}" = "1" ] && FEATURE_ARGS+=(--lumen-moe-dispatch-overlap)
+[ "${MOE_GLOBAL_EXPERT_LAYOUT}" = "1" ] && FEATURE_ARGS+=(--lumen-moe-global-expert-layout)
 
 case "${EXPERT_BACKEND}" in
     sequential|te_grouped|sonic) ;;
@@ -38,9 +48,14 @@ fi
 
 RUN_SUFFIX=${RUN_SUFFIX:-}
 LOG_FILE="${RESULTS_DIR}/qwen3-30b-a3b-fsdp-${EXPERT_BACKEND}${RUN_SUFFIX:+-${RUN_SUFFIX}}-bf16-seq${SEQ_LEN}-mbs${MBS}-gbs${GBS}.log"
-DP=$((NGPU / EP))
-if [ $((NGPU % EP)) -ne 0 ]; then
-    echo "ERROR: NGPU=${NGPU} must be divisible by EP=${EP}" >&2
+WORLD_SIZE=$((NGPU * NNODES))
+DP=${DP:-${WORLD_SIZE}}
+if [ $((WORLD_SIZE % EP)) -ne 0 ]; then
+    echo "ERROR: WORLD_SIZE=${WORLD_SIZE} must be divisible by EP=${EP}" >&2
+    exit 2
+fi
+if [ "${DP}" -ne "${WORLD_SIZE}" ]; then
+    echo "ERROR: DP=${DP} must equal WORLD_SIZE=${WORLD_SIZE}; dense DP overlaps EP" >&2
     exit 2
 fi
 GRAD_ACCUM=$((GBS / (MBS * DP)))
@@ -57,6 +72,7 @@ torchrun \
     --master_port="${MASTER_PORT}" \
     "${SCRIPT_DIR}/pretrain_qwen3_30b_a3b_fsdp.py" \
     "${MODEL_ARGS[@]}" \
+    "${FEATURE_ARGS[@]}" \
     --tokenizer-name-or-path "${TOKENIZER_PATH}" \
     --train-data-path "${DATA_PATH}" \
     --val-data-path "${DATA_PATH}" \
@@ -76,13 +92,15 @@ torchrun \
     --adam-beta1 0.9 \
     --adam-beta2 0.95 \
     --adam-eps 1e-8 \
-    --aux-loss-coeff 1e-3 \
+    --aux-loss-coeff "${AUX_LOSS_COEFF:-1e-3}" \
     --ep-size "${EP}" \
     --dp-size "${DP}" \
     --expert-backend "${EXPERT_BACKEND}" \
-    --sharding full_shard \
+    --sharding "${SHARDING}" \
     --no-gradient-checkpointing \
     --num-workers 2 \
+    --shuffle-data \
+    --data-seed 0 \
     --log-interval 1 \
     --eval-interval 0 \
     --seed 1234 \

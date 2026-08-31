@@ -89,6 +89,47 @@ pip install -e ".[dev]"
 | **LLaMA2 SFT** | Fine-tuning / LoRA on LLaMA2 7B–70B with FP8 attention, packed sequences, early stopping | [`examples/llama2/`](examples/llama2/) |
 | **LLaMA 3.1 Pretrain** | Pretraining LLaMA 3.1 8B with FP8 hybrid training and MXFP8 attention (MLPerf-aligned) | [`examples/llama31/`](examples/llama31/) |
 
+## Qwen3-30B-A3B MoE benchmark
+
+The optimized BF16 benchmark uses 8× MI350X GPUs, sequence length 4096,
+micro-batch size 2, global batch size 256, TP=1, PP=1, and EP=8. Runs load
+the real Qwen3-30B-A3B checkpoint and FineWeb data; the 4,513 physical
+sequences are cycled to provide the 5,120 samples required by 20 steps.
+Performance is the median of steps 11–20.
+
+![Qwen3-30B-A3B MoE benchmark](examples/qwen3-30b-a3b/results/qwen3-30b-a3b-real-optimized20-speed.png)
+
+Best validated configurations:
+
+- **FSDP Sequential:** 32.413 s/step, 7.898 samples/s, 161.2 GiB peak memory.
+- **FSDP SonicMoE:** 22.356 s/step, 11.451 samples/s, 128.0 GiB peak memory.
+  Uses global expert layout, Triton forward GEMM, multistream grouped GEMM,
+  and normal-priority (`0`) HIP streams.
+- **FSDP TE Grouped:** 22.375 s/step, 11.441 samples/s, 153.0 GiB peak memory.
+  Uses the TE CK/CUTLASS grouped GEMM path.
+- **Megatron Sequential:** 29.364 s/step, 8.718 samples/s, 142.5 GiB peak memory.
+- **Megatron SonicMoE:** 24.498 s/step, 10.450 samples/s, 123.9 GiB peak memory.
+  Uses multistream grouped GEMM with normal-priority (`0`) HIP streams.
+- **Megatron TE Grouped:** 28.587 s/step, 8.956 samples/s, 142.5 GiB peak memory.
+  Uses the TE CK/CUTLASS grouped GEMM path.
+
+All six runs completed 20 steps with final LM loss in the 2.385–2.386 range.
+High-priority (`-1`) Sonic streams starved Megatron RCCL traffic and were
+slower; normal priority also edged out high priority for FSDP. TE hipBLASLt
+autotuning was not selected because loading its generated cache failed in the
+tested Transformer Engine build (`Invalid scale name: float3`).
+
+Reproduce the optimized matrices:
+
+```bash
+cd examples/qwen3-30b-a3b
+TRAIN_STEPS=20 MBS=2 GBS=256 SEQ_LEN=4096 \
+  python run_qwen3_benchmark.py fsdp
+TRAIN_STEPS=20 MBS=2 GBS=256 SEQ_LEN=4096 \
+  python run_qwen3_benchmark.py megatron
+python run_qwen3_benchmark.py summarize --warmup-steps 10
+```
+
 ## Testing
 
 See [`tests/`](tests/) for test instructions.

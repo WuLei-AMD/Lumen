@@ -2,7 +2,7 @@ ARG BASE_IMAGE=rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1
 FROM ${BASE_IMAGE}
 
 ARG MEGATRON_COMMIT=a1b00d4259e92dc4a07a0be2c24088fe827f4b6e
-ARG TE_TAG=v2.10_rocm
+ARG TE_COMMIT=b2a0450804c0a999c42628834290f07d58d671ef
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake git ninja-build pybind11-dev \
@@ -11,12 +11,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pip install pybind11 packaging ninja cmake psutil
 
 # Build ROCm Transformer Engine for MI350X from source.
-RUN git clone --recursive --branch "${TE_TAG}" \
-        https://github.com/ROCm/TransformerEngine.git /workspace/TransformerEngine
+RUN git clone https://github.com/ROCm/TransformerEngine.git /workspace/TransformerEngine && \
+    cd /workspace/TransformerEngine && \
+    git checkout "${TE_COMMIT}" && \
+    git submodule update --init --recursive
 RUN cd /workspace/TransformerEngine && \
     NVTE_USE_ROCM=1 \
     NVTE_FRAMEWORK=pytorch \
     NVTE_ROCM_ARCH=gfx950 \
+    CMAKE_ARGS="-DUSE_FUSED_ATTN_CK=ON -DCMAKE_HIP_ARCHITECTURES=gfx950" \
     MAX_JOBS=16 \
     pip install . --no-build-isolation
 
@@ -32,7 +35,8 @@ COPY . /workspace/Lumen
 
 # Build SonicMoE-enabled AITER and install Lumen.
 RUN cd /workspace/Lumen/third_party/aiter && \
-    MAX_JOBS=16 pip install -e . --no-build-isolation --no-deps
+    MAX_JOBS=16 pip install -e . --no-build-isolation --no-deps && \
+    python -c "from aiter.jit.core import get_module; m = get_module('module_hipb_groupedgemm'); assert hasattr(m, 'hipb_grouped_mm'); assert hasattr(m, 'hipb_multistream_mm')"
 RUN cd /workspace/Lumen && \
     pip install -e . --no-build-isolation --no-deps && \
     pip install \
@@ -40,6 +44,9 @@ RUN cd /workspace/Lumen && \
         "huggingface_hub>=0.24" "datasets>=2.16" "transformers>=4.43" \
         setuptools-scm "numpy>=1.26" && \
     pip install "peft>=0.9" --no-deps
+
+# HipKittens is excluded because this benchmark is BF16.
+RUN python -c "import pathlib, transformer_engine as te; root = pathlib.Path(te.__file__).parent; data = b''.join(p.read_bytes() for p in root.rglob('*.so')); assert b'ck_grouped' in data, 'CK grouped GEMM symbols missing'"
 
 ENV PYTHONPATH="/workspace/Lumen:/workspace/Lumen/third_party/aiter:/workspace/Megatron-LM"
 ENV TOKENIZERS_PARALLELISM=false

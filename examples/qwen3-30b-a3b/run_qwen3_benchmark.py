@@ -38,40 +38,28 @@ CONTAINER_RESULTS = "/workspace/Lumen/examples/qwen3-30b-a3b/results"
 CASE_CONFIGS: dict[str, dict[str, str]] = {
     "fsdp_sequential": {
         "EXPERT_BACKEND": "sequential",
-        "RUN_SUFFIX": "real",
+        "RUN_SUFFIX": "real-optimized20",
         "COMMAND": "bash run_fsdp.sh",
     },
-    "fsdp_sonic_blas": {
+    "fsdp_sonic_multistream": {
         "EXPERT_BACKEND": "sonic",
-        "SONIC_MOE_GEMM_BACKEND": "blas",
-        "RUN_SUFFIX": "real-blas",
-        "COMMAND": "bash run_fsdp.sh",
-    },
-    "fsdp_sonic": {
-        "EXPERT_BACKEND": "sonic",
+        "SONIC_MOE_GEMM_BACKEND": "triton",
+        "SONIC_MOE_GROUPED_GEMM_BACKEND": "multistream",
+        "SONIC_MOE_MULTISTREAM_PRIORITY": "0",
+        "MOE_GLOBAL_EXPERT_LAYOUT": "1",
+        "RUN_SUFFIX": "real-global-layout-priority0-optimized20",
         "COMMAND": "bash run_fsdp.sh",
     },
     "fsdp_te_grouped": {
         "EXPERT_BACKEND": "te_grouped",
-        "RUN_SUFFIX": "real",
+        "NVTE_USE_CUTLASS_GROUPED_GEMM": "1",
+        "NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK": "1",
+        "RUN_SUFFIX": "real-ck-optimized20",
         "COMMAND": "bash run_fsdp.sh",
     },
-    "sequential": {"MOE_IMPL": "sequential"},
-    "sequential_tune": {
+    "sequential": {
         "MOE_IMPL": "sequential",
-        "HIPBLASLT_TUNING_FILE": (
-            f"{CONTAINER_RESULTS}/qwen3-30b-a3b-sequential-real-gbs256-tuned.csv"
-        ),
-        "TRAIN_STEPS": "1",
-        "LR_WARMUP_ITERS": "0",
-        "RUN_SUFFIX": "real-hipblaslt-tuning",
-    },
-    "sequential_tuned": {
-        "MOE_IMPL": "sequential",
-        "HIPBLASLT_TUNING_OVERRIDE_FILE": (
-            f"{CONTAINER_RESULTS}/qwen3-30b-a3b-sequential-real-gbs256-tuned.csv"
-        ),
-        "RUN_SUFFIX": "real-hipblaslt-tuned",
+        "RUN_SUFFIX": "real-optimized20",
     },
     "sonic_triton_tune": {
         "COMMAND": (
@@ -84,74 +72,48 @@ CASE_CONFIGS: dict[str, dict[str, str]] = {
         "SONIC_MOE_GEMM_BACKEND": "triton",
         "RUN_SUFFIX": "triton-tuned",
     },
-    "sonic_blas": {
+    "sonic_multistream": {
         "MOE_IMPL": "sonic",
-        "SONIC_MOE_GEMM_BACKEND": "blas",
-        "RUN_SUFFIX": "blas-fused-swiglu",
-    },
-    "sonic_blas_tune": {
-        "MOE_IMPL": "sonic",
-        "SONIC_MOE_GEMM_BACKEND": "blas",
-        "HIPBLASLT_TUNING_FILE": (
-            f"{CONTAINER_RESULTS}/qwen3-30b-a3b-sonic-blas-real-gbs256-tuned.csv"
-        ),
-        "TRAIN_STEPS": "1",
-        "LR_WARMUP_ITERS": "0",
-        "RUN_SUFFIX": "real-blas-tuning",
-    },
-    "sonic_blas_tuned": {
-        "MOE_IMPL": "sonic",
-        "SONIC_MOE_GEMM_BACKEND": "blas",
-        "HIPBLASLT_TUNING_OVERRIDE_FILE": (
-            f"{CONTAINER_RESULTS}/qwen3-30b-a3b-sonic-blas-real-gbs256-tuned.csv"
-        ),
-        "RUN_SUFFIX": "real-blas-tuned",
+        "SONIC_MOE_GEMM_BACKEND": "triton",
+        "SONIC_MOE_GROUPED_GEMM_BACKEND": "multistream",
+        "SONIC_MOE_MULTISTREAM_PRIORITY": "0",
+        "RUN_SUFFIX": "real-multistream-priority0-optimized20",
     },
     "te_grouped": {"MOE_IMPL": "te_grouped"},
     "te_ck": {
         "MOE_IMPL": "te_grouped",
         "NVTE_USE_CUTLASS_GROUPED_GEMM": "1",
         "NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK": "1",
-        "RUN_SUFFIX": "real-ck",
+        "RUN_SUFFIX": "real-ck-optimized20",
     },
     "te_hipblaslt_tune": {
         "MOE_IMPL": "te_grouped",
-        "NVTE_USE_HIPBLASLT": "1",
-        "HIPBLASLT_TUNING_FILE": (
-            f"{CONTAINER_RESULTS}/qwen3-30b-a3b-te-hipblaslt-real-gbs256-tuned.csv"
+        "TE_HIPBLASLT_ALGO_SAVE": (
+            f"{CONTAINER_RESULTS}/qwen3-30b-a3b-te-hipblaslt-gbs256.cache"
         ),
+        "TE_HIPBLASLT_TUNING_RUN_COUNT": "5",
+        "TE_HIPBLASLT_TUNING_ALGO_COUNT": "64",
         "TRAIN_STEPS": "1",
         "LR_WARMUP_ITERS": "0",
         "RUN_SUFFIX": "real-hipblaslt-tuning",
     },
     "te_hipblaslt_tuned": {
         "MOE_IMPL": "te_grouped",
-        "NVTE_USE_HIPBLASLT": "1",
-        "HIPBLASLT_TUNING_OVERRIDE_FILE": (
-            f"{CONTAINER_RESULTS}/qwen3-30b-a3b-te-hipblaslt-real-gbs256-tuned.csv"
+        "TE_HIPBLASLT_ALGO_LOAD": (
+            f"{CONTAINER_RESULTS}/qwen3-30b-a3b-te-hipblaslt-gbs256.cache"
         ),
-        "RUN_SUFFIX": "real-hipblaslt-tuned",
-    },
-    "te_hipkittens": {
-        "MOE_IMPL": "te_grouped",
-        "NVTE_USE_HIPKITTENS_GEMM": "1",
-        "RUN_SUFFIX": "real-hipkittens",
+        "RUN_SUFFIX": "real-hipblaslt",
     },
 }
 
 MEGATRON_CASES = (
-    ("sequential_tune", 29900),
-    ("sequential_tuned", 29901),
-    ("sonic_blas_tune", 29902),
-    ("sonic_blas_tuned", 29903),
-    ("te_hipblaslt_tune", 29904),
-    ("te_hipblaslt_tuned", 29905),
+    ("sequential", 29900),
+    ("sonic_multistream", 29901),
     ("te_ck", 29906),
-    ("te_hipkittens", 29907),
 )
 FSDP_CASES = (
     ("FSDP Sequential", "fsdp_sequential", 29920),
-    ("FSDP Sonic BLAS", "fsdp_sonic_blas", 29921),
+    ("FSDP Sonic multi-stream BLAS", "fsdp_sonic_multistream", 29921),
     ("FSDP TE Grouped", "fsdp_te_grouped", 29922),
 )
 
@@ -216,6 +178,14 @@ def parse_log(path: Path) -> tuple[list[dict[str, float]], int, int, float]:
         for step, time_ms, logged_gbs, loss in MEGATRON_PATTERN.findall(text)
         if int(logged_gbs) == gbs
     ]
+    # Megatron intentionally logs iteration 1 without resetting its interval
+    # accumulators. With log_interval=1, iteration 2 is therefore the average
+    # of iterations 1 and 2 rather than a per-step value. Recover the actual
+    # second point for both the loss and timing curves.
+    if len(points) >= 2 and points[0]["step"] == 1 and points[1]["step"] == 2:
+        points[1]["loss"] = 2.0 * points[1]["loss"] - points[0]["loss"]
+        points[1]["time_ms"] = 2.0 * points[1]["time_ms"] - points[0]["time_ms"]
+        points[1]["throughput"] = gbs * 1000 / points[1]["time_ms"]
     if not points:
         matches = FSDP_PATTERN.findall(text)
         points = [
@@ -239,14 +209,13 @@ def parse_log(path: Path) -> tuple[list[dict[str, float]], int, int, float]:
 
 def case_label(path: Path) -> str:
     labels = (
-        ("fsdp-sequential-real-", "FSDP Sequential"),
-        ("fsdp-sonic-real-blas-", "FSDP Sonic BLAS"),
-        ("fsdp-te_grouped-real-", "FSDP TE Grouped"),
-        ("sequential-real-hipblaslt-tuned-", "Megatron Sequential"),
-        ("sonic-real-blas-tuned-", "Megatron Sonic BLAS"),
-        ("te_grouped-real-hipblaslt-tuned-", "Megatron TE hipBLASLt"),
+        ("fsdp-sequential-real-optimized20-", "FSDP Sequential"),
+        ("fsdp-sonic-real-global-layout-priority0-", "FSDP Sonic"),
+        ("fsdp-te_grouped-real-ck-", "FSDP TE CK"),
+        ("sequential-real-optimized20-", "Megatron Sequential"),
+        ("sonic-real-multistream-priority0-", "Megatron Sonic"),
+        ("te_grouped-real-hipblaslt-", "Megatron TE hipBLASLt"),
         ("te_grouped-real-ck-", "Megatron TE CK"),
-        ("te_grouped-real-hipkittens-", "Megatron TE HipKittens"),
     )
     for marker, label in labels:
         if marker in path.stem:
@@ -256,14 +225,12 @@ def case_label(path: Path) -> str:
 
 def expected_logs() -> list[Path]:
     names = (
-        f"qwen3-30b-a3b-sequential-real-hipblaslt-tuned-seq4096-mbs{MBS}-gbs{GBS}.log",
-        f"qwen3-30b-a3b-sonic-real-blas-tuned-seq4096-mbs{MBS}-gbs{GBS}.log",
-        f"qwen3-30b-a3b-te_grouped-real-hipblaslt-tuned-seq4096-mbs{MBS}-gbs{GBS}.log",
-        f"qwen3-30b-a3b-te_grouped-real-ck-seq4096-mbs{MBS}-gbs{GBS}.log",
-        f"qwen3-30b-a3b-te_grouped-real-hipkittens-seq4096-mbs{MBS}-gbs{GBS}.log",
-        f"qwen3-30b-a3b-fsdp-sequential-real-bf16-seq4096-mbs{MBS}-gbs{GBS}.log",
-        f"qwen3-30b-a3b-fsdp-sonic-real-blas-bf16-seq4096-mbs{MBS}-gbs{GBS}.log",
-        f"qwen3-30b-a3b-fsdp-te_grouped-real-bf16-seq4096-mbs{MBS}-gbs{GBS}.log",
+        f"qwen3-30b-a3b-sequential-real-optimized20-seq4096-mbs{MBS}-gbs{GBS}.log",
+        f"qwen3-30b-a3b-sonic-real-multistream-priority0-optimized20-seq4096-mbs{MBS}-gbs{GBS}.log",
+        f"qwen3-30b-a3b-te_grouped-real-ck-optimized20-seq4096-mbs{MBS}-gbs{GBS}.log",
+        f"qwen3-30b-a3b-fsdp-sequential-real-optimized20-bf16-seq4096-mbs{MBS}-gbs{GBS}.log",
+        f"qwen3-30b-a3b-fsdp-sonic-real-global-layout-priority0-optimized20-bf16-seq4096-mbs{MBS}-gbs{GBS}.log",
+        f"qwen3-30b-a3b-fsdp-te_grouped-real-ck-optimized20-bf16-seq4096-mbs{MBS}-gbs{GBS}.log",
     )
     return [RESULTS_DIR / name for name in names]
 

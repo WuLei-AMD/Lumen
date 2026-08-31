@@ -10,7 +10,7 @@ import torch
 from qwen3_moe_mapping import pack_swiglu_fc1
 from saver_base import MegatronCheckpointSaverBase
 from schema_qwen3_moe import get_qwen3_moe_schema
-from utils import chunk_weight
+from utils import _ConverterFakeProcessGroup, chunk_weight
 
 
 def add_arguments(parser):
@@ -27,6 +27,19 @@ def add_arguments(parser):
 
 
 class Qwen3MoECheckpointSaver(MegatronCheckpointSaverBase):
+    def initialize_megatron_env(self):
+        super().initialize_megatron_env()
+        # MCore 0.17 expert MLP construction requires the ETP group itself,
+        # while the bundled generic converter only initializes TP/PP/EP groups.
+        from megatron.core import mpu
+
+        expert_tp_size = self.margs.expert_tensor_parallel_size
+        mpu._EXPERT_TENSOR_PARALLEL_GROUP = _ConverterFakeProcessGroup(
+            size=expert_tp_size
+        )
+        mpu.set_expert_tensor_parallel_world_size(expert_tp_size)
+        mpu.set_expert_tensor_parallel_rank(0)
+
     def receive_checkpoint_metadata(self):
         super().receive_checkpoint_metadata()
         actual = (

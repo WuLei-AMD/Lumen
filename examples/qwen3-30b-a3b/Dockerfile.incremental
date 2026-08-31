@@ -1,0 +1,15 @@
+ARG BASE_IMAGE=zhangdanyangamd/lumen@sha256:ef5c8632b852f3a04ebc3a9d600e6ef2dc66d4d39e78be41ae97b347ddc6bfd3
+FROM ${BASE_IMAGE}
+
+WORKDIR /workspace/Lumen
+COPY . /workspace/Lumen
+
+RUN cd /workspace/Lumen/third_party/aiter && \
+    GPU_ARCHS=gfx950 CU_NUM=256 MAX_JOBS=16 pip install -e . --no-build-isolation --no-deps && \
+    cd /workspace/Lumen && \
+    pip install -e . --no-build-isolation --no-deps
+
+RUN python -c "import pathlib, transformer_engine as te; root = pathlib.Path(te.__file__).parent; data = b''.join(p.read_bytes() for p in root.rglob('*.so')); assert te.__version__.startswith('2.10.0+b2a04508'); assert b'ck_grouped' in data"
+
+ENV PYTHONPATH="/workspace/Lumen:/workspace/Lumen/third_party/aiter:/workspace/Megatron-LM"
+WORKDIR /workspace/Lumen/examples/qwen3-30b-a3b

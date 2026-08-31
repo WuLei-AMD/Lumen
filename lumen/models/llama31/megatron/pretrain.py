@@ -32,6 +32,8 @@ Example::
     )
 """
 
+import os
+
 import torch
 from megatron.core import tensor_parallel
 from megatron.training import get_args, get_tokenizer, print_rank_0
@@ -57,6 +59,8 @@ from lumen.models.megatron import (  # noqa: F401
     reset_fp8_state,
 )
 from lumen.models.utils import safe_add_argument
+
+_PARITY_BATCH_INDEX = 0
 
 __all__ = [
     "PretrainTextDataset",
@@ -131,7 +135,11 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         args.seq_length,
         raw_tokenizer,
         is_hf,
-        max_samples=train_val_test_num_samples[0],
+        # Keep the full corpus for cyclic sampling. Truncating to
+        # global_batch_size * train_iters changes the permutation whenever the
+        # requested run length changes and prevents parity with FSDP.
+        max_samples=None,
+        virtual_num_samples=train_val_test_num_samples[0],
     )
     valid_ds = PretrainTextDataset(
         valid_path,
@@ -159,6 +167,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch for pretraining (standard LM, all tokens contribute)."""
+    global _PARITY_BATCH_INDEX
     if not is_first_or_last_pipeline_stage(vp_stage):
         return None, None, None, None, None
 
@@ -173,6 +182,22 @@ def get_batch(data_iterator, vp_stage=None):
 
     tokens = data_b["input_ids"].contiguous()
     labels = data_b["labels"].contiguous()
+    dump_dir = os.environ.get("QWEN_PARITY_DUMP_DIR")
+    if dump_dir:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        dump_path = os.path.join(
+            dump_dir, f"megatron-batch{_PARITY_BATCH_INDEX}-rank{rank}.pt"
+        )
+        if not os.path.exists(dump_path):
+            os.makedirs(dump_dir, exist_ok=True)
+            torch.save(
+                {
+                    "input_ids": tokens.detach().cpu(),
+                    "labels": labels.detach().cpu(),
+                },
+                dump_path,
+            )
+        _PARITY_BATCH_INDEX += 1
 
     tokenizer = get_tokenizer()
     if hasattr(tokenizer, "_tokenizer") and hasattr(tokenizer._tokenizer, "eos_token_id"):

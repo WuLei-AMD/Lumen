@@ -5,7 +5,7 @@ from schema_base import ModelSchema
 
 def get_qwen3_moe_schema(num_local_experts: int) -> ModelSchema:
     layer = {
-        "self_attn_norm_weight": "self_attention.linear_qkv.layer_norm_weight",
+        "self_attn_norm_weight": "input_layernorm.weight",
         "self_attn_qkv_weight": "self_attention.linear_qkv.weight",
         "self_attn_proj_weight": "self_attention.linear_proj.weight",
         "q_norm_weight": "self_attention.q_layernorm.weight",
@@ -33,5 +33,10 @@ def get_qwen3_moe_schema(num_local_experts: int) -> ModelSchema:
                 "bias": "decoder.final_layernorm.bias",
             },
             "output_layer": {"weight": "output_layer.weight"},
+            # Required by Megatron's generic ModelSchema even for decoder-only
+            # models. These heads are absent from Qwen3-MoE.
+            "pooler": {},
+            "lm_head": {},
+            "binary_head": {},
         }
     )

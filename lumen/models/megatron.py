@@ -44,38 +44,6 @@ from lumen.modules.attention_mla import LumenDotProductAttentionMLA
 
 logger = logging.getLogger(__name__)
 
-
-def _patch_moe_fused_router():
-    """Monkey-patch Megatron-Core's moe_utils with Lumen fused router ops."""
-    try:
-        import megatron.core.transformer.moe.moe_utils as moe_utils
-
-        from lumen.ops.moe.fused_router import (
-            fused_compute_score_for_moe_aux_loss,
-            fused_moe_aux_loss,
-            fused_topk_with_score_function,
-        )
-
-        moe_utils.fused_topk_with_score_function = fused_topk_with_score_function
-        moe_utils.fused_compute_score_for_moe_aux_loss = fused_compute_score_for_moe_aux_loss
-        moe_utils.fused_moe_aux_loss = fused_moe_aux_loss
-
-        try:
-            import megatron.core.extensions.transformer_engine as te_ext
-
-            te_ext.fused_topk_with_score_function = fused_topk_with_score_function
-            te_ext.fused_compute_score_for_moe_aux_loss = fused_compute_score_for_moe_aux_loss
-            te_ext.fused_moe_aux_loss = fused_moe_aux_loss
-        except ImportError:
-            pass
-
-        logger.info("Patched Megatron-Core moe_utils with Lumen fused router ops")
-    except ImportError:
-        logger.debug("Megatron-Core moe_utils not found, skipping MoE router patch")
-
-
-_patch_moe_fused_router()
-
 stimer = StragglerDetector()
 
 
@@ -100,6 +68,74 @@ def _patch_core_attention(spec):
         if hasattr(subs, "layer_specs"):
             for layer_spec in subs.layer_specs:
                 _patch_core_attention(layer_spec)
+
+
+def _install_parity_dump_hook(model: torch.nn.Module) -> None:
+    dump_dir = os.environ.get("QWEN_PARITY_DUMP_DIR")
+    if not dump_dir or (torch.distributed.is_initialized() and torch.distributed.get_rank() != 0):
+        return
+
+    os.makedirs(dump_dir, exist_ok=True)
+    state = {"written": False}
+
+    def dump_first_layer(_module, inputs, kwargs, output):
+        if state["written"]:
+            return
+        hidden_input = inputs[0] if inputs else kwargs["hidden_states"]
+        hidden_output = output[0] if isinstance(output, tuple) else output
+        torch.save(
+            {
+                "input": hidden_input.detach().cpu(),
+                "output": hidden_output.detach().cpu(),
+            },
+            os.path.join(dump_dir, "megatron-layer0.pt"),
+        )
+        state["written"] = True
+
+    model.decoder.layers[0].register_forward_hook(dump_first_layer, with_kwargs=True)
+
+    def dump_component(name):
+        written = {"value": False}
+
+        def hook(_module, _inputs, output):
+            if written["value"]:
+                return
+            tensor = output[0] if isinstance(output, tuple) else output
+            torch.save(
+                tensor.detach().cpu(),
+                os.path.join(dump_dir, f"megatron-{name}.pt"),
+            )
+            written["value"] = True
+
+        return hook
+
+    layer = model.decoder.layers[0]
+    layer.self_attention.register_forward_hook(dump_component("attention"))
+    layer.self_attention.linear_qkv.register_forward_hook(dump_component("linear-qkv"))
+    layer.self_attention.core_attention.register_forward_hook(dump_component("core-attention"))
+    layer.self_attention.linear_proj.register_forward_hook(dump_component("linear-proj"))
+    layer.mlp.register_forward_hook(dump_component("mlp"))
+
+
+def _install_legacy_input_norm_load_hook(model: torch.nn.Module) -> None:
+    """Load checkpoints that stored local-spec input norms under fused TE keys."""
+
+    def remap_input_norms(_module, state_dict, _prefix, *_args):
+        suffix = ".self_attention.linear_qkv.layer_norm_weight"
+        remapped = 0
+        for old_key in [key for key in state_dict if key.endswith(suffix)]:
+            new_key = old_key[: -len(suffix)] + ".input_layernorm.weight"
+            if new_key not in state_dict:
+                state_dict[new_key] = state_dict[old_key]
+                remapped += 1
+            del state_dict[old_key]
+        if remapped:
+            print_rank_0(
+                f"> remapped {remapped} legacy fused input-norm checkpoint keys "
+                "to the local transformer spec"
+            )
+
+    model.register_load_state_dict_pre_hook(remap_input_norms)
 
 
 class _MegatronCompatibleTLRMSNorm(torch.nn.Module):
@@ -456,7 +492,8 @@ def lumen_gpt_builder(
         use_kitchen=getattr(config, "use_kitchen", False),
     )
 
-    _patch_core_attention(transformer_layer_spec)
+    if os.environ.get("LUMEN_USE_MEGATRON_ATTENTION", "0") != "1":
+        _patch_core_attention(transformer_layer_spec)
     _patch_norms_in_spec(transformer_layer_spec)
 
     model = GPTModel(
@@ -476,6 +513,8 @@ def lumen_gpt_builder(
         pg_collection=pg_collection,
         vp_stage=vp_stage,
     )
+    _install_legacy_input_norm_load_hook(model)
+    _install_parity_dump_hook(model)
 
     grad_quant_type = getattr(args, "grad_quant_type", None)
     normalization = getattr(args, "normalization", "RMSNorm")
@@ -1988,6 +2027,7 @@ def _run_warmup_eval_pass(model, args):
 
 _val_loss_ema: Optional[float] = None
 _early_stop_logged = False
+_parity_loss_index = 0
 
 
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model=None):
@@ -1996,11 +2036,21 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model=None):
     previous per-step, per-rank training-loss EMA stop caused a DP desync
     (one rank crossed the threshold on its local loss and exited the train
     loop while others continued -> mismatched collectives -> NCCL deadlock)."""
+    global _parity_loss_index
     losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.view(-1).float()
     loss = torch.sum(losses * loss_mask)
     num_tokens = loss_mask.sum().clone().detach().to(torch.int)
     reporting = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
+    if os.environ.get("QWEN_PARITY_LOG_LOCAL_LOSS", "0") == "1":
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        local_mean = loss.detach() / num_tokens.clamp_min(1)
+        print(
+            f"Qwen parity local loss: rank={rank} call={_parity_loss_index} "
+            f"lm_loss={local_mean.item():.9f}",
+            flush=True,
+        )
+        _parity_loss_index += 1
     return loss, num_tokens, {"lm loss": reporting}
 
 
@@ -2149,6 +2199,13 @@ def add_common_megatron_args(parser):
         action="store_true",
         default=False,
         help="Replace Megatron MoE expert MLPs with AITER SonicMoE during LumenConfig.enable().",
+    )
+    safe_add_argument(
+        lumen,
+        "--lumen-fused-router",
+        action="store_true",
+        default=False,
+        help="Install autograd-safe AITER router functions during LumenConfig.enable().",
     )
     safe_add_argument(
         lumen,
