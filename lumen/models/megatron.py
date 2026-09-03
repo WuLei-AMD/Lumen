@@ -2069,7 +2069,7 @@ def make_forward_step(get_batch_fn: Callable, loss_fn: Callable = loss_func, zer
         zero_last_loss_mask: Forwarded to :func:`_get_synthetic_batch`.
     """
 
-    def forward_step(data_iterator, model: GPTModel):
+    def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = False):
         global _warmup_step_counter, _warmup_completed
 
         args = get_args()
@@ -2115,8 +2115,18 @@ def make_forward_step(get_batch_fn: Callable, loss_fn: Callable = loss_func, zer
         timers("batch-generator").stop()
 
         with stimer:
-            with get_cpu_offload_context(args):
-                output_tensor = model(tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask)
+            if return_schedule_plan:
+                assert getattr(args, "overlap_moe_expert_parallel_comm", False), (
+                    "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
+                )
+                output_tensor = model.build_schedule_plan(
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                )
+            else:
+                with get_cpu_offload_context(args):
+                    output_tensor = model(
+                        tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                    )
 
         return output_tensor, partial(loss_fn, loss_mask, model=model)
 

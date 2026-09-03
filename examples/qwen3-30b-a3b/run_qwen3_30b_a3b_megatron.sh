@@ -52,6 +52,9 @@ OVERLAP_ARGS=()
 if [ "${MEGATRON_OVERLAP:-1}" = "1" ]; then
     OVERLAP_ARGS=(--overlap-grad-reduce --overlap-param-gather)
 fi
+if [ "${OVERLAP_MOE_EP_COMM:-1}" = "1" ]; then
+    OVERLAP_ARGS+=(--overlap-moe-expert-parallel-comm)
+fi
 
 mkdir -p "$(dirname "${DATA_PATH}")" "${RESULTS_DIR}"
 REQUIRED_DOCUMENTS=$((GBS * (TRAIN_STEPS + 4)))
