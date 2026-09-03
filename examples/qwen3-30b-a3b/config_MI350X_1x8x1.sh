@@ -20,7 +20,10 @@ TRAIN_STEPS=${TRAIN_STEPS:-20}
 LR_WARMUP_ITERS=${LR_WARMUP_ITERS:-2}
 LR=${LR:-1e-5}
 MIN_LR=${MIN_LR:-0}
-LUMEN_ATTN_BACKEND=${LUMEN_ATTN_BACKEND:-triton}
+# CK/csrc FlashAttention (fmha_v3) replaces both fwd and bwd vs Triton on
+# the real Qwen3-30B-A3B shape (B=1,S=4096,Hq=32,Hkv=4,D=128 BF16 causal):
+#   fwd ~6x, bwd ~4.7x. Override with LUMEN_ATTN_BACKEND=triton to restore.
+LUMEN_ATTN_BACKEND=${LUMEN_ATTN_BACKEND:-csrc}
 
 TOKENIZER_PATH=${TOKENIZER_PATH:-/workspace/Lumen/examples/qwen3/tokenizer}
 DATA_PATH=${DATA_PATH:-/workspace/Lumen/examples/qwen3-30b-a3b/data/mock_train.jsonl}
