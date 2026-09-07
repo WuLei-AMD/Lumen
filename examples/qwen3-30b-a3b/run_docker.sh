@@ -7,7 +7,21 @@ IMAGE_NAME=${IMAGE_NAME:-zhangdanyangamd/lumen:qwen3-30b-a3b-350x-pretrain260829
 COMMAND=${COMMAND:-"bash run_qwen3_30b_a3b_megatron.sh"}
 HOST_ASSET_ROOT=${HOST_ASSET_ROOT:-/dev/shm/qwen3-30b-a3b}
 
+NCCL_ENV_ARGS=()
+for _v in \
+    NCCL_MIN_P2P_NCHANNELS NCCL_MIN_CTAS NCCL_NCHANNELS_PER_NET_PEER \
+    NCCL_NVLS_ENABLE NCCL_DEBUG NCCL_PROTO NCCL_ALGO \
+    NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS NCCL_P2P_NET_CHUNKSIZE \
+    NCCL_BUFFSIZE NCCL_IB_DISABLE NCCL_SOCKET_IFNAME \
+    RCCL_MSCCL_ENABLE TORCH_NCCL_AVOID_RECORD_STREAMS
+do
+    if [ -n "${!_v:-}" ]; then
+        NCCL_ENV_ARGS+=(--env "${_v}=${!_v}")
+    fi
+done
+
 docker run --rm --init \
+    "${NCCL_ENV_ARGS[@]}" \
     --device=/dev/kfd \
     --device=/dev/dri \
     --group-add video \
@@ -74,6 +88,12 @@ docker run --rm --init \
     --env MEGATRON_OVERLAP="${MEGATRON_OVERLAP:-1}" \
     --env OVERLAP_MOE_EP_COMM="${OVERLAP_MOE_EP_COMM:-1}" \
     --env CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-8}" \
+    --env MOE_PAD_TO_CAPACITY="${MOE_PAD_TO_CAPACITY:-0}" \
+    --env MOE_EXPERT_CAPACITY_FACTOR="${MOE_EXPERT_CAPACITY_FACTOR:-1.0}" \
+    --env GRAD_ACC_FUSION="${GRAD_ACC_FUSION:-0}" \
+    --env CUDA_GRAPH_IMPL="${CUDA_GRAPH_IMPL:-transformer_engine}" \
+    --env CUDA_GRAPH_SCOPE="${CUDA_GRAPH_SCOPE:-attn}" \
+    --env CUDA_GRAPH_WARMUP_STEPS="${CUDA_GRAPH_WARMUP_STEPS:-}" \
     --env QWEN_PARITY_DUMP_DIR="${QWEN_PARITY_DUMP_DIR:-}" \
     --env QWEN_PARITY_LOG_LOCAL_LOSS="${QWEN_PARITY_LOG_LOCAL_LOSS:-0}" \
     --env LUMEN_PROFILE_OUTPUT="${LUMEN_PROFILE_OUTPUT:-}" \

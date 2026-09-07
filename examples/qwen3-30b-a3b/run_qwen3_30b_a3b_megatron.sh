@@ -56,6 +56,32 @@ if [ "${OVERLAP_MOE_EP_COMM:-1}" = "1" ]; then
     OVERLAP_ARGS+=(--overlap-moe-expert-parallel-comm)
 fi
 
+PAD_ARGS=()
+if [ "${MOE_PAD_TO_CAPACITY:-0}" = "1" ]; then
+    PAD_ARGS=(
+        --moe-pad-expert-input-to-capacity
+        --moe-expert-capacity-factor "${MOE_EXPERT_CAPACITY_FACTOR:-1.0}"
+    )
+fi
+
+GRAD_ACC_ARGS=()
+if [ "${GRAD_ACC_FUSION:-0}" != "1" ]; then
+    GRAD_ACC_ARGS=(--no-gradient-accumulation-fusion)
+fi
+
+CUDA_GRAPH_IMPL="${CUDA_GRAPH_IMPL:-transformer_engine}"
+CUDA_GRAPH_SCOPE="${CUDA_GRAPH_SCOPE:-attn}"
+CUDA_GRAPH_ARGS=()
+if [ "${CUDA_GRAPH_SCOPE}" != "none" ]; then
+    CUDA_GRAPH_ARGS=(
+        --cuda-graph-impl "${CUDA_GRAPH_IMPL}"
+        --cuda-graph-scope ${CUDA_GRAPH_SCOPE}
+    )
+    if [ -n "${CUDA_GRAPH_WARMUP_STEPS:-}" ]; then
+        CUDA_GRAPH_ARGS+=(--cuda-graph-warmup-steps "${CUDA_GRAPH_WARMUP_STEPS}")
+    fi
+fi
+
 mkdir -p "$(dirname "${DATA_PATH}")" "${RESULTS_DIR}"
 REQUIRED_DOCUMENTS=$((GBS * (TRAIN_STEPS + 4)))
 if [ "${REQUIRED_DOCUMENTS}" -lt 128 ]; then
@@ -89,7 +115,7 @@ RUN_SUFFIX=${RUN_SUFFIX:-}
 RUN_NAME="qwen3-30b-a3b-${MOE_IMPL}${RUN_SUFFIX:+-${RUN_SUFFIX}}-seq${SEQ_LEN}-mbs${MBS}-gbs${GBS}"
 LOG_FILE="${RESULTS_DIR}/${RUN_NAME}.log"
 
-echo "Qwen3-30B-A3B: MOE_IMPL=${MOE_IMPL}, TP=${TP}, EP=${EP}, seq=${SEQ_LEN}"
+echo "Qwen3-30B-A3B: MOE_IMPL=${MOE_IMPL}, TP=${TP}, EP=${EP}, seq=${SEQ_LEN}, pad=${MOE_PAD_TO_CAPACITY:-0}, grad_acc_fusion=${GRAD_ACC_FUSION:-0}, cuda_graph_scope=${CUDA_GRAPH_SCOPE:-}"
 
 torchrun \
     --nproc_per_node="${NGPU}" \
@@ -128,6 +154,7 @@ torchrun \
     --moe-aux-loss-coeff "${AUX_LOSS_COEFF:-1e-3}" \
     --moe-token-dispatcher-type alltoall \
     --moe-permute-fusion \
+    "${PAD_ARGS[@]}" \
     --expert-model-parallel-size "${EP}" \
     --expert-tensor-parallel-size "${ETP}" \
     ${MOE_ARGS} \
@@ -147,9 +174,10 @@ torchrun \
     --adam-beta2 0.95 \
     --adam-eps 1e-8 \
     --bf16 \
-    --no-gradient-accumulation-fusion \
+    "${GRAD_ACC_ARGS[@]}" \
     --use-distributed-optimizer \
     "${OVERLAP_ARGS[@]}" \
+    "${CUDA_GRAPH_ARGS[@]}" \
     --attention-dropout 0.0 \
     --hidden-dropout 0.0 \
     --no-masked-softmax-fusion \

@@ -1,12 +1,75 @@
 # Qwen3-30B-A3B Megatron + SonicMoE
 
-This example runs the Qwen3-30B-A3B architecture with Megatron on one
-8×MI350X node. It supports three interchangeable expert implementations:
+This example runs Qwen3-30B-A3B on one 8×MI350X node (TP=1, PP=1, CP=1, EP=8).
+Expert implementations:
 
 - `sequential`: Megatron `SequentialMLP`
 - `te_grouped`: Transformer Engine `TEGroupedMLP`
-- `sonic`: AITER pure-Triton SonicMoE, installed through
-  `LumenConfig.enable(model)`
+- `sonic`: AITER SonicMoE (replaces `MoELayer.experts` only)
+
+## Fastest Megatron SonicMoE recipe (default)
+
+These knobs are the script defaults. Set `MOE_IMPL=sonic` and, for the
+reported numbers, `MBS=2 GBS=256` with a real checkpoint and FineWeb.
+
+| Knob | Default | What it does |
+|---|---|---|
+| `LUMEN_ATTN_BACKEND` | `csrc` | AITER CK `fmha_v3` |
+| `SONIC_MOE_GROUPED_GEMM_BACKEND` | `triton` | Triton grouped GEMM |
+| `SONIC_MOE_USE_QWEN3_TUNED_GEMM` | `1` | Qwen3-tuned Triton configs |
+| `OVERLAP_MOE_EP_COMM` | `1` | Combined 1F1B EP all-to-all overlap |
+| `CUDA_DEVICE_MAX_CONNECTIONS` | `8` | Extra HIP queues for overlap |
+| `CUDA_GRAPH_IMPL` | `transformer_engine` | Megatron TE `make_graphed_callables` |
+| `CUDA_GRAPH_SCOPE` | `attn` | Graph `_forward_attention` only (not MoE/A2A) |
+| `MOE_PAD_TO_CAPACITY` | `0` | Leave off; drop-and-pad changes loss |
+| `GRAD_ACC_FUSION` | `0` | Leave off; small-batch gain was ~2.6% |
+
+Disable graphs with `CUDA_GRAPH_SCOPE=none`. Restore Triton attention with
+`LUMEN_ATTN_BACKEND=triton`.
+
+`run_docker.sh` does **not** forward arbitrary host env into the training
+process. Anything the Python job must see (`LUMEN_ATTN_BACKEND`,
+`SONIC_MOE_*`, `CUDA_GRAPH_*`, `QWEN_E2E_PROFILE_*`, …) has to be listed
+in `run_docker.sh --env` (already true for the table above) **or**
+`export`ed again inside `COMMAND`.
+
+### Production e2e (real weights + FineWeb)
+
+Image: `zhangdanyangamd/lumen:qwen3-30b-a3b-350x-pretrain260829-multistream`.
+BF16, seq=4096, 20 steps, median of steps 11–20. Loss matches the
+pre-graph recipe (step 20 lm loss 2.3846 vs 2.3847).
+
+| Config | Step (median) | Throughput | TFLOP/s/GPU | mem usages |
+|---|---|---|---|---|
+| Triton attn + multistream GEMM (no overlap extras) | 24.71 s | 10.36 samples/s | 122.0 | 0.609 |
+| 4 opts (CK + Triton GEMM + EP overlap + CONN=8) | 17.47 s | 14.66 samples/s | 172.7 | 0.710 |
+| **4 opts + attn CUDA Graph (current default)** | **12.72 s** | **20.13 samples/s** | **237.2** | 0.692 |
+
+```bash
+cd /home/leiwu/Lumen   # or your clone
+
+HOST_ASSET_ROOT=/dev/shm/qwen3-30b-a3b \
+MODEL_PATH=/nobackup/model/Qwen3-30B-A3B \
+DATA_PATH=/nobackup/data/fineweb-sample-10BT-26624.jsonl \
+MEGATRON_LOAD_PATH=/nobackup/checkpoints/Qwen3-30B-A3B-tp1-pp1-ep8 \
+MOE_IMPL=sonic \
+RUN_SUFFIX=mbs2-gbs256-best \
+TRAIN_STEPS=20 SEQ_LEN=4096 MBS=2 GBS=256 \
+COMMAND='export TOKENIZER_PATH=/nobackup/model/Qwen3-30B-A3B
+bash run_qwen3_30b_a3b_megatron.sh' \
+bash examples/qwen3-30b-a3b/run_docker.sh
+```
+
+Host paths under `HOST_ASSET_ROOT` are mounted at `/nobackup` in the
+container. Attribution, profiles, and A/B notes:
+`docs/qwen3-30b-a3b-perf-optimization.md`.
+
+### Smoke (mock data, default MBS=1 GBS=8)
+
+```bash
+MOE_IMPL=sonic TRAIN_STEPS=5 SEQ_LEN=1024 \
+  bash examples/qwen3-30b-a3b/run_docker.sh
+```
 
 ## Build
 
@@ -19,23 +82,14 @@ The image is built from the official ROCm 7.2 PyTorch base. Transformer Engine
 `v2.10_rocm`, ROCm Megatron-LM, the SonicMoE AITER revision, and Lumen are all
 built from source; it does not inherit Miles or Primus.
 
-The Lumen AITER submodule must point to the SonicMoE-enabled
-`lumen/qwen3-30b-a3b` revision.
-
-To reproduce the measured MI350X experiments without rebuilding the image,
-use the published Docker Hub tag:
+To reproduce without rebuilding:
 
 ```bash
-docker pull zhangdanyangamd/lumen:qwen3-30b-a3b-350x-pretrain260828
+docker pull zhangdanyangamd/lumen:qwen3-30b-a3b-350x-pretrain260829-multistream
 
-IMAGE_NAME=zhangdanyangamd/lumen:qwen3-30b-a3b-350x-pretrain260828 \
-  bash examples/qwen3-30b-a3b/run_docker.sh
+IMAGE_NAME=zhangdanyangamd/lumen:qwen3-30b-a3b-350x-pretrain260829-multistream \
+  MOE_IMPL=sonic bash examples/qwen3-30b-a3b/run_docker.sh
 ```
-
-The published image digest is
-`sha256:ef5c8632b852f3a04ebc3a9d600e6ef2dc66d4d39e78be41ae97b347ddc6bfd3`.
-Set the same `IMAGE_NAME` for benchmark commands that invoke
-`run_docker.sh`, or set `IMAGE` when using `run_qwen3_30b_a3b_fsdp.sh`.
 
 ## SequentialMLP versus TEGroupedMLP
 
@@ -47,22 +101,6 @@ COMMAND="bash benchmark_mlp.sh" \
 The default benchmark runs 20 iterations at sequence length 4096 and writes
 per-run logs plus `results/mlp_summary.csv`. Override `TRAIN_STEPS`, `SEQ_LEN`,
 `MBS`, and `GBS` through the environment.
-
-## SonicMoE e2e training
-
-First run a short smoke:
-
-```bash
-MOE_IMPL=sonic TRAIN_STEPS=5 SEQ_LEN=1024 \
-  bash examples/qwen3-30b-a3b/run_docker.sh
-```
-
-Then run the same workload as the baselines:
-
-```bash
-MOE_IMPL=sonic TRAIN_STEPS=20 SEQ_LEN=4096 \
-  bash examples/qwen3-30b-a3b/run_docker.sh
-```
 
 ## Kernel-level Qwen shape
 
@@ -81,24 +119,6 @@ SonicMoE tuning data is stored under
 `third_party/aiter/aiter/ops/triton/configs/moe/`. Tune against the kernel
 benchmark first, then verify gains with the e2e `sonic` run because routing,
 all-to-all, and weight-gradient costs are not represented by GEMM-only timing.
-
-## MI350X reference results
-
-The following BF16 results were measured on one 8×MI350X node with TP=1,
-EP=8, MBS=1, GBS=8, and gradient-accumulation fusion disabled:
-
-- Sequence 256: SequentialMLP 608 ms/step; TEGroupedMLP 616 ms/step.
-- Sequence 4096: SequentialMLP 1198 ms/step; TEGroupedMLP 2109 ms/step.
-- SonicMoE kernel at T=32768: forward 0.77 ms, backward 3.70 ms,
-  4.46 ms total (277 TFLOPS).
-- SonicMoE e2e at sequence 4096 (steps 4–12): 2614 ms median,
-  1641 ms best. The expert-major storage fix improved the previous
-  post-JIT median by about 2.6×, but the result remains variable and slower
-  than SequentialMLP.
-
-SonicMoE tuning removes host synchronization from grouped-GEMM grid
-calculation and preserves expert-major physical weight layout. E2E profiling
-should focus next on integration/optimizer scheduling rather than GEMM tiles.
 
 ## Transformers + FSDP2
 
@@ -161,6 +181,6 @@ limit with activation checkpointing disabled. MBS 4 is the largest divisor of
 GBS 256 that completed the one-step memory probe.
 
 `run_docker.sh` defaults to
-`zhangdanyangamd/lumen:qwen3-30b-a3b-350x-pretrain260828` and overlays the
-local FSDP implementation while preserving the image's bundled SonicMoE AITER
-sources.
+`zhangdanyangamd/lumen:qwen3-30b-a3b-350x-pretrain260829-multistream` and
+overlays the local FSDP implementation while preserving the image's bundled
+SonicMoE AITER sources.
