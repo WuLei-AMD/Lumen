@@ -13,9 +13,10 @@ Model-specific code (batch construction, dataset providers, model-specific CLI
 arguments) remains in the per-model subpackages.
 """
 
+import inspect
 import logging
 import os
-from functools import partial
+from functools import partial, wraps
 from typing import Callable, Optional
 
 import torch
@@ -1450,6 +1451,151 @@ def install_hip_graphs_hook() -> None:
     _mt_training.setup_model_and_optimizer = _setup_with_hip_graphs
 
 
+def _install_graph_safe_rng_hook() -> None:
+    """Give the Lumen-native graph path a capture-safe RNG tracker.
+
+    Megatron only turns on ``te_rng_tracker``/``use_cudagraphable_rng`` when
+    ``cuda_graph_impl != none`` (``arguments.py``), which the native path
+    deliberately leaves at ``none``. Without the graph-safe tracker the philox
+    offset is baked in at capture time, so every replay of a captured attention
+    graph reuses one dropout mask and the global offset never advances.
+
+    ``_set_random_seed`` runs inside ``initialize_megatron``, well before the
+    ``setup_model_and_optimizer`` wrapper, so it has to be patched separately.
+    """
+    import megatron.training.initialize as _mt_initialize
+
+    current = _mt_initialize._set_random_seed
+    if getattr(current, "_lumen_graph_safe_rng_hook", False):
+        return
+
+    signature = inspect.signature(current)
+
+    @wraps(current)
+    def _set_random_seed_graph_safe(*args, **kwargs):
+        if getattr(get_args(), "lumen_attention_graphs", False):
+            bound = signature.bind(*args, **kwargs)
+            bound.arguments["te_rng_tracker"] = True
+            bound.arguments["use_cudagraphable_rng"] = True
+            print_rank_0(
+                "> Lumen attention graphs: enabling graph-safe RNG tracker "
+                "(te_rng_tracker, use_cudagraphable_rng)"
+            )
+            return current(*bound.args, **bound.kwargs)
+        return current(*args, **kwargs)
+
+    _set_random_seed_graph_safe._lumen_graph_safe_rng_hook = True
+    _mt_initialize._set_random_seed = _set_random_seed_graph_safe
+
+
+def install_attention_graphs_hook() -> None:
+    """Install the opt-in Lumen-native attention-only graph path.
+
+    The wrapper is attached after model/optimizer construction and captures
+    ``TransformerLayer._forward_attention`` lazily after eager warmup. The MoE
+    and EP communication path remains eager. This path is mutually exclusive
+    with Megatron's TE CUDA graphs and the older full-layer
+    ``--lumen-hip-graphs`` implementation.
+    """
+    import megatron.training.training as _mt_training
+
+    _install_graph_safe_rng_hook()
+
+    current_setup = _mt_training.setup_model_and_optimizer
+    if getattr(current_setup, "_lumen_attention_graphs_hook", False):
+        return
+
+    def _setup_with_attention_graphs(*args, **kwargs):
+        model, optimizer, scheduler = current_setup(*args, **kwargs)
+        train_args = get_args()
+
+        if not getattr(train_args, "lumen_attention_graphs", False):
+            return model, optimizer, scheduler
+        if getattr(train_args, "lumen_hip_graphs", False):
+            raise ValueError(
+                "--lumen-attention-graphs and --lumen-hip-graphs cannot be enabled together"
+            )
+        if getattr(train_args, "cuda_graph_impl", "none") == "transformer_engine":
+            raise ValueError(
+                "--lumen-attention-graphs is mutually exclusive with "
+                "--cuda-graph-impl=transformer_engine; disable the TE graph path"
+            )
+        if not model:
+            return model, optimizer, scheduler
+
+        from lumen.utils.hip_graphs import install_attention_graph_capture
+
+        num_warmup = max(
+            int(getattr(train_args, "lumen_attention_graph_warmup_steps", 3)), 1
+        )
+        recompute_num = 0
+        if (
+            getattr(train_args, "recompute_granularity", None) == "full"
+            and getattr(train_args, "recompute_method", None) == "block"
+        ):
+            recompute_num = getattr(train_args, "recompute_num_layers", 0)
+
+        max_layers = int(
+            getattr(train_args, "lumen_attention_graph_max_layers", 0)
+        )
+        max_microbatches = int(
+            getattr(train_args, "lumen_attention_graph_max_microbatches", 0)
+        )
+        targets = model if isinstance(model, list) else [model]
+        for target in targets:
+            hook_owner = target
+            make_forward_pre_hook = None
+            while hook_owner is not None:
+                make_forward_pre_hook = getattr(
+                    hook_owner, "_make_forward_pre_hook", None
+                )
+                if make_forward_pre_hook is not None:
+                    break
+                hook_owner = getattr(hook_owner, "module", None)
+
+            unwrapped = target
+            while hasattr(unwrapped, "module"):
+                unwrapped = unwrapped.module
+            count = install_attention_graph_capture(
+                unwrapped,
+                num_warmup=num_warmup,
+                skip_recomputed_layers=recompute_num,
+                max_graphed_layers=max_layers,
+                max_microbatches=max_microbatches,
+                make_forward_pre_hook=make_forward_pre_hook,
+            )
+            if count:
+                print_rank_0(
+                    f"> Lumen attention graphs: wrapped {count} layers "
+                    f"(capture after {num_warmup} calls per microbatch)"
+                )
+
+        return model, optimizer, scheduler
+
+    _setup_with_attention_graphs._lumen_attention_graphs_hook = True
+    _mt_training.setup_model_and_optimizer = _setup_with_attention_graphs
+
+    current_train_step = _mt_training.train_step
+    if not getattr(current_train_step, "_lumen_attention_graph_capture_boundary", False):
+
+        @wraps(current_train_step)
+        def _train_step_with_attention_graph_capture(*args, **kwargs):
+            result = current_train_step(*args, **kwargs)
+            if getattr(get_args(), "lumen_attention_graphs", False):
+                from lumen.utils.hip_graphs import capture_pending_attention_graphs
+
+                count = capture_pending_attention_graphs()
+                if count:
+                    print_rank_0(
+                        f"> Lumen attention graphs: captured {count} "
+                        "forward/backward graph pairs this step"
+                    )
+            return result
+
+        _train_step_with_attention_graph_capture._lumen_attention_graph_capture_boundary = True
+        _mt_training.train_step = _train_step_with_attention_graph_capture
+
+
 
 def _patch_meta_materializer() -> None:
     """Replace to_empty_if_meta_device with a version that materializes
@@ -2257,6 +2403,37 @@ def add_common_megatron_args(parser):
         action="store_true",
         default=False,
         help="Graph-capture training steps to reduce kernel launch overhead.",
+    )
+    safe_add_argument(
+        lumen,
+        "--lumen-attention-graphs",
+        action="store_true",
+        default=False,
+        help=(
+            "Use Lumen-native forward/backward HIP graphs for each transformer "
+            "layer's attention half; MoE/MLP remains eager."
+        ),
+    )
+    safe_add_argument(
+        lumen,
+        "--lumen-attention-graph-warmup-steps",
+        type=int,
+        default=3,
+        help="Eager calls per layer and microbatch before attention graph capture.",
+    )
+    safe_add_argument(
+        lumen,
+        "--lumen-attention-graph-max-layers",
+        type=int,
+        default=0,
+        help="Maximum attention layers to graph (0 means all eligible layers).",
+    )
+    safe_add_argument(
+        lumen,
+        "--lumen-attention-graph-max-microbatches",
+        type=int,
+        default=0,
+        help="Maximum microbatch indices to graph (0 means all observed indices).",
     )
     safe_add_argument(
         lumen,

@@ -37,6 +37,7 @@ docker run --rm --init \
     --volume "${REPO_ROOT}/lumen/models/qwen3_30b_a3b/fsdp:/workspace/Lumen/lumen/models/qwen3_30b_a3b/fsdp" \
     --volume "${REPO_ROOT}/lumen/config.py:/workspace/Lumen/lumen/config.py" \
     --volume "${REPO_ROOT}/lumen/modules/sonic_moe.py:/workspace/Lumen/lumen/modules/sonic_moe.py" \
+    --volume "${REPO_ROOT}/lumen/utils/hip_graphs.py:/workspace/Lumen/lumen/utils/hip_graphs.py" \
     --volume "${REPO_ROOT}/lumen/ops/moe/__init__.py:/workspace/Lumen/lumen/ops/moe/__init__.py" \
     --volume "${REPO_ROOT}/lumen/ops/moe/dispatch_layout.py:/workspace/Lumen/lumen/ops/moe/dispatch_layout.py" \
     --volume "${REPO_ROOT}/lumen/ops/moe/dispatch_overlap.py:/workspace/Lumen/lumen/ops/moe/dispatch_overlap.py" \
@@ -94,6 +95,19 @@ docker run --rm --init \
     --env CUDA_GRAPH_IMPL="${CUDA_GRAPH_IMPL:-transformer_engine}" \
     --env CUDA_GRAPH_SCOPE="${CUDA_GRAPH_SCOPE:-attn}" \
     --env CUDA_GRAPH_WARMUP_STEPS="${CUDA_GRAPH_WARMUP_STEPS:-}" \
+    --env LUMEN_ATTN_GRAPHS="${LUMEN_ATTN_GRAPHS:-0}" \
+    --env LUMEN_ATTN_GRAPH_WARMUP_STEPS="${LUMEN_ATTN_GRAPH_WARMUP_STEPS:-3}" \
+    --env LUMEN_ATTN_GRAPH_MAX_LAYERS="${LUMEN_ATTN_GRAPH_MAX_LAYERS:-0}" \
+    --env LUMEN_ATTN_GRAPH_MAX_MICROBATCHES="${LUMEN_ATTN_GRAPH_MAX_MICROBATCHES:-0}" \
+    --env LUMEN_ATTN_GRAPH_CAPTURES_PER_STEP="${LUMEN_ATTN_GRAPH_CAPTURES_PER_STEP:-0}" \
+    --env LUMEN_ATTN_GRAPH_PER_MICROBATCH="${LUMEN_ATTN_GRAPH_PER_MICROBATCH:-1}" \
+    --env LUMEN_ATTN_GRAPH_SHARE_ROPE="${LUMEN_ATTN_GRAPH_SHARE_ROPE:-1}" \
+    --env LUMEN_ATTN_GRAPH_PROFILE="${LUMEN_ATTN_GRAPH_PROFILE:-0}" \
+    --env LUMEN_ATTN_GRAPH_CHECK_NUMERICS="${LUMEN_ATTN_GRAPH_CHECK_NUMERICS:-0}" \
+    --env QWEN_E2E_PROFILE_STEP="${QWEN_E2E_PROFILE_STEP:-}" \
+    --env QWEN_E2E_PROFILE_STEPS="${QWEN_E2E_PROFILE_STEPS:-1}" \
+    --env QWEN_E2E_PROFILE_DIR="${QWEN_E2E_PROFILE_DIR:-}" \
+    --env QWEN_E2E_PROFILE_TRACE="${QWEN_E2E_PROFILE_TRACE:-0}" \
     --env QWEN_PARITY_DUMP_DIR="${QWEN_PARITY_DUMP_DIR:-}" \
     --env QWEN_PARITY_LOG_LOCAL_LOSS="${QWEN_PARITY_LOG_LOCAL_LOSS:-0}" \
     --env LUMEN_PROFILE_OUTPUT="${LUMEN_PROFILE_OUTPUT:-}" \

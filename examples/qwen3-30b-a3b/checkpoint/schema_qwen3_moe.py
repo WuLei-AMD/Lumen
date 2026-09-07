@@ -5,7 +5,8 @@ from schema_base import ModelSchema
 
 def get_qwen3_moe_schema(num_local_experts: int) -> ModelSchema:
     layer = {
-        "self_attn_norm_weight": "input_layernorm.weight",
+        # TE fused RMSNorm into QKV; input_layernorm is IdentityOp.
+        "self_attn_norm_weight": "self_attention.linear_qkv.layer_norm_weight",
         "self_attn_qkv_weight": "self_attention.linear_qkv.weight",
         "self_attn_proj_weight": "self_attention.linear_proj.weight",
         "q_norm_weight": "self_attention.q_layernorm.weight",

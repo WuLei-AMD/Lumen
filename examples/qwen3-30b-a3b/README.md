@@ -27,6 +27,22 @@ reported numbers, `MBS=2 GBS=256` with a real checkpoint and FineWeb.
 Disable graphs with `CUDA_GRAPH_SCOPE=none`. Restore Triton attention with
 `LUMEN_ATTN_BACKEND=triton`.
 
+An experimental Lumen-native attention graph implementation is available for
+A/B testing. It captures forward and backward graphs for `_forward_attention`
+while keeping SonicMoE and EP all-to-all eager:
+
+```bash
+LUMEN_ATTN_GRAPHS=1 \
+LUMEN_ATTN_GRAPH_MAX_LAYERS=1 \
+MOE_IMPL=sonic TRAIN_STEPS=10 SEQ_LEN=4096 MBS=1 GBS=16 \
+  bash examples/qwen3-30b-a3b/run_docker.sh
+```
+
+Start with one layer, validate loss, then set
+`LUMEN_ATTN_GRAPH_MAX_LAYERS=0` for all eligible layers. Enabling
+`LUMEN_ATTN_GRAPHS=1` suppresses the TE graph CLI flags; the measured production
+default remains the TE implementation until the Lumen path reaches parity.
+
 `run_docker.sh` does **not** forward arbitrary host env into the training
 process. Anything the Python job must see (`LUMEN_ATTN_BACKEND`,
 `SONIC_MOE_*`, `CUDA_GRAPH_*`, `QWEN_E2E_PROFILE_*`, …) has to be listed

@@ -924,6 +924,30 @@ class TestAddCommonMegatronArgs:
         args = self._parse()
         assert args.lumen_cross_entropy is False
 
+    def test_lumen_attention_graph_defaults(self):
+        args = self._parse()
+        assert args.lumen_attention_graphs is False
+        assert args.lumen_attention_graph_warmup_steps == 3
+        assert args.lumen_attention_graph_max_layers == 0
+        assert args.lumen_attention_graph_max_microbatches == 0
+
+    def test_lumen_attention_graph_options(self):
+        args = self._parse(
+            [
+                "--lumen-attention-graphs",
+                "--lumen-attention-graph-warmup-steps",
+                "5",
+                "--lumen-attention-graph-max-layers",
+                "2",
+                "--lumen-attention-graph-max-microbatches",
+                "4",
+            ]
+        )
+        assert args.lumen_attention_graphs is True
+        assert args.lumen_attention_graph_warmup_steps == 5
+        assert args.lumen_attention_graph_max_layers == 2
+        assert args.lumen_attention_graph_max_microbatches == 4
+
     def test_mxfp8_block_defaults(self):
         args = self._parse()
         assert args.mxfp8_block_m_fwd == 128

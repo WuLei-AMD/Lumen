@@ -8,6 +8,7 @@ from megatron.core.enums import ModelType
 from megatron.training import pretrain
 
 from lumen.models.megatron import (
+    install_attention_graphs_hook,
     install_fp8_param_gather_hook,
     make_lumen_model_provider,
 )
@@ -27,13 +28,14 @@ model_provider = make_lumen_model_provider(
     fp8_applier=apply_fp8_training,
 )
 install_fp8_param_gather_hook()
+install_attention_graphs_hook()
 train_valid_test_datasets_provider.is_distributed = True
 
 
 def _install_e2e_profiler() -> None:
     """Profile one or more complete Megatron train steps."""
     target_raw = os.environ.get("QWEN_E2E_PROFILE_STEP")
-    if target_raw is None:
+    if not target_raw:
         return
 
     import torch

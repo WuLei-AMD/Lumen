@@ -72,7 +72,15 @@ fi
 CUDA_GRAPH_IMPL="${CUDA_GRAPH_IMPL:-transformer_engine}"
 CUDA_GRAPH_SCOPE="${CUDA_GRAPH_SCOPE:-attn}"
 CUDA_GRAPH_ARGS=()
-if [ "${CUDA_GRAPH_SCOPE}" != "none" ]; then
+LUMEN_ATTN_GRAPH_ARGS=()
+if [ "${LUMEN_ATTN_GRAPHS:-0}" = "1" ]; then
+    LUMEN_ATTN_GRAPH_ARGS=(
+        --lumen-attention-graphs
+        --lumen-attention-graph-warmup-steps "${LUMEN_ATTN_GRAPH_WARMUP_STEPS:-3}"
+        --lumen-attention-graph-max-layers "${LUMEN_ATTN_GRAPH_MAX_LAYERS:-0}"
+        --lumen-attention-graph-max-microbatches "${LUMEN_ATTN_GRAPH_MAX_MICROBATCHES:-0}"
+    )
+elif [ "${CUDA_GRAPH_SCOPE}" != "none" ]; then
     CUDA_GRAPH_ARGS=(
         --cuda-graph-impl "${CUDA_GRAPH_IMPL}"
         --cuda-graph-scope ${CUDA_GRAPH_SCOPE}
@@ -115,7 +123,7 @@ RUN_SUFFIX=${RUN_SUFFIX:-}
 RUN_NAME="qwen3-30b-a3b-${MOE_IMPL}${RUN_SUFFIX:+-${RUN_SUFFIX}}-seq${SEQ_LEN}-mbs${MBS}-gbs${GBS}"
 LOG_FILE="${RESULTS_DIR}/${RUN_NAME}.log"
 
-echo "Qwen3-30B-A3B: MOE_IMPL=${MOE_IMPL}, TP=${TP}, EP=${EP}, seq=${SEQ_LEN}, pad=${MOE_PAD_TO_CAPACITY:-0}, grad_acc_fusion=${GRAD_ACC_FUSION:-0}, cuda_graph_scope=${CUDA_GRAPH_SCOPE:-}"
+echo "Qwen3-30B-A3B: MOE_IMPL=${MOE_IMPL}, TP=${TP}, EP=${EP}, seq=${SEQ_LEN}, pad=${MOE_PAD_TO_CAPACITY:-0}, grad_acc_fusion=${GRAD_ACC_FUSION:-0}, cuda_graph_scope=${CUDA_GRAPH_SCOPE:-}, lumen_attn_graphs=${LUMEN_ATTN_GRAPHS:-0}"
 
 torchrun \
     --nproc_per_node="${NGPU}" \
@@ -178,6 +186,7 @@ torchrun \
     --use-distributed-optimizer \
     "${OVERLAP_ARGS[@]}" \
     "${CUDA_GRAPH_ARGS[@]}" \
+    "${LUMEN_ATTN_GRAPH_ARGS[@]}" \
     --attention-dropout 0.0 \
     --hidden-dropout 0.0 \
     --no-masked-softmax-fusion \
