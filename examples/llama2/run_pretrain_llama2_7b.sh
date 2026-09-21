@@ -7,7 +7,8 @@
 #   PRECISION=fp8  bash run_pretrain_llama2_7b.sh   # default
 #
 # All paths are relative to this script; no absolute/user-specific paths.
-# Override any of IMAGE / MBS / GBS / SEQ_LEN / TRAIN_STEPS / SEED via env.
+# Override any of IMAGE / MBS / GBS / SEQ_LEN / TRAIN_STEPS / SEED / ATTN_BACKEND via env.
+# ATTN_BACKEND selects --lumen-attn-backend (csrc, opus, asm, triton, auto).
 ###############################################################################
 set -euo pipefail
 
@@ -25,6 +26,7 @@ MBS="${MBS:-4}"
 GBS="${GBS:-256}"
 SEQ_LEN="${SEQ_LEN:-4096}"
 TRAIN_STEPS="${TRAIN_STEPS:-50}"
+ATTN_BACKEND="${ATTN_BACKEND:-csrc}"
 SEED="${SEED:-1234}"
 
 mkdir -p "${RESULTS_DIR}"
@@ -52,6 +54,7 @@ fi
 FP8_ARGS=()
 if [ "${PRECISION}" = "fp8" ]; then
     FP8_ARGS=(
+        --lumen-linear
         --linear-fp8
         --fp8-format hybrid
         --linear-fp8-scaling delayed
@@ -89,11 +92,12 @@ docker run --rm --init \
     -e LUMEN_PREFER_HIPBLASLT=1 \
     -e LUMEN_FUSED_SWIGLU=1 \
     -e LUMEN_FUSED_RESIDUAL_NORM=1 \
-    -e LUMEN_FUSED_RES_BWD=1 \
+    -e LUMEN_FUSED_RES_BWD="${LUMEN_FUSED_RES_BWD:-0}" \
     -e LUMEN_SKIP_BACKEND_SYNC=1 \
     "${FP8_ENV[@]}" \
     -e MBS="${MBS}" -e GBS="${GBS}" -e SEQ_LEN="${SEQ_LEN}" \
     -e TRAIN_STEPS="${TRAIN_STEPS}" -e SEED="${SEED}" \
+    -e ATTN_BACKEND="${ATTN_BACKEND}" \
     "${IMAGE}" \
     bash -c '
 set -euo pipefail
@@ -177,7 +181,7 @@ torchrun --nproc_per_node=8 --nnodes=1 pretrain_llama31.py \
     --eval-interval "${TRAIN_STEPS}" \
     --save-interval 1000000 \
     --log-interval 1 \
-    --lumen-attn-backend csrc \
+    --lumen-attn-backend "${ATTN_BACKEND}" \
     '"${FP8_ARGS[*]}"' \
     2>&1 | tee "/results/lumen_llama2_7b_'"${PRECISION}"'.log"
 '

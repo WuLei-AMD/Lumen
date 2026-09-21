@@ -86,6 +86,8 @@ _BACKEND_MAP = {
     "triton": ("aiter_triton", "aiter_triton_fp8"),
     "csrc": ("aiter_csrc", "aiter_csrc_fp8"),
     "asm": ("aiter_csrc", "aiter_asm_fp8"),
+    # OPUS only has a BF16 forward kernel; FP8 attention keeps the csrc recipe.
+    "opus": ("aiter_opus", "aiter_csrc_fp8"),
 }
 
 
@@ -93,7 +95,7 @@ def resolve_attn_backend(backend: str, fp8_attn: str) -> str:
     """Derive the concrete ``aiter_*`` backend string from user-facing flags.
 
     Args:
-        backend: One of ``auto``, ``triton``, ``csrc``, ``asm``.
+        backend: One of ``auto``, ``triton``, ``csrc``, ``asm``, ``opus``.
         fp8_attn: One of ``none``, ``dpa``, ``mha``.
 
     Returns:

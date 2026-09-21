@@ -91,10 +91,11 @@ class LumenDotProductAttention(MegatronModule):
     output back.
 
     Backends (``--lumen-attn-backend``):
-        User-facing choices: ``auto``, ``triton``, ``csrc``, ``asm``.
+        User-facing choices: ``auto``, ``triton``, ``csrc``, ``asm``, ``opus``.
         Combined with ``--lumen-fp8-attn`` (``none``/``dpa``/``mha``), these
-        resolve to concrete kernels: ``aiter_csrc``, ``aiter_triton``,
-        ``aiter_triton_fp8``, ``aiter_csrc_fp8``, ``aiter_asm_fp8``.
+        resolve to concrete kernels: ``aiter_csrc``, ``aiter_opus``,
+        ``aiter_triton``, ``aiter_triton_fp8``, ``aiter_csrc_fp8``,
+        ``aiter_asm_fp8``.
     """
 
     def __init__(
@@ -177,7 +178,9 @@ class LumenDotProductAttention(MegatronModule):
         Returns:
             context: [sq, b, hp]   (hp = np * hn)
         """
-        materialize = self.backend != "aiter_csrc" or self.cp_size > 1
+        # Both CK csrc and OPUS read q/k/v strides directly and only require
+        # stride(-1) == 1, so the permuted view can stay unmaterialised.
+        materialize = self.backend not in ("aiter_csrc", "aiter_opus") or self.cp_size > 1
         q = _sbhd_to_bshd(query, materialize)
         k = _sbhd_to_bshd(key, materialize)
         v = _sbhd_to_bshd(value, materialize)
@@ -218,11 +221,11 @@ class LumenDotProductAttention(MegatronModule):
                 scale_manager=self.scale_manager,
             )
         else:
-            if self.backend == "aiter_csrc" and not is_aiter_available():
+            if self.backend in ("aiter_csrc", "aiter_opus") and not is_aiter_available():
                 raise RuntimeError(
-                    "AITER is not installed. The aiter_csrc backend "
+                    f"AITER is not installed. The {self.backend} backend "
                     "requires 'aiter' — install it or use "
-                    "--lumen-attn-backend aiter_triton."
+                    "--lumen-attn-backend triton."
                 )
             out = attention(
                 q,

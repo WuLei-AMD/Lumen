@@ -38,9 +38,11 @@ def add_common_megatron_args(parser):
         "--lumen-attn-backend",
         type=str,
         default="auto",
-        choices=["auto", "triton", "csrc", "asm"],
+        choices=["auto", "triton", "csrc", "asm", "opus"],
         help="Lumen attention kernel backend. 'auto' prefers csrc with triton fallback. "
-        "'asm' uses ASM kernels with fallback chain: asm -> csrc -> triton.",
+        "'asm' uses ASM kernels with fallback chain: asm -> csrc -> triton. "
+        "'opus' uses the OPUS gfx950 bf16 forward (forward-only kernel; backward "
+        "and any ineligible shape fall back to csrc).",
     )
     safe_add_argument(
         lumen,

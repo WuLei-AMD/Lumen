@@ -721,12 +721,92 @@ class AttentionCsrcSeqMajorOutFunction(torch.autograd.Function):
         return dq, dk, dv, None, None, None, None, None
 
 
+class AttentionOpusFunction(torch.autograd.Function):
+    """OPUS gfx950 bf16 forward + CK/asm csrc backward.
+
+    aiter ships no OPUS backward kernel, so this pairs the OPUS forward with the
+    same ``_flash_attn_backward`` the csrc backend uses. The two agree on what the
+    saved tensors mean: ``out`` is the attention output and ``softmax_lse`` is the
+    log-sum-exp of the *scaled* scores in natural log, float32, ``[B, H_q, S]``.
+
+    Restricted to the plain dense case -- no dropout, bias, alibi or sliding
+    window -- which is all the OPUS forward implements; callers gate on
+    :func:`~lumen.kernels.attention.attention_impl.opus_available` first.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal,
+        deterministic,
+        grad_quant_type,
+        seq_major_out,
+    ):
+        from lumen.kernels.attention.attention_impl import attention_opus_forward_impl
+
+        out, softmax_lse = attention_opus_forward_impl(
+            q, k, v, softmax_scale, causal, seq_major_out
+        )
+
+        # The csrc backward takes rng_state positionally. Dropout is always 0 on
+        # this path, so it is never sampled from -- but it is still read, so it
+        # has to be zeroed rather than left as uninitialised memory.
+        rng_state = torch.zeros((2,), dtype=torch.int64, device=q.device)
+
+        ctx.save_for_backward(q, k, v, out, softmax_lse, rng_state)
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.deterministic = deterministic
+        ctx.grad_quant_type = grad_quant_type
+        return out
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        from aiter.ops.mha import _flash_attn_backward
+
+        q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+        _flash_attn_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            None,
+            0.0,
+            ctx.softmax_scale,
+            ctx.causal,
+            -1,
+            -1,
+            None,
+            None,
+            ctx.deterministic,
+            rng_state,
+        )
+
+        gqt = ctx.grad_quant_type
+        dq = quantize_grad_tensor(dq, gqt)
+        dk = quantize_grad_tensor(dk, gqt)
+        dv = quantize_grad_tensor(dv, gqt)
+        return dq, dk, dv, None, None, None, None, None
+
+
 _mark_allow_in_graph(
     AttentionTritonFunction,
     AttentionTritonMXFP8Function,
     AttentionTritonBlockwise2DFunction,
     AttentionCsrcFP8BwdFunction,
     AttentionCsrcSeqMajorOutFunction,
+    AttentionOpusFunction,
 )
 
 
@@ -777,6 +857,56 @@ def attention(
     # Resolve "auto": prefer CK csrc when available, fall back to Triton.
     if backend_type == "auto":
         backend_type = "aiter_csrc" if _is_aiter_available() else "aiter_triton"
+
+    # OPUS covers only the plain dense forward on gfx950 bf16. Anything outside
+    # that (other arch/dtype/head dim, dropout, bias, alibi, sliding window, CP)
+    # degrades to csrc rather than failing, so the backend stays selectable
+    # without the caller having to know the kernel's matrix.
+    if backend_type == "aiter_opus":
+        if not _is_aiter_available():
+            raise RuntimeError(
+                "AITER is not installed. The aiter_opus attention backend requires "
+                "'aiter' — install it or use backend_type='aiter_triton'."
+            )
+        from lumen.kernels.attention.attention_impl import opus_available
+
+        # AttentionOpusFunction keeps the LSE for its own backward and does not
+        # surface it, so a caller that asks for it goes to csrc rather than
+        # paying for a second launch.
+        _opus_ok = (
+            cp_param_bundle is None
+            and not return_lse
+            and not return_attn_probs
+            and opus_available(
+                q,
+                k,
+                v,
+                dropout_p=dropout_p,
+                window_size_left=int(window_size[0]),
+                window_size_right=int(window_size[1]),
+                bias=bias,
+                alibi_slopes=alibi_slopes,
+            )
+        )
+        if _opus_ok:
+            return AttentionOpusFunction.apply(
+                q,
+                k,
+                v,
+                softmax_scale,
+                causal,
+                deterministic,
+                grad_quant_type,
+                seq_major_out,
+            )
+
+        logger.info(
+            "attention: opus backend not eligible (q=%s, k=%s, dtype=%s) — using csrc",
+            tuple(q.shape),
+            tuple(k.shape),
+            q.dtype,
+        )
+        backend_type = "aiter_csrc"
 
     # Context-parallelism path
     if cp_param_bundle is not None:
