@@ -39,6 +39,8 @@ in `run_docker.sh --env` (already true for the table above) **or**
 runs FlyDSL gfx950 **gemm1/gemm2** (MFMA-preshuffled weights, fused SwiGLU and
 score scatter) for the pre-routed expert forward and FlyDSL grouped NN/TN
 kernels for dgrad/wgrad. Do not use this with `FP8_MODE=blockwise2d`.
+Full reproduce steps and call path:
+[`docs/flydsl-sonic-moe-runbook.md`](docs/flydsl-sonic-moe-runbook.md).
 
 ```bash
 MOE_IMPL=sonic \
