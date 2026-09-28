@@ -12,3 +12,9 @@ examples/qwen3-30b-a3b/results/
 tunableop_results*.csv
 data/
 *.parquet
+outputs/
+experiments/*/models/
+experiments/*/outputs/
+experiments/*/data/build/
+*.safetensors
+gpucore.*

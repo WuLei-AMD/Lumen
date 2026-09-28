@@ -1,0 +1,24 @@
+hardware:
+  profile: amd_mi300_gfx942
+  vendor: amd
+  gpu_sku: MI300X
+  target_arch: gfx942
+  supported_arches: [gfx942]
+  runtime_arch_check: true
+  nodes: 1
+  gpus_per_node: 8
+  memory_gib_per_gpu: 192
+  tuned_kernel_overlay: null
+  capabilities:
+    bf16: true
+    native_fp8: true
+    fp8_formats: [e4m3fnuz]
+
+distributed:
+  nproc_per_node: 8
+  world_size: 8
+  dp_size: 8
+  ep_size: 8
+
+precision:
+  fp8_format: e4m3fnuz

@@ -1,0 +1,19 @@
+profiles:
+  hardware: ../hardware/amd_mi300_gfx942.yaml
+  recipe: ../recipes/qwen3_amd_fp8.yaml
+
+data:
+  train_path: data/build/generic_jsonl/train.tokenized.jsonl
+  validation_path: data/build/generic_jsonl/dev.tokenized.jsonl
+  pad_token_id: 151643
+  num_workers: 2
+
+output:
+  adapter_dir: outputs/qwen3-mi300-jsonl-lora
+  resume_adapter_dir: null
+
+execution:
+  allow_training: false
+  data_manifest_path: null
+  tokenizer_sha256: null
+  data_manifest_sha256: null

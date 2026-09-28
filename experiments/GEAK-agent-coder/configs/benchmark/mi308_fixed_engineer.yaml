@@ -1,0 +1,58 @@
+name: geak-qwen3-base-vs-sft
+
+# Replace all sha256:<...> sentinels when the held-out suite is frozen.
+fixed_identity:
+  agent_hash: "sha256:REPLACE_WITH_FROZEN_ENGINEER_PROMPT_AND_TOOL_HASH"
+  suite_hash: "sha256:REPLACE_WITH_FROZEN_HELD_OUT_SUITE_HASH"
+  decode_hash: "sha256:REPLACE_WITH_FROZEN_DECODE_HASH"
+
+tasks_manifest: ../../manifests/benchmark/held_out_tasks.json
+output_root: ../../artifacts/benchmark
+protected_sha256:
+  - "REPLACE_WITH_EACH_PROTECTED_TARGET_OR_REFERENCE_SHA256"
+
+variants:
+  - name: base
+    base_url: "http://127.0.0.1:8000/v1"
+    model: "Qwen/Qwen3-30B-A3B"
+    checkpoint_identity: "hf:Qwen/Qwen3-30B-A3B@PIN_COMMIT"
+  - name: sft
+    base_url: "http://127.0.0.1:8001/v1"
+    model: "Qwen/Qwen3-30B-A3B-GEAK-SFT"
+    checkpoint_identity: "sha256:REPLACE_WITH_EXPORTED_CHECKPOINT_MANIFEST_HASH"
+
+runner:
+  role: engineer
+  max_turns: 10
+  seeds: [11, 29, 47]
+  multitune_source_root: /home/danyzhan/Lumen-RL/experiments/multi-tune-agent
+  decode:
+    temperature: 0.2
+    max_tokens: 4096
+    timeout_s: 600
+  multitune_config:
+    geak_root: /home/danyzhan/GEAK
+    cases_path: /ABSOLUTE/FROZEN/HELD_OUT/CASES.json
+    trajectory_root: /ABSOLUTE/ISOLATED/BENCHMARK/RUNS
+    gpu_ids: "1"
+    max_rounds: 1
+    engineers_per_round: 1
+    keep_sessions: true
+
+gpu_isolation:
+  enabled: true
+  execute: false
+  service_gpu_ids: ["0"]
+  benchmark_gpu_ids: ["1", "2", "3", "4", "5", "6", "7"]
+  exclusive_case_per_gpu: true
+  lock_command: /home/danyzhan/GEAK/gpu_lock.sh
+  isolated_compile_and_tmp_per_run: true
+  endpoint_and_benchmark_must_not_share_gpu: true
+  timing_variance_fallback_concurrency: 4
+
+metrics:
+  fast_thresholds: [1.0, 1.2, 1.5, 2.0]
+  speedup_metric: speedup_vs_frozen_baseline
+  bootstrap_samples: 2000
+  bootstrap_seed: 20260921
+  confidence: 0.95

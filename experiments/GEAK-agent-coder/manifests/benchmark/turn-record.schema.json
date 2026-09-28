@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://geak.local/schemas/benchmark/turn-record.schema.json",
+  "title": "GEAK agent-loop per-turn record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "variant",
+    "seed",
+    "turn",
+    "compiled",
+    "correct",
+    "evaluated",
+    "speedup_vs_frozen_baseline",
+    "tokens_input",
+    "tokens_output",
+    "tokens_total",
+    "wall_time_s",
+    "error_type",
+    "operator",
+    "lane",
+    "tool_calls",
+    "metadata"
+  ],
+  "properties": {
+    "task_id": {"type": "string", "minLength": 1},
+    "variant": {"type": "string", "minLength": 1},
+    "seed": {"type": "integer"},
+    "turn": {"type": "integer", "minimum": 1},
+    "compiled": {"type": "boolean"},
+    "correct": {"type": "boolean"},
+    "evaluated": {"type": "boolean"},
+    "speedup_vs_frozen_baseline": {
+      "type": ["number", "null"],
+      "minimum": 0
+    },
+    "tokens_input": {"type": "integer", "minimum": 0},
+    "tokens_output": {"type": "integer", "minimum": 0},
+    "tokens_total": {"type": "integer", "minimum": 0},
+    "wall_time_s": {"type": "number", "minimum": 0},
+    "error_type": {"type": ["string", "null"]},
+    "operator": {"type": "string"},
+    "lane": {"type": "string"},
+    "tool_calls": {"type": "integer", "minimum": 0},
+    "metadata": {"type": "object"}
+  }
+}

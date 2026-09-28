@@ -1,0 +1,29 @@
+profiles:
+  hardware: ../hardware/amd_mi308_gfx942.yaml
+  recipe: ../recipes/geak_mi308_release_v1.yaml
+
+model:
+  name_or_path: Qwen/Qwen3-30B-A3B
+  local_path: /home/danyzhan/Lumen/experiments/GEAK-agent-coder/models/Qwen3-30B-A3B
+  revision: ad44e777bcd18fa416d9da3bd8f70d33ebb85d39
+
+distributed:
+  expert_backend: sonic
+  timeout_seconds: 7200
+
+data:
+  train_path: /home/danyzhan/Lumen/experiments/GEAK-agent-coder/data/build/qwen3_30b_a3b_phase1/train.tokenized.jsonl
+  validation_path: /home/danyzhan/Lumen/experiments/GEAK-agent-coder/data/build/qwen3_30b_a3b_phase1/dev.tokenized.jsonl
+  pad_token_id: 151643
+  num_workers: 2
+
+output:
+  adapter_dir: /home/danyzhan/Lumen/experiments/GEAK-agent-coder/outputs/geak-agent-coder-lora-phase1
+  resume_adapter_dir: null
+
+execution:
+  allow_training: true
+  replay_package_root: /home/danyzhan/phase1_control/general-coding-replay-v1
+  data_manifest_path: /home/danyzhan/Lumen/experiments/GEAK-agent-coder/data/build/qwen3_30b_a3b_phase1/manifest.json
+  tokenizer_sha256: 4dbc3bb2f4583311d9745013e46f2e3dc2c066971c8f16fce90a2f8b5c4baa98
+  data_manifest_sha256: a77fb8c9591b0f309b63092a53f93fc6b3b1866649c6801e5a9f5b2fd29b36d7

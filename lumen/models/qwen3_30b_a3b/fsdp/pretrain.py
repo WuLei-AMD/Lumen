@@ -360,7 +360,29 @@ class _SonicLocalExperts(nn.Module):
     def __init__(self, experts: nn.Module, start: int, end: int):
         super().__init__()
         self.num_experts = end - start
-        gate, up = experts.gate_up_proj[start:end].detach().chunk(2, dim=1)
+        if hasattr(experts, "gate_up_proj") and hasattr(experts, "down_proj"):
+            packed_gate_up = experts.gate_up_proj[start:end].detach()
+            packed_down = experts.down_proj[start:end].detach()
+        elif isinstance(experts, (nn.ModuleList, list)):
+            local = experts[start:end]
+            packed_gate_up = torch.stack(
+                [
+                    torch.cat(
+                        (
+                            expert.gate_proj.weight.detach(),
+                            expert.up_proj.weight.detach(),
+                        ),
+                        dim=0,
+                    )
+                    for expert in local
+                ]
+            )
+            packed_down = torch.stack(
+                [expert.down_proj.weight.detach() for expert in local]
+            )
+        else:
+            raise TypeError(f"unsupported packed expert source: {type(experts).__name__}")
+        gate, up = packed_gate_up.chunk(2, dim=1)
         self.w1 = nn.Parameter(
             torch.stack((gate, up), dim=2)
             .flatten(1, 2)
@@ -368,7 +390,7 @@ class _SonicLocalExperts(nn.Module):
             .contiguous()
         )
         self.w2 = nn.Parameter(
-            experts.down_proj[start:end].detach().transpose(1, 2).contiguous()
+            packed_down.transpose(1, 2).contiguous()
         )
         self.scaling_type = "none"
         self.scaling_manager = None
@@ -549,6 +571,7 @@ class EPShardedMoeBlock(nn.Module):
         self._lumen_moe_dispatch_overlap = False
         self._lumen_moe_global_expert_layout = False
         self._sonic_first_forward = expert_backend == "sonic"
+        self._offload_moe_activations = False
 
         experts = original_block.experts
         num_experts = getattr(experts, "num_experts", None)
@@ -580,13 +603,20 @@ class EPShardedMoeBlock(nn.Module):
             else:
                 self.local_experts = _FusedLocalExperts(experts, self.local_expert_start, end)
         elif isinstance(experts, (nn.ModuleList, list)):
-            if expert_backend in ("sonic", "te_grouped"):
+            if expert_backend == "sonic":
+                self.local_experts = _SonicLocalExperts(
+                    experts,
+                    self.local_expert_start,
+                    end,
+                )
+            elif expert_backend == "te_grouped":
                 raise TypeError(
                     f"expert_backend={expert_backend} requires packed HF expert "
                     "weights (gate_up_proj/down_proj); "
                     f"got {type(experts).__name__}"
                 )
-            self.local_experts = _ModuleListLocalExperts(experts, self.local_expert_start, end)
+            else:
+                self.local_experts = _ModuleListLocalExperts(experts, self.local_expert_start, end)
         else:
             raise TypeError(f"Unsupported Qwen3 expert container: {type(experts).__name__}")
 
@@ -605,6 +635,10 @@ class EPShardedMoeBlock(nn.Module):
                 "The global-expert dispatcher currently requires expert_backend=sonic"
             )
         self._lumen_moe_global_expert_layout = True
+
+    def enable_moe_activation_offload(self) -> None:
+        """Offload MoE saved tensors to CPU during forward, restore on backward."""
+        self._offload_moe_activations = True
 
     def _route(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         gate_output = self.gate(hidden_states)
@@ -760,6 +794,30 @@ class EPShardedMoeBlock(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Route tokens to local experts and restore their original ordering."""
+        if self._offload_moe_activations:
+            return self._forward_with_offload(hidden_states)
+        return self._forward_core(hidden_states)
+
+    def _forward_with_offload(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Forward with MoE activations offloaded to pinned CPU memory."""
+        current_device = hidden_states.device
+
+        def pack(tensor: torch.Tensor) -> tuple:
+            if not tensor.is_cuda or tensor.numel() < 1024:
+                return ("gpu", tensor)
+            torch.cuda.current_stream(current_device).synchronize()
+            cpu_tensor = tensor.to("cpu", non_blocking=False)
+            return ("cpu", cpu_tensor)
+
+        def unpack(packed) -> torch.Tensor:
+            if packed[0] == "gpu":
+                return packed[1]
+            return packed[1].to(current_device, non_blocking=False)
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+            return self._forward_core(hidden_states)
+
+    def _forward_core(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_shape = hidden_states.shape
         hidden_flat = hidden_states.reshape(-1, input_shape[-1])
         routing_weights, selected_experts = self._route(hidden_flat)
@@ -793,8 +851,6 @@ class EPShardedMoeBlock(nn.Module):
         send_expert_ids = local_expert_ids[order]
         send_weights = flat_weights[order]
 
-        # Exchange tokens and their two scalar metadata fields together. Local
-        # expert ids are small integers and are exactly representable in BF16.
         send_payload = torch.cat(
             (
                 send_hidden,
@@ -822,8 +878,7 @@ class EPShardedMoeBlock(nn.Module):
             recv_weights,
         )
 
-        if self._sonic_first_forward and self.ep_size > 1:
-            dist.barrier(group=self.ep_group)
+        if self._sonic_first_forward:
             self._sonic_first_forward = False
 
         returned = self._exchange_tensor(
@@ -832,6 +887,17 @@ class EPShardedMoeBlock(nn.Module):
         final_output = torch.zeros_like(hidden_flat)
         final_output.index_add_(0, send_token_ids, returned)
         return final_output.reshape(input_shape)
+
+
+def enable_moe_activation_offload(model: nn.Module) -> int:
+    """Enable CPU offload of MoE activations on all EPShardedMoeBlock layers."""
+    count = 0
+    for module in model.modules():
+        if isinstance(module, EPShardedMoeBlock):
+            module.enable_moe_activation_offload()
+            count += 1
+    _rank0_log("enabled MoE activation CPU offload on %d blocks", count)
+    return count
 
 
 def shard_moe_experts(

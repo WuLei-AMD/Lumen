@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geak-agent-coder"
+version = "0.1.0"
+description = "Gated Qwen3-30B-A3B LoRA SFT and GEAK benchmark tooling"
+requires-python = ">=3.10"
+dependencies = [
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+train = [
+  "datasets>=3.0",
+  "peft>=0.14",
+  "safetensors>=0.4",
+  "transformers>=4.51",
+]
+test = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+geak-agent-coder = "geak_agent_coder.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

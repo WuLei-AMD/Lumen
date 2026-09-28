@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://geak.local/schemas/benchmark/comparison.schema.json",
+  "title": "GEAK paired benchmark comparison",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "fixed_identity",
+    "baseline_variant",
+    "candidate_variant",
+    "paired_tasks",
+    "bootstrap",
+    "metrics",
+    "baseline_summary",
+    "candidate_summary"
+  ],
+  "properties": {
+    "schema_version": {"const": "geak_benchmark_comparison_v1"},
+    "fixed_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent_hash", "suite_hash", "decode_hash"],
+      "properties": {
+        "agent_hash": {"type": "string"},
+        "suite_hash": {"type": "string"},
+        "decode_hash": {"type": "string"}
+      }
+    },
+    "baseline_variant": {"type": "string"},
+    "candidate_variant": {"type": "string"},
+    "paired_tasks": {"type": "integer", "minimum": 1},
+    "bootstrap": {
+      "type": "object",
+      "required": ["samples", "seed", "confidence", "unit"],
+      "properties": {
+        "samples": {"type": "integer", "minimum": 1},
+        "seed": {"type": "integer"},
+        "confidence": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+        "unit": {"const": "task"}
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "baseline",
+          "candidate",
+          "delta",
+          "ci_low",
+          "ci_high"
+        ]
+      }
+    },
+    "baseline_summary": {"type": "object"},
+    "candidate_summary": {"type": "object"}
+  }
+}

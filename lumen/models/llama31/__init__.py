@@ -24,29 +24,35 @@ For backward compatibility, the Megatron APIs are re-exported at this level::
 """
 
 from lumen.models.llama31.dataset import PretrainTextDataset
-from lumen.models.llama31.megatron import (
-    add_pretrain_args,
-    apply_fp8_training,
-    apply_lora,
-    forward_step,
-    get_batch,
-    loss_func,
-    lumen_gpt_builder,
-    reset_fp8_state,
-    train_valid_test_datasets_provider,
-)
 
-__all__ = [
-    # Shared
-    "PretrainTextDataset",
-    # Megatron (re-exports)
-    "add_pretrain_args",
-    "apply_fp8_training",
-    "apply_lora",
-    "forward_step",
-    "get_batch",
-    "loss_func",
-    "reset_fp8_state",
-    "lumen_gpt_builder",
-    "train_valid_test_datasets_provider",
-]
+try:
+    from lumen.models.llama31.megatron import (
+        add_pretrain_args,
+        apply_fp8_training,
+        apply_lora,
+        forward_step,
+        get_batch,
+        loss_func,
+        lumen_gpt_builder,
+        reset_fp8_state,
+        train_valid_test_datasets_provider,
+    )
+except ModuleNotFoundError as exc:
+    if not (exc.name or "").startswith("megatron"):
+        raise
+    __all__ = ["PretrainTextDataset"]
+else:
+    __all__ = [
+        # Shared
+        "PretrainTextDataset",
+        # Megatron (re-exports)
+        "add_pretrain_args",
+        "apply_fp8_training",
+        "apply_lora",
+        "forward_step",
+        "get_batch",
+        "loss_func",
+        "reset_fp8_state",
+        "lumen_gpt_builder",
+        "train_valid_test_datasets_provider",
+    ]

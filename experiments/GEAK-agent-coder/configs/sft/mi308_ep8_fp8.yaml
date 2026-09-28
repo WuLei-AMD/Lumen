@@ -1,0 +1,20 @@
+profiles:
+  hardware: ../hardware/amd_mi308_gfx942.yaml
+  recipe: ../recipes/geak_mi308_release_v1.yaml
+
+data:
+  train_path: data/build/qwen3_30b_a3b/train.tokenized.jsonl
+  validation_path: data/build/qwen3_30b_a3b/dev.tokenized.jsonl
+  pad_token_id: 151643
+  num_workers: 2
+
+output:
+  adapter_dir: outputs/geak-agent-coder-lora
+  resume_adapter_dir: null
+
+execution:
+  allow_training: false
+  replay_package_root: null
+  data_manifest_path: null
+  tokenizer_sha256: null
+  data_manifest_sha256: null
