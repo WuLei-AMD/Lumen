@@ -1,52 +1,163 @@
 # Qwen3-Coder-30B-A3B 12K SFT Training Report
 
 **Date:** 2026-09-28
-**Hardware:** 8x AMD MI308X (192GB HBM3 each)
+**Hardware:** 8x AMD MI308X (192GB HBM3 each, gfx942)
 **Model:** Qwen/Qwen3-Coder-30B-A3B-Instruct (revision b2cff646)
-**HF Upload:** [Zhangdanyang/Qwen3-Coder-30B-A3B-SFT-TH-2epoch](https://huggingface.co/Zhangdanyang/Qwen3-Coder-30B-A3B-SFT-TH-2epoch)
+**Container:** `geak-sft-32k` (ROCm 7.0, PyTorch 2.x, vLLM 0.15.0+rocm700)
 
-## Training Configuration
+## Checkpoints
+
+| Run | Steps | Epochs | Val Loss | HuggingFace |
+|-----|-------|--------|----------|-------------|
+| 2-epoch | 125 | 2 | 0.1775 | [Zhangdanyang/Qwen3-Coder-30B-A3B-SFT-TH-2epoch](https://huggingface.co/Zhangdanyang/Qwen3-Coder-30B-A3B-SFT-TH-2epoch) |
+| 4-epoch | 250 | 4 | 0.1730 | [Zhangdanyang/Qwen3-Coder-30B-A3B-SFT-TH-4epoch](https://huggingface.co/Zhangdanyang/Qwen3-Coder-30B-A3B-SFT-TH-4epoch) |
+
+---
+
+## 1. Data Preparation
+
+### 1.1 Data Sources
+
+The training data comes from three sources, configured in `configs/data/qwen3_30b_a3b_phase1.yaml`:
+
+| Source | Type | Samples | Domain | Description |
+|--------|------|---------|--------|-------------|
+| `kernel_train` | GEAK trajectories | ~2500 | kernel | Phase 1 production wave (2000 quota), Triton+HIP kernel optimization trajectories collected via multi-tune-agent |
+| `kernel_dev` | GEAK trajectories | ~200 | kernel | Phase 1 dev wave (200 quota), held separate for validation |
+| `replay` | General coding | 500 | general_coding | SWE-bench style coding tasks for retention |
+
+Raw trajectories are stored in `/home/danyzhan/geak_sft_dataset/phase1-production-wave-2000-v1/` and `/home/danyzhan/geak_sft_dataset/phase1-dev-wave-200-v1/`.
+
+### 1.2 Data Build Pipeline
+
+```bash
+geak-agent-coder data-build --config configs/data/qwen3_30b_a3b_phase1.yaml
+```
+
+The pipeline (implemented in `src/geak_agent_coder/data/build.py`):
+
+1. **Admission** (`admission.py`): Each source is validated against SHA256 checksums, required provenance fields, and allowed split assignments
+2. **Field mapping** (`mapping.py`): Raw trajectory fields are mapped to a canonical schema (`sample_id`, `sample_domain`, `input`, `output`, `messages`)
+3. **Tokenization**: Messages are tokenized using the Qwen3-30B-A3B tokenizer with `max_length=32768` and `include_assistant_eot_in_loss=true`; samples exceeding max length are quarantined
+4. **Sampling** (`sampling.py`): 1000 training samples are drawn with `length_penalty_power=0.5` (favoring shorter samples to maximize gradient updates per token budget); replay mix enforced at 15-20% assistant loss token share
+5. **Manifest**: SHA256 checksums of all artifacts are written to `manifest.json` for reproducibility
+
+### 1.3 Output
+
+| File | Rows | Description |
+|------|------|-------------|
+| `train.tokenized.jsonl` | 1,000 | 689 kernel + 311 general_coding |
+| `dev.tokenized.jsonl` | 200 | Validation set (kernel only) |
+| `manifest.json` | - | Checksums and sampling indices for exact reproduction |
+
+### 1.4 Data Integrity
+
+All data artifacts are pinned by SHA256:
+- Tokenizer: `4dbc3bb2...`
+- Data manifest: `a77fb8c9...`
+- Train source: `9142b204...`
+- Dev source: `bbb51046...`
+- Replay source: `e0877c8e...`
+
+---
+
+## 2. Training Configuration
+
+### 2.1 Model and LoRA
+
+| Parameter | Value |
+|-----------|-------|
+| Base model | Qwen/Qwen3-Coder-30B-A3B-Instruct |
+| Architecture | 30.5B total params, 3.3B activated (MoE, 128 experts, top-8) |
+| LoRA attention rank/alpha | 32 / 64 |
+| LoRA expert rank/alpha | 16 / 32 |
+| LoRA targets (attention) | q_proj, k_proj, v_proj, o_proj |
+| LoRA targets (expert) | gate_up, down (Sonic packed format) |
+| Trainable modules | 576 (192 attention + 384 expert) |
+| Adapter dtype | bfloat16 |
+
+### 2.2 Distributed Training
+
+| Parameter | Value |
+|-----------|-------|
+| FSDP sharding | `shard_grad_op` |
+| Expert parallelism | EP=8 (16 local experts per rank) |
+| Expert backend | Sonic (AITER SonicMoE, Triton GEMM) |
+| MoE global expert layout | enabled |
+| Precision | FP8 blockwise2d (e4m3fnuz, block_size=128) |
+| Gradient checkpointing | selective (attention checkpointed, MoE retained) |
+| MoE activation offload | synchronous CPU offload via `saved_tensors_hooks` |
+
+### 2.3 Optimization
 
 | Parameter | Value |
 |-----------|-------|
 | Max sequence length | 12,288 |
-| Total steps | 125 |
-| Epochs | ~2 |
-| Gradient accumulation | 2 |
 | Micro batch size | 1 |
+| Gradient accumulation | 2 |
 | Effective batch size | 16 (8 DP x 1 micro x 2 GA) |
 | Learning rate | 1e-4 |
 | Optimizer | AdamW (weight_decay=0) |
 | Max grad norm | 1.0 |
 | Seed | 1234 |
-| Precision | FP8 blockwise2d (e4m3fnuz, block_size=128) |
-| FSDP sharding | shard_grad_op |
-| Expert parallelism | EP=8 (16 local experts per rank) |
-| Expert backend | Sonic (Triton GEMM) |
-| MoE global expert layout | enabled |
-| Gradient checkpointing | selective (attention checkpointed, MoE retained) |
-| MoE activation offload | enabled (synchronous CPU offload) |
-| PYTORCH_ALLOC_CONF | expandable_segments:True |
 
-## LoRA Configuration
+### 2.4 Environment Variables
 
-| Target | Rank | Alpha |
-|--------|------|-------|
-| Attention (q/k/v/o_proj) | 32 | 64 |
-| Expert (gate_up/down) | 16 | 32 |
-| Total trainable params | 576 modules |
-| Adapter dtype | bfloat16 |
+```bash
+export SONIC_MOE_GEMM_BACKEND=triton
+export SONIC_MOE_GROUPED_GEMM_BACKEND=triton
+export GPU_COREDUMP_ENABLE=0
+export HSA_DISABLE_CORE_DUMP=1
+export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+```
 
-## Dataset
+---
 
-| Split | Samples | Path |
-|-------|---------|------|
-| Train | 1,000 | `data/build/qwen3_30b_a3b_phase1/train.tokenized.jsonl` |
-| Validation | 200 | `data/build/qwen3_30b_a3b_phase1/dev.tokenized.jsonl` |
+## 3. Training Procedure
 
-## Training Curve
+### 3.1 Launch Command
 
-### Train Loss
+```bash
+torchrun --nnodes=1 --nproc-per-node=8 --standalone \
+    -m geak_agent_coder.sft.train \
+    --config experiments/GEAK-agent-coder/configs/sft/qwen3_coder_12k_production.yaml
+```
+
+### 3.2 Two-Epoch Run (125 steps)
+
+Config: `configs/sft/qwen3_coder_12k_production.yaml`
+
+The first run trains from scratch for 125 steps (~2 epochs). Validation is evaluated every 25 steps with 32 batches.
+
+### 3.3 Four-Epoch Run (125 more steps, resume)
+
+Config: `configs/sft/qwen3_coder_12k_4epoch.yaml`
+
+The second run resumes from the 2-epoch checkpoint via `resume_adapter_dir` and trains for 125 additional steps (total 250 steps, ~4 epochs).
+
+### 3.4 Model Export
+
+After training, LoRA adapters are merged into the base model weights:
+
+```bash
+python3 experiments/GEAK-agent-coder/scripts/merge_to_hf.py
+```
+
+The merge script (`scripts/merge_to_hf.py`):
+1. Loads all 8 adapter shards (one per EP rank)
+2. Computes `delta = (B @ A) * alpha / rank` for each LoRA pair
+3. For expert LoRAs, unpacks Sonic-format `gate_up_lora` into per-expert `gate_proj` + `up_proj` deltas
+4. Applies deltas to the corresponding HF safetensor shards (streaming, one shard at a time)
+5. Copies tokenizer, config, and other non-weight files
+6. Total: 18,624 weight deltas merged (192 attention + 18,432 expert)
+
+---
+
+## 4. Training Curves
+
+### 4.1 Two-Epoch Run (Steps 1-125)
+
+#### Train Loss
 
 ```
 Step   Loss      Step   Loss      Step   Loss      Step   Loss      Step   Loss
@@ -77,41 +188,114 @@ Step   Loss      Step   Loss      Step   Loss      Step   Loss      Step   Loss
  25    0.5914      50   0.2801      75   0.0754     100   0.5910     125   0.1069
 ```
 
-### Validation Loss
+#### Validation Loss (2-epoch)
 
-| Step | Validation Loss |
-|------|----------------|
+| Step | Val Loss |
+|------|----------|
 | 25   | 0.2363 |
 | 50   | 0.1963 |
 | 75   | 0.1870 |
 | 100  | 0.1834 |
 | 125  | 0.1775 |
 
-Validation loss decreased monotonically across all checkpoints, with no sign of overfitting.
+### 4.2 Four-Epoch Run (Steps 126-250, resumed)
 
-## Key Technical Decisions
+#### Validation Loss (4-epoch, steps relative to resumed run)
 
-### FSDP2 sharding: `shard_grad_op` instead of `full_shard`
+| Step (resumed) | Val Loss |
+|----------------|----------|
+| 25 (total 150) | 0.1806 |
+| 50 (total 175) | 0.1769 |
+| 75 (total 200) | 0.1773 |
+| 100 (total 225) | 0.1753 |
+| 125 (total 250) | 0.1730 |
 
-`full_shard` causes NCCL deadlock during backward when combined with EP all-to-all. The backward all-gather (to re-materialize parameters) and the MoE all-to-all backward operate on overlapping process groups (DP=8 and EP=8 share the same 8 ranks), causing collective ordering conflicts. `shard_grad_op` avoids the backward all-gather entirely.
+Validation loss continued to decrease monotonically from 0.1775 to 0.1730, with no overfitting observed.
 
-### Synchronous MoE activation offload
+---
 
-Asynchronous offload using `torch.cuda.Stream` + `record_event` causes `HSA_STATUS_ERROR_EXCEPTION` (0x1016) on ROCm during backward. The synchronous variant (`tensor.to("cpu", non_blocking=False)`) avoids this ROCm-specific issue while still reducing peak GPU memory enough to prevent OOM at 12K sequence length.
+## 5. Key Technical Decisions
 
-### Sonic ModuleList support
+### 5.1 `shard_grad_op` instead of `full_shard`
 
-Qwen3-Coder uses `nn.ModuleList` for experts (not packed `gate_up_proj`/`down_proj` tensors). `_SonicLocalExperts.__init__` was extended to extract and repack weights from individual expert modules into the Sonic-expected `w1`/`w2` layout.
+`full_shard` causes NCCL deadlock during backward when DP and EP share the same process group (both are world-size 8 on a single node). The backward all-gather and the MoE all-to-all backward interleave on the same NCCL communicator, causing collective ordering conflicts. `shard_grad_op` avoids the backward all-gather entirely at the cost of ~7 GB more memory per GPU.
 
-## GPU Memory Profile
+### 5.2 Synchronous MoE activation offload
+
+Asynchronous offload using `torch.cuda.Stream` + `record_event` causes `HSA_STATUS_ERROR_EXCEPTION` (0x1016) on ROCm during backward. The root cause is a ROCm-specific bug in GPU event synchronization across streams when combined with `saved_tensors_hooks`. The synchronous variant (`tensor.to("cpu", non_blocking=False)`) avoids this while still reducing peak GPU memory from OOM (~192+ GB) to ~185 GB.
+
+### 5.3 Sonic ModuleList support
+
+Qwen3-Coder uses `nn.ModuleList` for experts (not the packed `gate_up_proj`/`down_proj` tensor format used by Qwen3-30B-A3B). `_SonicLocalExperts.__init__` was extended to detect ModuleList inputs and repack individual `gate_proj.weight`, `up_proj.weight`, `down_proj.weight` tensors into Sonic's expected `w1`/`w2` layout.
+
+### 5.4 Megatron lazy import guards
+
+Both `lumen/models/llama31/__init__.py` and `lumen/models/qwen3_30b_a3b/__init__.py` were modified to wrap megatron imports in `try/except ModuleNotFoundError` so the FSDP2 training path works without megatron-core installed.
+
+---
+
+## 6. GPU Memory Profile
 
 | Phase | Memory per GPU |
 |-------|---------------|
 | After model load + FSDP2 wrap | ~136 GB |
+| After FP8 quantization | ~145 GB |
 | During forward (peak) | ~173 GB |
 | During backward (peak) | ~185 GB |
 | Headroom | ~7 GB / 192 GB |
 
-## Merged Model
+---
 
-The best checkpoint (step 100, val_loss=0.1834) was merged into the base model using the GEAK LoRA merge pipeline. All 18,624 weight deltas (192 attention + 18,432 expert) were applied to produce a standard HF-format checkpoint.
+## 7. Reproduction Steps
+
+### Prerequisites
+
+- 8x AMD MI308X GPUs (192 GB HBM3 each)
+- Docker container with ROCm 7.0, PyTorch, vLLM 0.15.0+rocm700
+- Lumen repo at `dev/moe` branch
+- GEAK SFT dataset at `/home/danyzhan/geak_sft_dataset/`
+- General coding replay at `/home/danyzhan/phase1_control/`
+
+### Step 1: Build tokenized dataset
+
+```bash
+cd /home/danyzhan/Lumen
+pip install -e experiments/GEAK-agent-coder
+geak-agent-coder data-build --config experiments/GEAK-agent-coder/configs/data/qwen3_30b_a3b_phase1.yaml
+```
+
+### Step 2: Run 2-epoch training
+
+```bash
+export PYTHONPATH="/home/danyzhan/Lumen:${PYTHONPATH}"
+export SONIC_MOE_GEMM_BACKEND=triton
+export SONIC_MOE_GROUPED_GEMM_BACKEND=triton
+export GPU_COREDUMP_ENABLE=0
+export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+
+torchrun --nnodes=1 --nproc-per-node=8 --standalone \
+    -m geak_agent_coder.sft.train \
+    --config experiments/GEAK-agent-coder/configs/sft/qwen3_coder_12k_production.yaml
+```
+
+### Step 3: Run 4-epoch training (resume)
+
+```bash
+torchrun --nnodes=1 --nproc-per-node=8 --standalone \
+    -m geak_agent_coder.sft.train \
+    --config experiments/GEAK-agent-coder/configs/sft/qwen3_coder_12k_4epoch.yaml
+```
+
+### Step 4: Merge LoRA into HF format
+
+Edit `scripts/merge_to_hf.py` to point `adapter_dir` to the desired checkpoint (`best/` subdir), then:
+
+```bash
+python3 experiments/GEAK-agent-coder/scripts/merge_to_hf.py
+```
+
+### Step 5: Upload to HuggingFace
+
+```bash
+huggingface-cli upload Zhangdanyang/<model-name> <merged-output-dir> . --repo-type model
+```
