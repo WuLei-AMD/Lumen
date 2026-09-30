@@ -705,20 +705,14 @@ class EPShardedMoeBlock(nn.Module):
     ) -> torch.Tensor:
         """Dispatch expert-major tokens and avoid receiver-side token sorting."""
         from lumen.ops.moe.dispatch_layout import (
+            gather_tokens,
             transpose_variable_chunks,
             weighted_token_reduce,
         )
         from lumen.ops.moe.dispatch_overlap import device_a2a_enabled, host_split_pair
 
-        token_ids = (
-            torch.arange(hidden_flat.shape[0], device=hidden_flat.device)
-            .unsqueeze(1)
-            .expand_as(selected_experts)
-            .reshape(-1)
-        )
         flat_experts = selected_experts.reshape(-1)
         order = torch.argsort(flat_experts, stable=True)
-        send_token_ids = token_ids[order]
 
         local_counts = torch.bincount(flat_experts, minlength=self.num_experts)
         # Count all-gather is a few KB. Run it beside the token gather, and
@@ -741,13 +735,21 @@ class EPShardedMoeBlock(nn.Module):
                 group=self.ep_group,
                 async_op=True,
             )
-            send_hidden = hidden_flat[send_token_ids]
+            send_hidden, route_rows = gather_tokens(
+                hidden_flat,
+                order,
+                selected_experts.shape[1],
+            )
             if count_work is not None:
                 count_work.wait()
             global_counts = gathered.view(self.ep_size, self.num_experts)
         else:
             global_counts = self._gather_expert_counts(local_counts)
-            send_hidden = hidden_flat[send_token_ids]
+            send_hidden, route_rows = gather_tokens(
+                hidden_flat,
+                order,
+                selected_experts.shape[1],
+            )
         # Keep this slice a view. contiguous() would queue a copy on the
         # default stream, behind the token gather, and the side-stream read
         # would copy uninitialized memory.
@@ -794,7 +796,7 @@ class EPShardedMoeBlock(nn.Module):
         )
         # index_add_ scatters duplicate token ids. Gathering each token's
         # top-k rows and reducing them avoids those atomics.
-        return weighted_token_reduce(returned, order, routing_weights)
+        return weighted_token_reduce(returned, route_rows, routing_weights)
 
     def _prepare_global_dispatch(
         self,
