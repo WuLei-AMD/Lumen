@@ -12,6 +12,7 @@ across expert-data-parallel replicas.
 """
 
 import argparse
+import contextvars
 import json
 import logging
 import math
@@ -607,34 +608,43 @@ class EPShardedMoeBlock(nn.Module):
         self._lumen_moe_global_expert_layout = True
 
     def _route(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        weights, experts = self._route_with_logits(hidden_states)
+        return weights, experts
+
+    def _route_with_logits(
+        self,
+        hidden_states: torch.Tensor,
+        sink: Optional[list] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         gate_output = self.gate(hidden_states)
         if isinstance(gate_output, tuple) and len(gate_output) >= 3:
-            return gate_output[1], gate_output[2]
+            logits, weights, experts = gate_output[0], gate_output[1], gate_output[2]
+        else:
+            logits = gate_output
+            if self._lumen_fused_router:
+                from lumen.ops.moe import fused_topk_with_score_function
 
-        router_logits = gate_output
-        if self._lumen_fused_router:
-            from lumen.ops.moe import fused_topk_with_score_function
-
-            _, routing_probs = fused_topk_with_score_function(
-                router_logits,
-                self.top_k,
-                True,
-                None,
-                None,
-                None,
-                "softmax",
-                None,
-            )
-            routing_weights, selected_experts = torch.topk(
-                routing_probs, self.top_k, dim=-1
-            )
-            return routing_weights.to(hidden_states.dtype), selected_experts
-
-        routing_scores = F.softmax(router_logits, dim=-1, dtype=torch.float32)
-        routing_weights, selected_experts = torch.topk(routing_scores, self.top_k, dim=-1)
-        if getattr(self.gate, "norm_topk_prob", getattr(self, "norm_topk_prob", False)):
-            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-        return routing_weights.to(hidden_states.dtype), selected_experts
+                _, routing_probs = fused_topk_with_score_function(
+                    logits,
+                    self.top_k,
+                    True,
+                    None,
+                    None,
+                    None,
+                    "softmax",
+                    None,
+                )
+                weights, experts = torch.topk(routing_probs, self.top_k, dim=-1)
+                weights = weights.to(hidden_states.dtype)
+            else:
+                routing_scores = F.softmax(logits, dim=-1, dtype=torch.float32)
+                weights, experts = torch.topk(routing_scores, self.top_k, dim=-1)
+                if getattr(self.gate, "norm_topk_prob", getattr(self, "norm_topk_prob", False)):
+                    weights = weights / weights.sum(dim=-1, keepdim=True)
+                weights = weights.to(hidden_states.dtype)
+        if sink is not None:
+            sink.append(logits)
+        return weights, experts
 
     def _exchange_counts(self, send_counts: torch.Tensor) -> torch.Tensor:
         if self.ep_size == 1:
@@ -695,6 +705,7 @@ class EPShardedMoeBlock(nn.Module):
     ) -> torch.Tensor:
         """Dispatch expert-major tokens and avoid receiver-side token sorting."""
         from lumen.ops.moe.dispatch_layout import transpose_variable_chunks
+        from lumen.ops.moe.dispatch_overlap import device_a2a_enabled, host_split_pair
 
         token_ids = (
             torch.arange(hidden_flat.shape[0], device=hidden_flat.device)
@@ -709,21 +720,49 @@ class EPShardedMoeBlock(nn.Module):
         send_weights = flat_weights[order]
 
         local_counts = torch.bincount(flat_experts, minlength=self.num_experts)
-        global_counts = self._gather_expert_counts(local_counts)
+        # Count all-gather is a few KB. Run it beside the token gather, and
+        # materialize split lists on a side stream so RCCL does not drain the
+        # gather before launch. Payload bytes are unchanged.
+        use_device_splits = (
+            device_a2a_enabled()
+            and self.ep_size > 1
+            and local_counts.is_cuda
+        )
+        if use_device_splits:
+            gathered = torch.empty(
+                self.ep_size * self.num_experts,
+                dtype=local_counts.dtype,
+                device=local_counts.device,
+            )
+            count_work = dist.all_gather_into_tensor(
+                gathered,
+                local_counts.contiguous(),
+                group=self.ep_group,
+                async_op=True,
+            )
+            send_hidden = hidden_flat[send_token_ids]
+            if count_work is not None:
+                count_work.wait()
+            global_counts = gathered.view(self.ep_size, self.num_experts)
+        else:
+            global_counts = self._gather_expert_counts(local_counts)
+            send_hidden = hidden_flat[send_token_ids]
+        # Keep this slice a view. contiguous() would queue a copy on the
+        # default stream, behind the token gather, and the side-stream read
+        # would copy uninitialized memory.
         recv_counts_by_sender = global_counts[
             :,
             self.local_expert_start : self.local_expert_start
             + self.experts_per_rank,
-        ].contiguous()
-        send_splits = (
-            local_counts.view(self.ep_size, self.experts_per_rank)
-            .sum(dim=1)
-            .tolist()
+        ]
+        send_splits, recv_splits = host_split_pair(
+            local_counts.view(self.ep_size, self.experts_per_rank),
+            recv_counts_by_sender,
         )
-        recv_splits = recv_counts_by_sender.sum(dim=1).tolist()
+        recv_counts_by_sender = recv_counts_by_sender.contiguous()
 
         recv_hidden = self._exchange_tensor(
-            hidden_flat[send_token_ids],
+            send_hidden,
             send_splits,
             recv_splits,
             differentiable=True,
@@ -758,6 +797,81 @@ class EPShardedMoeBlock(nn.Module):
         )
         return final_output
 
+    def _prepare_global_dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+    ) -> "_GlobalDispatch":
+        """Pack expert-major tokens and exchange counts. Payload all-to-all stays unlaunched."""
+        from lumen.ops.moe.dispatch_overlap import host_split_pair
+
+        hidden_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        token_ids = (
+            torch.arange(hidden_flat.shape[0], device=hidden_flat.device)
+            .unsqueeze(1)
+            .expand_as(selected_experts)
+            .reshape(-1)
+        )
+        flat_experts = selected_experts.reshape(-1)
+        flat_weights = routing_weights.reshape(-1)
+        order = torch.argsort(flat_experts, stable=True)
+        send_token_ids = token_ids[order]
+        send_weights = flat_weights[order]
+        local_counts = torch.bincount(flat_experts, minlength=self.num_experts)
+        if self.ep_size > 1 and local_counts.is_cuda:
+            gathered = torch.empty(
+                self.ep_size * self.num_experts,
+                dtype=local_counts.dtype,
+                device=local_counts.device,
+            )
+            count_work = dist.all_gather_into_tensor(
+                gathered,
+                local_counts.contiguous(),
+                group=self.ep_group,
+                async_op=True,
+            )
+            send_hidden = hidden_flat[send_token_ids]
+            if count_work is not None:
+                count_work.wait()
+            global_counts = gathered.view(self.ep_size, self.num_experts)
+        else:
+            global_counts = self._gather_expert_counts(local_counts)
+            send_hidden = hidden_flat[send_token_ids]
+        recv_counts_by_sender = global_counts[
+            :,
+            self.local_expert_start : self.local_expert_start + self.experts_per_rank,
+        ]
+        send_splits, recv_splits = host_split_pair(
+            local_counts.view(self.ep_size, self.experts_per_rank),
+            recv_counts_by_sender,
+        )
+        recv_counts_by_sender = recv_counts_by_sender.contiguous()
+        ready = torch.cuda.current_stream().record_event()
+        return _GlobalDispatch(
+            send_hidden=send_hidden.detach(),
+            send_token_ids=send_token_ids,
+            order=order,
+            send_weights=send_weights.detach(),
+            send_splits=send_splits,
+            recv_splits=recv_splits,
+            recv_counts_by_sender=recv_counts_by_sender,
+            ready=ready,
+            pending=None,
+        )
+
+    def _launch_prepared_dispatch(self, prepared: "_GlobalDispatch") -> "_GlobalDispatch":
+        from lumen.ops.moe.dispatch_overlap import launch_payload_all_to_all
+
+        prepared.pending = launch_payload_all_to_all(
+            prepared.send_hidden,
+            prepared.send_splits,
+            prepared.recv_splits,
+            self.ep_group,
+            prepared.ready,
+        )
+        return prepared
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Route tokens to local experts and restore their original ordering."""
         input_shape = hidden_states.shape
@@ -781,10 +895,16 @@ class EPShardedMoeBlock(nn.Module):
         destinations = torch.div(flat_experts, self.experts_per_rank, rounding_mode="floor")
         local_expert_ids = flat_experts.remainder(self.experts_per_rank)
         send_counts = torch.bincount(destinations, minlength=self.ep_size)
-        pending_counts = None
-        if self._lumen_moe_dispatch_overlap and self.ep_size > 1:
-            from lumen.ops.moe.dispatch_overlap import begin_count_exchange
+        from lumen.ops.moe.dispatch_overlap import (
+            begin_count_exchange,
+            device_a2a_enabled,
+            host_split_pair,
+        )
 
+        pending_counts = None
+        if self.ep_size > 1 and (
+            self._lumen_moe_dispatch_overlap or device_a2a_enabled()
+        ):
             pending_counts = begin_count_exchange(send_counts, self.ep_group)
         order = torch.argsort(destinations, stable=True)
 
@@ -804,11 +924,15 @@ class EPShardedMoeBlock(nn.Module):
             dim=-1,
         )
         if pending_counts is not None:
-            send_splits, recv_splits = pending_counts.wait_for_splits()
+            if pending_counts.work is not None:
+                pending_counts.work.wait()
+            send_splits, recv_splits = host_split_pair(
+                pending_counts.send_counts,
+                pending_counts.recv_counts,
+            )
         else:
             recv_counts = self._exchange_counts(send_counts)
-            send_splits = send_counts.tolist()
-            recv_splits = recv_counts.tolist()
+            send_splits, recv_splits = host_split_pair(send_counts, recv_counts)
         recv_payload = self._exchange_tensor(
             send_payload, send_splits, recv_splits, differentiable=True
         )
@@ -832,6 +956,369 @@ class EPShardedMoeBlock(nn.Module):
         final_output = torch.zeros_like(hidden_flat)
         final_output.index_add_(0, send_token_ids, returned)
         return final_output.reshape(input_shape)
+
+
+@dataclass
+class _GlobalDispatch:
+    """Host-side plan for one microbatch of the global-layout payload exchange."""
+
+    send_hidden: torch.Tensor
+    send_token_ids: torch.Tensor
+    order: torch.Tensor
+    send_weights: torch.Tensor
+    send_splits: list
+    recv_splits: list
+    recv_counts_by_sender: torch.Tensor
+    ready: torch.cuda.Event
+    pending: object
+
+
+_PAIR_ROUTER: contextvars.ContextVar = contextvars.ContextVar(
+    "lumen_fsdp_pair_router",
+    default=None,
+)
+_OVERLAP_BLOCK: Optional["EPShardedMoeBlock"] = None
+
+
+def _begin_expert(
+    block: "EPShardedMoeBlock",
+    recv: torch.Tensor,
+    counts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sender-major transpose and expert GEMM. The expert-major transpose is deferred."""
+    from lumen.ops.moe.dispatch_layout import transpose_variable_chunks
+
+    inp = recv.detach().requires_grad_(True)
+    counts_sum = counts.sum(dim=0)
+
+    def _experts(hidden: torch.Tensor) -> torch.Tensor:
+        return block.local_experts(hidden, counts=counts_sum)
+
+    with torch.enable_grad():
+        # fused=True avoids Tensor.tolist(), which would sync the compute
+        # stream and drain the GEMM before the side-stream all-to-all runs.
+        grouped = transpose_variable_chunks(
+            inp,
+            counts,
+            source_layout="sender_major",
+            fused=True,
+        )
+        # Expert saved tensors for both microbatches push the caching allocator
+        # into reclaiming record_stream blocks and the all-to-all stops
+        # overlapping. Recompute the GEMMs instead of storing those tensors.
+        expert_out = torch.utils.checkpoint.checkpoint(
+            _experts,
+            grouped,
+            use_reentrant=False,
+        )
+    return inp, expert_out
+
+
+def _finish_expert(expert_out: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    from lumen.ops.moe.dispatch_layout import transpose_variable_chunks
+
+    with torch.enable_grad():
+        return transpose_variable_chunks(
+            expert_out,
+            counts,
+            source_layout="expert_major",
+            fused=True,
+        )
+
+
+def _scatter_returned(
+    returned: torch.Tensor,
+    slot: _GlobalDispatch,
+    like: torch.Tensor,
+) -> torch.Tensor:
+    weighted = returned * slot.send_weights.to(dtype=returned.dtype).unsqueeze(-1)
+    flat = torch.zeros(
+        like.shape[0] * like.shape[1] if like.dim() == 3 else like.shape[0],
+        like.shape[-1],
+        dtype=like.dtype,
+        device=like.device,
+    )
+    flat.index_add_(0, slot.send_token_ids, weighted.to(dtype=flat.dtype))
+    return flat.view_as(like)
+
+
+def _weight_grad(
+    grad_hidden: torch.Tensor,
+    returned: torch.Tensor,
+    slot: _GlobalDispatch,
+    shape: torch.Size,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    grad_flat = grad_hidden.reshape(-1, grad_hidden.shape[-1])
+    grad_at = grad_flat.index_select(0, slot.send_token_ids)
+    grad_send = (grad_at.to(dtype=returned.dtype) * returned).sum(dim=-1)
+    restored = torch.zeros(
+        slot.order.shape[0],
+        dtype=grad_send.dtype,
+        device=grad_send.device,
+    )
+    restored.index_copy_(0, slot.order, grad_send)
+    return restored.view(shape).to(dtype=dtype)
+
+
+def _returned_grad(grad_hidden: torch.Tensor, slot: _GlobalDispatch) -> torch.Tensor:
+    grad_flat = grad_hidden.reshape(-1, grad_hidden.shape[-1])
+    grad_at = grad_flat.index_select(0, slot.send_token_ids)
+    return grad_at.to(dtype=slot.send_weights.dtype) * slot.send_weights.unsqueeze(-1)
+
+
+def _hidden_grad(grad_send: torch.Tensor, slot: _GlobalDispatch, like: torch.Tensor) -> torch.Tensor:
+    flat = torch.zeros(
+        like.reshape(-1, like.shape[-1]).shape,
+        dtype=like.dtype,
+        device=like.device,
+    )
+    flat.index_add_(0, slot.send_token_ids, grad_send.to(dtype=flat.dtype))
+    return flat.view_as(like)
+
+
+class _OverlappedGlobalMoe(torch.autograd.Function):
+    """Two-microbatch MoE whose payload all-to-alls share the expert GEMMs.
+
+    Forward launches the second dispatch under the first expert call and the
+    first combine under the second expert call. Backward does the same with
+    the reverse collectives. Expert modules are real ``nn.Module`` calls so
+    their FSDP hooks still run; the graph is retained on a detached leaf and
+    replayed from this backward.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden0, hidden1, weights0, weights1):
+        from lumen.ops.moe.dispatch_overlap import launch_payload_all_to_all
+
+        block = _OVERLAP_BLOCK
+        slot0 = block._pair_slot
+        # The count all-gather inside prepare uses the EP group, so the
+        # previous payload dispatch has to be finished first.
+        recv0 = slot0.pending.wait()
+        slot0.send_hidden = None
+        slot1 = block._prepare_global_dispatch(
+            hidden1,
+            weights1,
+            block._pair_experts1,
+        )
+        # Queue dispatch 1 before the expert GEMM so RCCL is not stuck behind
+        # a full-grid kernel on the compute stream.
+        slot1 = block._launch_prepared_dispatch(slot1)
+        inp0, expert0 = _begin_expert(block, recv0, slot0.recv_counts_by_sender)
+        local0 = _finish_expert(expert0, slot0.recv_counts_by_sender)
+        # Record before joining dispatch 1 so combine 0 does not wait for that join.
+        ready0 = torch.cuda.current_stream().record_event()
+        slot1.pending.wait_work()
+        combine0 = launch_payload_all_to_all(
+            local0.detach(),
+            slot0.recv_splits,
+            slot0.send_splits,
+            block.ep_group,
+            ready0,
+        )
+        recv1 = slot1.pending.wait()
+        slot1.send_hidden = None
+        inp1, expert1 = _begin_expert(block, recv1, slot1.recv_counts_by_sender)
+        local1 = _finish_expert(expert1, slot1.recv_counts_by_sender)
+        ready1 = torch.cuda.current_stream().record_event()
+        # Combine 0 overlaps expert 1. Free the EP group before combine 1.
+        combine0.wait_work()
+        combine1 = launch_payload_all_to_all(
+            local1.detach(),
+            slot1.recv_splits,
+            slot1.send_splits,
+            block.ep_group,
+            ready1,
+        )
+        returned0 = combine0.wait()
+        returned1 = combine1.wait()
+        ctx.graphs = [local0, inp0, local1, inp1]
+        ctx.slots = [slot0, slot1]
+        ctx.returned = [returned0.detach(), returned1.detach()]
+        ctx.weight_meta = (
+            weights0.shape,
+            weights0.dtype,
+            weights1.shape,
+            weights1.dtype,
+        )
+        ctx.group = block.ep_group
+        return (
+            _scatter_returned(returned0, slot0, hidden0),
+            _scatter_returned(returned1, slot1, hidden1),
+        )
+
+    @staticmethod
+    def backward(ctx, grad0, grad1):
+        from lumen.ops.moe.dispatch_overlap import launch_payload_all_to_all
+
+        local0, inp0, local1, inp1 = ctx.graphs
+        slot0, slot1 = ctx.slots
+        returned0, returned1 = ctx.returned
+        group = ctx.group
+        shape0, dtype0, shape1, dtype1 = ctx.weight_meta
+        stream = torch.cuda.current_stream()
+
+        def _as_local_grad(grad_returned, local):
+            return grad_returned.detach().to(dtype=local.dtype).contiguous()
+
+        grad_returned1 = _returned_grad(grad1, slot1).contiguous()
+        ready_combine1 = stream.record_event()
+        grad_returned0 = _returned_grad(grad0, slot0).contiguous()
+        ready_combine0 = stream.record_event()
+        combine1 = launch_payload_all_to_all(
+            grad_returned1,
+            slot1.send_splits,
+            slot1.recv_splits,
+            group,
+            ready_combine1,
+        )
+        combine1.wait_work()
+        combine0 = launch_payload_all_to_all(
+            grad_returned0,
+            slot0.send_splits,
+            slot0.recv_splits,
+            group,
+            ready_combine0,
+        )
+        local_grad1 = _as_local_grad(combine1.wait(), local1)
+        torch.autograd.backward(local1, local_grad1)
+        expert_ready1 = stream.record_event()
+        combine0.wait_work()
+        if inp1.grad is None:
+            raise RuntimeError("cross-microbatch overlap lost the expert input grad")
+        dispatch1 = launch_payload_all_to_all(
+            inp1.grad.detach().contiguous(),
+            slot1.recv_splits,
+            slot1.send_splits,
+            group,
+            expert_ready1,
+        )
+        local_grad0 = _as_local_grad(combine0.wait(), local0)
+        torch.autograd.backward(local0, local_grad0)
+        expert_ready0 = stream.record_event()
+        dispatch1.wait_work()
+        if inp0.grad is None:
+            raise RuntimeError("cross-microbatch overlap lost the expert input grad")
+        dispatch0 = launch_payload_all_to_all(
+            inp0.grad.detach().contiguous(),
+            slot0.recv_splits,
+            slot0.send_splits,
+            group,
+            expert_ready0,
+        )
+        grad_send1 = dispatch1.wait()
+        grad_hidden1 = _hidden_grad(grad_send1, slot1, grad1)
+        grad_hidden0 = _hidden_grad(dispatch0.wait(), slot0, grad0)
+        grad_weights0 = _weight_grad(grad0, returned0, slot0, shape0, dtype0)
+        grad_weights1 = _weight_grad(grad1, returned1, slot1, shape1, dtype1)
+        ctx.graphs = None
+        ctx.slots = None
+        ctx.returned = None
+        return grad_hidden0, grad_hidden1, grad_weights0, grad_weights1
+
+
+def _attention_residual(
+    layer: nn.Module,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    position_ids: Optional[torch.Tensor],
+    position_embeddings: Optional[tuple],
+) -> torch.Tensor:
+    residual = hidden_states
+    hidden_states = layer.input_layernorm(hidden_states)
+    hidden_states, _ = layer.self_attn(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        position_embeddings=position_embeddings,
+        use_cache=False,
+    )
+    return residual + hidden_states
+
+
+def _pair_decoder_forward(
+    layer: nn.Module,
+    hidden_states: torch.Tensor,
+    partner: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.Tensor] = None,
+    position_embeddings: Optional[tuple] = None,
+    partner_attention_mask: Optional[torch.Tensor] = None,
+    partner_position_ids: Optional[torch.Tensor] = None,
+    partner_position_embeddings: Optional[tuple] = None,
+    **kwargs,
+) -> torch.Tensor:
+    """Run two microbatches through one decoder layer and overlap their all-to-alls."""
+    global _OVERLAP_BLOCK
+    del kwargs
+    buckets = _PAIR_ROUTER.get()
+    sink0 = None if buckets is None else buckets[0]
+    sink1 = None if buckets is None else buckets[1]
+    mlp = layer.mlp
+    attended0 = _attention_residual(
+        layer, hidden_states, attention_mask, position_ids, position_embeddings
+    )
+    normed0 = layer.post_attention_layernorm(attended0)
+    weights0, experts0 = mlp._route_with_logits(
+        normed0.reshape(-1, normed0.shape[-1]),
+        sink0,
+    )
+    slot0 = mlp._launch_prepared_dispatch(
+        mlp._prepare_global_dispatch(normed0, weights0, experts0)
+    )
+    attended1 = _attention_residual(
+        layer,
+        partner,
+        partner_attention_mask,
+        partner_position_ids,
+        partner_position_embeddings,
+    )
+    normed1 = layer.post_attention_layernorm(attended1)
+    weights1, experts1 = mlp._route_with_logits(
+        normed1.reshape(-1, normed1.shape[-1]),
+        sink1,
+    )
+    mlp._pair_slot = slot0
+    mlp._pair_experts1 = experts1
+    _OVERLAP_BLOCK = mlp
+    moe0, moe1 = _OverlappedGlobalMoe.apply(normed0, normed1, weights0, weights1)
+    return torch.cat((attended0 + moe0, attended1 + moe1), dim=0)
+
+
+def _install_fsdp_mb_overlap(model: nn.Module) -> None:
+    for layer in model.model.layers:
+        mlp = getattr(layer, "mlp", None)
+        if not isinstance(mlp, EPShardedMoeBlock):
+            continue
+        if not mlp._lumen_moe_global_expert_layout:
+            raise RuntimeError(
+                "LUMEN_FSDP_MB_OVERLAP=1 requires MOE_GLOBAL_EXPERT_LAYOUT=1 "
+                "and expert_backend=sonic"
+            )
+        if getattr(layer, "_lumen_pair_forward", False):
+            continue
+        orig_forward = layer.forward
+
+        def _bind(layer_ref, previous):
+            def wrapped(hidden_states, partner=None, **kwargs):
+                if partner is None:
+                    return previous(hidden_states, **kwargs)
+                return _pair_decoder_forward(
+                    layer_ref,
+                    hidden_states,
+                    partner,
+                    **kwargs,
+                )
+
+            return wrapped
+
+        layer.forward = _bind(layer, orig_forward)
+        layer._lumen_pair_forward = True
+    _rank0_log(
+        "FSDP cross-microbatch all-to-all overlap enabled "
+        "(payload dispatch/combine on a side stream)"
+    )
 
 
 def shard_moe_experts(
@@ -1317,6 +1804,132 @@ class FSDPTrainer:
     def _loss(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         return self._loss_components(batch)[0]
 
+    def _next_batch(self, data_iterator, step: int, micro_step: int):
+        try:
+            batch = next(data_iterator)
+        except StopIteration:
+            data_iterator = iter(self.train_loader)
+            batch = next(data_iterator)
+        dump_dir = os.environ.get("QWEN_PARITY_DUMP_DIR")
+        if dump_dir:
+            dump_path = (
+                Path(dump_dir)
+                / f"fsdp-batch{step - 1}-micro{micro_step}-rank{self.rank}.pt"
+            )
+            if not dump_path.exists():
+                dump_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "input_ids": batch["input_ids"].cpu(),
+                        "labels": batch.get("labels", torch.empty(0)).cpu(),
+                    },
+                    dump_path,
+                )
+        return data_iterator, batch
+
+    def _token_plan(self, input_ids: torch.Tensor):
+        from transformers.masking_utils import (
+            create_causal_mask,
+            create_sliding_window_causal_mask,
+        )
+
+        inner = self.model.model
+        inputs_embeds = inner.embed_tokens(input_ids)
+        position_ids = torch.arange(
+            inputs_embeds.shape[1],
+            device=inputs_embeds.device,
+        ).unsqueeze(0)
+        mask_function = (
+            create_causal_mask
+            if inner.config.sliding_window is None
+            else create_sliding_window_causal_mask
+        )
+        causal_mask = mask_function(
+            config=inner.config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=None,
+            past_key_values=None,
+            position_ids=position_ids,
+        )
+        position_embeddings = inner.rotary_emb(
+            inputs_embeds,
+            position_ids=position_ids,
+        )
+        return inputs_embeds, causal_mask, position_ids, position_embeddings
+
+    def _paired_pretrain_loss(
+        self,
+        batch0: dict[str, torch.Tensor],
+        batch1: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward two microbatches together and return the sum of their losses."""
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+            load_balancing_loss_func,
+        )
+
+        ids0 = batch0["input_ids"].to(self.local_rank, non_blocking=True)
+        labels0 = batch0["labels"].to(self.local_rank, non_blocking=True)
+        ids1 = batch1["input_ids"].to(self.local_rank, non_blocking=True)
+        labels1 = batch1["labels"].to(self.local_rank, non_blocking=True)
+        router0: list[torch.Tensor] = []
+        router1: list[torch.Tensor] = []
+        holder: dict[str, torch.Tensor] = {}
+        token = _PAIR_ROUTER.set((router0, router1))
+        causal = self.model
+        orig_forward = causal.forward
+
+        def paired_forward(*args, **kwargs):
+            del args, kwargs
+            inner = causal.model
+            hidden0, mask0, pos0, emb0 = self._token_plan(ids0)
+            hidden1, mask1, pos1, emb1 = self._token_plan(ids1)
+            for layer in inner.layers:
+                paired = layer(
+                    hidden0,
+                    partner=hidden1,
+                    attention_mask=mask0,
+                    position_ids=pos0,
+                    position_embeddings=emb0,
+                    partner_attention_mask=mask1,
+                    partner_position_ids=pos1,
+                    partner_position_embeddings=emb1,
+                )
+                hidden0, hidden1 = paired.chunk(2, dim=0)
+            hidden0 = inner.norm(hidden0)
+            hidden1 = inner.norm(hidden1)
+            logits0 = causal.lm_head(hidden0)
+            logits1 = causal.lm_head(hidden1)
+            num_experts = QWEN3_30B_A3B_CONFIG["num_experts"]
+            top_k = QWEN3_30B_A3B_CONFIG["num_experts_per_tok"]
+            aux0 = load_balancing_loss_func(tuple(router0), num_experts, top_k, None)
+            aux1 = load_balancing_loss_func(tuple(router1), num_experts, top_k, None)
+            if not torch.is_tensor(aux0):
+                aux0 = logits0.new_zeros(())
+            if not torch.is_tensor(aux1):
+                aux1 = logits1.new_zeros(())
+            ce0 = F.cross_entropy(
+                logits0.reshape(-1, logits0.shape[-1]),
+                labels0.reshape(-1),
+            )
+            ce1 = F.cross_entropy(
+                logits1.reshape(-1, logits1.shape[-1]),
+                labels1.reshape(-1),
+            )
+            coef = self.args.aux_loss_coeff / top_k
+            holder["lm"] = ce0.detach() + ce1.detach()
+            holder["aux"] = aux0.detach() + aux1.detach()
+            return ce0 + coef * aux0 + ce1 + coef * aux1
+
+        causal.forward = paired_forward
+        try:
+            # FSDP root pre-forward unpacks the device-cast args. An empty
+            # call makes that tuple empty, so pass one real batch.
+            total = causal(input_ids=ids0)
+        finally:
+            causal.forward = orig_forward
+            _PAIR_ROUTER.reset(token)
+        return total, holder["lm"], holder["aux"]
+
     @torch.no_grad()
     def validate(self) -> float:
         """Return validation loss averaged over data-parallel replicas."""
@@ -1343,6 +1956,22 @@ class FSDPTrainer:
     def train(self) -> None:
         """Run the configured training loop."""
         self.model.train()
+        mb_overlap = (
+            os.environ.get("LUMEN_FSDP_MB_OVERLAP", "0") == "1"
+            and self.args.data_format == "pretrain"
+        )
+        if mb_overlap:
+            if self.args.gradient_accumulation_steps % 2:
+                raise RuntimeError(
+                    "LUMEN_FSDP_MB_OVERLAP requires an even number of "
+                    "gradient accumulation steps"
+                )
+            _install_fsdp_mb_overlap(self.model)
+            # RCCL allocates the all-to-all workspace with hipMalloc, outside
+            # the caching allocator. Two live microbatches already sit near
+            # 200 GiB, and the allocator will otherwise reserve the rest, so
+            # the next collective fails with free memory near zero.
+            torch.cuda.set_per_process_memory_fraction(0.95, self.local_rank)
         data_iterator = iter(self.train_loader)
         profiler = None
         profile_output = os.environ.get("LUMEN_PROFILE_OUTPUT")
@@ -1366,28 +1995,18 @@ class FSDPTrainer:
             accumulated_loss = 0.0
             accumulated_lm_loss = 0.0
             accumulated_aux_loss = 0.0
-            for micro_step in range(self.args.gradient_accumulation_steps):
-                try:
-                    batch = next(data_iterator)
-                except StopIteration:
-                    data_iterator = iter(self.train_loader)
-                    batch = next(data_iterator)
-                dump_dir = os.environ.get("QWEN_PARITY_DUMP_DIR")
-                if dump_dir:
-                    dump_path = (
-                        Path(dump_dir)
-                        / f"fsdp-batch{step - 1}-micro{micro_step}-rank{self.rank}.pt"
+            pair_stride = 2 if mb_overlap else 1
+            for micro_step in range(0, self.args.gradient_accumulation_steps, pair_stride):
+                data_iterator, batch = self._next_batch(data_iterator, step, micro_step)
+                if mb_overlap:
+                    data_iterator, partner = self._next_batch(
+                        data_iterator,
+                        step,
+                        micro_step + 1,
                     )
-                    if not dump_path.exists():
-                        dump_path.parent.mkdir(parents=True, exist_ok=True)
-                        torch.save(
-                            {
-                                "input_ids": batch["input_ids"].cpu(),
-                                "labels": batch.get("labels", torch.empty(0)).cpu(),
-                            },
-                            dump_path,
-                        )
-                loss, lm_loss, aux_loss = self._loss_components(batch)
+                    loss, lm_loss, aux_loss = self._paired_pretrain_loss(batch, partner)
+                else:
+                    loss, lm_loss, aux_loss = self._loss_components(batch)
                 if os.environ.get("QWEN_PARITY_LOG_LOCAL_LOSS", "0") == "1":
                     logger.warning(
                         "Qwen parity local loss: rank=%d step=%d micro=%d lm_loss=%.9f",
