@@ -1699,6 +1699,29 @@ def _enable_lumen(
     return model
 
 
+def _configure_fsdp_microbatch(model: nn.Module, *, sync_grads: bool) -> None:
+    """Defer FSDP communication across the gradient-accumulation window.
+
+    ``shard_grad_op`` only keeps parameters unsharded between one microbatch's
+    forward and its backward. The next microbatch all-gathers them again, and
+    every backward reduce-scatters. Holding the unsharded parameters and
+    summing gradients locally until the last microbatch removes both.
+    """
+    from torch.distributed.fsdp import FSDPModule
+
+    if not isinstance(model, FSDPModule):
+        return
+    if not getattr(_configure_fsdp_microbatch, "_logged", False):
+        _configure_fsdp_microbatch._logged = True
+        _rank0_log(
+            "FSDP gradient accumulation keeps parameters unsharded and "
+            "reduce-scatters only on the last microbatch"
+        )
+    model.set_requires_gradient_sync(sync_grads, recurse=True)
+    model.set_reshard_after_backward(sync_grads, recurse=True)
+    model.set_is_last_backward(sync_grads)
+
+
 class FSDPTrainer:
     """Full-parameter Qwen3-30B-A3B trainer using FSDP2 and expert parallelism."""
 
@@ -2062,7 +2085,8 @@ class FSDPTrainer:
             accumulated_lm_loss = 0.0
             accumulated_aux_loss = 0.0
             pair_stride = 2 if mb_overlap else 1
-            for micro_step in range(0, self.args.gradient_accumulation_steps, pair_stride):
+            grad_acc = self.args.gradient_accumulation_steps
+            for micro_step in range(0, grad_acc, pair_stride):
                 data_iterator, batch = self._next_batch(data_iterator, step, micro_step)
                 if mb_overlap:
                     data_iterator, partner = self._next_batch(
@@ -2084,10 +2108,17 @@ class FSDPTrainer:
                 # Both dense-DP and expert-DP FSDP groups use SUM reductions.
                 # Scaling each rank's local loss by dense DP produces the
                 # global-batch mean for shared and EP-local expert parameters.
+                # Only the last microbatch reduce-scatters; earlier ones keep
+                # the unsharded parameters and accumulate the local gradient.
+                if grad_acc > pair_stride:
+                    _configure_fsdp_microbatch(
+                        self.model,
+                        sync_grads=micro_step + pair_stride >= grad_acc,
+                    )
                 (
                     loss
                     / (
-                        self.args.gradient_accumulation_steps
+                        grad_acc
                         * self.groups.dp_size
                     )
                 ).backward()
