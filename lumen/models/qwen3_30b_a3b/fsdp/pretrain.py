@@ -500,6 +500,7 @@ class _SonicLocalExperts(nn.Module):
             sonicmoe.SonicMoEActivationType.SWIGLU,
             False,
             False,
+            scores_are_one=True,
         )
         return output
 
