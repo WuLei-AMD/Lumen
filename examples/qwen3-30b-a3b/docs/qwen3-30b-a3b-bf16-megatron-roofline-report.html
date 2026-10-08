@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Qwen3-30B-A3B BF16 理论性能上限分析</title>
+  <style>
+    :root{--bg:#f5f7fa;--paper:#fff;--ink:#17202a;--muted:#617083;--line:#dce3ea;--blue:#1769aa;--green:#21775a;--orange:#a65b12;--red:#a33b3b;--soft:#edf5fb}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",sans-serif;line-height:1.62}
+    main{max-width:1160px;margin:auto;padding:40px 28px 68px} h1{font-size:30px;line-height:1.25;margin:0 0 10px} h2{font-size:21px;margin:36px 0 14px;padding-bottom:7px;border-bottom:1px solid var(--line)} h3{font-size:16px;margin:20px 0 8px}
+    p{margin:8px 0}.hero,.panel,.conclusion{background:var(--paper);border:1px solid var(--line)}.hero{padding:28px}.panel{padding:20px}.conclusion{padding:18px 20px;font-size:16px}
+    .sub,.small{color:var(--muted)}.small{font-size:12px}.badges{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0}.badge{border:1px solid var(--line);border-radius:999px;padding:4px 10px;font-size:12px;color:var(--muted)}
+    .metrics{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:var(--line);border:1px solid var(--line);margin-top:20px}.metric{background:#fff;padding:15px}.metric b{display:block;color:var(--blue);font-size:21px}.metric span{font-size:12px;color:var(--muted)}
+    .grid2{display:grid;grid-template-columns:1.2fr 1fr;gap:20px;align-items:start}.formula{font-family:Consolas,monospace;background:#101820;color:#f4f7f9;padding:14px 16px;white-space:pre-wrap;font-size:13px}
+    table{border-collapse:collapse;width:100%;font-size:13px;background:#fff}th,td{padding:9px 11px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{background:#eff3f6;color:#445264}td.num{text-align:right;font-variant-numeric:tabular-nums}
+    code{font-family:Consolas,monospace;background:#eef1f4;padding:1px 4px;border-radius:3px}.callout{border-left:4px solid var(--blue);background:var(--soft);padding:12px 15px;margin:14px 0}.warn{border-color:var(--orange);background:#fff6e8}.good{border-color:var(--green);background:#edf7f2}.bad{border-color:var(--red);background:#fff0f0}
+    ul,ol{padding-left:22px}li{margin:6px 0}.barrow{display:grid;grid-template-columns:125px 1fr 95px;gap:10px;align-items:center;margin:10px 0;font-size:13px}.bar{height:14px;background:#e6ebef}.bar i{display:block;height:100%;background:var(--blue)}.bar.green i{background:var(--green)}
+    svg{width:100%;height:auto;display:block}.sources a{color:var(--blue)}
+    @media(max-width:820px){.metrics{grid-template-columns:repeat(2,1fr)}.grid2{grid-template-columns:1fr}.barrow{grid-template-columns:100px 1fr 80px}}
+  </style>
+</head>
+<body><main>
+  <section class="hero">
+    <h1>Qwen3-30B-A3B BF16 理论性能上限</h1>
+    <p class="sub">三层时间分开读：芯片峰值给出不可越过的 1.31 s，Primus 给出另一套软件栈的 4.13 s 解析包络，本机 FlyDSL + OPUS 路径的实测是 9.88 s。下文用模型形状核对 23 GFLOP/token，并用已经跑过的 kernel 时间说明 4.13 s 不是这条路径的下一跳。</p>
+    <div class="badges"><span class="badge">BF16</span><span class="badge">MI350X · gfx950</span><span class="badge">8 GPU/节点</span><span class="badge">EP=8</span><span class="badge">SEQ=4096</span><span class="badge">MBS=2</span><span class="badge">GBS=256</span></div>
+    <div class="metrics">
+      <div class="metric"><b>1.31 s</b><span>芯片屋顶。matmul 全在 2.3 PF/s，通信算 0</span></div>
+      <div class="metric"><b>5.3 s</b><span>这条 RCCL 路径的硬底。all-to-all 流本身的时间</span></div>
+      <div class="metric"><b>7.5–8 s</b><span>现有 kernel 再快一档，比较可能落到的区间</span></div>
+      <div class="metric"><b>9.88 s</b><span>已经测到的最快一档</span></div>
+      <div class="metric"><b>13.3%</b><span>相对 2.3 PF/s。305 TFLOP/s/GPU</span></div>
+    </div>
+  </section>
+
+  <h2>1. 结论</h2>
+  <div class="conclusion">
+    一次 step 有 <b>1,048,576</b> 个 token。芯片屋顶是 <b>1.31 s</b>，那要求每个 FLOP 都跑在 2.3 PFLOP/s 上，通信和 permute 的时间都是 0。这条 FlyDSL + OPUS + RCCL 路径到不了。已经测到的最快是 <b>9.88 s</b>（305 TFLOP/s/GPU，峰值的 13.3%）。按现有 kernel 还能挤的空间，比较可能落在 <b>7.5–8 s</b>。再短会先撞上 all-to-all 流自己的 <b>5.3 s</b>：4608 次集合通信串在一条流上，RCCL 参数和另外几条传输都没有把它缩短。5.3 s 以下要换集合通信，不是再叠一层 overlap。
+  </div>
+  <div class="callout good"><b>为什么不是 4.13 s：</b>Primus 那个数使用 DeepEP 和 Turbo GEMM，比这条路径的 all-to-all 流还短，所以它不是本栈的下限。10.66 s 那次 profile 设备忙约 97%，空闲大约 0.3 s，调度气泡已经不大。计算链现在大约 8–9 s，长于 all-to-all 的 5.3 s，墙钟跟着计算走。</div>
+
+  <h2>2. 三层“上限”口径</h2>
+  <table>
+    <thead><tr><th>层级</th><th>来源</th><th>回答的问题</th><th>是否为实测训练结果</th></tr></thead>
+    <tbody>
+      <tr><td>芯片绝对屋顶</td><td>官方 2.3 PFLOP/s 与 8.0 TB/s</td><td>无限饱和、无通信时不可超过什么</td><td>否</td></tr>
+      <tr><td>内核 Roofline</td><td>rocprof-compute 硬件计数器</td><td>关键内核在计算侧还是 HBM 侧，距离各自屋顶多远</td><td>仅微内核采样，不是训练 step</td></tr>
+      <tr><td>模型/集群解析上限</td><td>Primus + Origami GEMM + FAv3 SDPA + DeepEP</td><td>另一套软件栈在考虑形状之后的包络，不是本栈的预测</td><td>否，纯模拟</td></tr>
+      <tr><td>本栈实测</td><td>FlyDSL + OPUS + RCCL，steps 11–20 中位数</td><td>这条路径现在走到哪</td><td>是，9.88 s / 13.3% MFU</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn"><b>重要边界：</b>Primus 的 8-GPU benchmark 模式已尝试，但当前 Lumen 镜像缺少 Primus 完整运行时依赖和对应 Turbo/DeepEP 环境，因此没有生成“单节点 benchmark artifact”。下文 Primus 数字是官方工具的 <code>profiling-mode=simulate</code> 解析上限；单节点真实硬件只用于 rocprof-compute 内核计数器校验。二者没有被混写成 benchmark-anchored 结果。</div>
+
+  <h2>3. Roofline 基础与芯片绝对屋顶</h2>
+  <div class="grid2">
+    <div class="panel">
+      <h3>计算公式</h3>
+      <div class="formula">AI = FLOPs / HBM Bytes
+P_roof(AI) = min(2.3 PFLOP/s, 8.0 TB/s × AI)
+Ridge Point = 2300 / 8 = 287.5 FLOP/Byte
+T_lower_bound = max(FLOPs / P_peak, Bytes / BW_peak)</div>
+      <p>23 GFLOP/token 不是随便取的整数。用本模型形状数一遍，和日志里的 TFLOP/s 对得上：9.88 s 那一跑报了 305.3 TFLOP/s/GPU，反推正好是 23.0 GFLOP/token。</p>
+      <div class="formula">每个 token、每一层的前向（2×MAC）：
+  QKV   2×2048×5120            = 21.0 MFLOP
+  O     2×4096×2048            = 16.8 MFLOP
+  因果 SDPA  2×32×128×4096     = 33.6 MFLOP
+  8 个专家  8×(2×2048×1536
+            + 2×768×2048)      = 75.5 MFLOP
+  router 2×2048×128            =  0.5 MFLOP
+48 层前向 = 7.07 GFLOP
+LM head 2×2048×151936         = 0.62 GFLOP
+
+训练把线性层按 ×3（前向 + dgrad + wgrad）、
+attention 矩阵和 LM head 同样按 ×3：
+  线性 113.8 MFLOP ×3 ×48      = 16.38 GFLOP
+  SDPA  33.6 MFLOP ×3 ×48      =  4.83 GFLOP
+  LM head 0.62 ×3              =  1.87 GFLOP
+合计                             ≈ 23.1 GFLOP/token
+
+step FLOPs = 23e9 × 1,048,576
+8 × 2.3e15 = 18.4 PFLOP/s
+芯片屋顶 = 1.31 s</div>
+    </div>
+    <div class="panel">
+      <h3>硬件口径</h3>
+      <table>
+        <tr><th>项目</th><th>单 GPU</th><th>8-GPU 节点</th></tr>
+        <tr><td>BF16 dense matrix</td><td>2.3 PFLOP/s</td><td>18.4 PFLOP/s</td></tr>
+        <tr><td>HBM3E 带宽</td><td>8.0 TB/s</td><td>64 TB/s</td></tr>
+        <tr><td>显存</td><td>288 GB</td><td>2.25 TB</td></tr>
+        <tr><td>Ridge Point</td><td>287.5 FLOP/B</td><td>287.5 FLOP/B</td></tr>
+      </table>
+      <p class="small">MI355X 的 BF16 dense 峰值为 2.5 PFLOP/s，Ridge Point 为 312.5 FLOP/B；本机运行时识别为 MI350X，因此正文采用 MI350X 口径。</p>
+    </div>
+  </div>
+
+  <h2>4. rocprof-compute：关键内核 Roofline</h2>
+  <p>采集形状与模型一致：MoE 为 16 个本地专家、H=2048、I=768、8192 routed tokens；Attention 为 B=2、S=4096、32 个 Q heads、4 个 KV heads、D=128、causal BF16。下表使用 gfx950 官方公式从计数器计算 FLOPs、HBM bytes 与持续时间。</p>
+  <table>
+    <thead><tr><th>关键内核组</th><th>AI (F/B)</th><th>达到性能</th><th>HBM 带宽</th><th>所在屋顶</th><th>Roofline 效率</th></tr></thead>
+    <tbody>
+      <tr><td>MoE GEMM1 forward</td><td class="num">426.4</td><td class="num">729.5 TF/s</td><td class="num">1.71 TB/s</td><td>Compute-bound</td><td class="num">31.7%</td></tr>
+      <tr><td>MoE GEMM2 forward</td><td class="num">370.9</td><td class="num">564.0 TF/s</td><td class="num">1.52 TB/s</td><td>Compute-bound</td><td class="num">24.5%</td></tr>
+      <tr><td>MoE NN backward</td><td class="num">294.0</td><td class="num">563.1 TF/s</td><td class="num">1.92 TB/s</td><td>拐点右侧，轻度 compute-bound</td><td class="num">24.5%</td></tr>
+      <tr><td>MoE TN backward</td><td class="num">262.5</td><td class="num">462.3 TF/s</td><td class="num">1.76 TB/s</td><td>Memory-bound</td><td class="num">22.0%</td></tr>
+      <tr><td>OPUS GQA forward</td><td class="num">3462.6</td><td class="num">1052.9 TF/s</td><td class="num">0.30 TB/s</td><td>Compute-bound</td><td class="num">45.8%</td></tr>
+      <tr><td>FMHA backward 主 kernel</td><td class="num">595.0</td><td class="num">695.5 TF/s</td><td class="num">1.17 TB/s</td><td>Compute-bound</td><td class="num">30.2%</td></tr>
+    </tbody>
+  </table>
+  <div class="callout"><b>如何读表：</b>“Memory-bound”只表示这个算术强度下，屋顶的第一条斜线是 HBM，不表示 kernel 已经打满 8 TB/s。TN 反向用了大约 1.76 TB/s，离 8 TB/s 还有四倍以上。它离计算屋顶同样远（462 TF/s 对 2.3 PF/s）。拐点左右差 25 FLOP/Byte，在这种距离上改变不了优化顺序：专家 GEMM 仍然先看 tile、ragged M 和尾波。减流量是靠近屋顶之后的事，不是现在的第一刀。</div>
+
+  <div class="panel">
+    <svg viewBox="0 0 900 420" role="img" aria-label="MI350X BF16 Roofline">
+      <rect width="900" height="420" fill="#fff"/><line x1="70" y1="355" x2="860" y2="355" stroke="#9ba7b3"/><line x1="70" y1="35" x2="70" y2="355" stroke="#9ba7b3"/>
+      <g stroke="#e1e6eb"><line x1="70" y1="290" x2="860" y2="290"/><line x1="70" y1="225" x2="860" y2="225"/><line x1="70" y1="160" x2="860" y2="160"/><line x1="70" y1="95" x2="860" y2="95"/></g>
+      <polyline points="70,350 220,286 370,222 520,158 625,95 860,95" fill="none" stroke="#1769aa" stroke-width="4"/>
+      <line x1="625" y1="70" x2="625" y2="355" stroke="#a65b12" stroke-dasharray="6 6"/><text x="635" y="83" font-size="12" fill="#a65b12">Ridge 287.5 F/B</text>
+      <circle cx="616" cy="184" r="7" fill="#a65b12"/><text x="475" y="181" font-size="12">TN bwd · 262 · 462 TF/s</text>
+      <circle cx="628" cy="167" r="7" fill="#21775a"/><text x="638" y="169" font-size="12">NN bwd · 294 · 563</text>
+      <circle cx="653" cy="167" r="7" fill="#21775a"/><text x="662" y="190" font-size="12">GEMM2 · 371 · 564</text>
+      <circle cx="674" cy="145" r="7" fill="#21775a"/><text x="684" y="146" font-size="12">GEMM1 · 426 · 730</text>
+      <circle cx="705" cy="151" r="7" fill="#21775a"/><text x="715" y="215" font-size="12">Attn bwd · 595 · 695</text>
+      <circle cx="825" cy="120" r="7" fill="#21775a"/><text x="695" y="113" font-size="12">OPUS fwd · 3463 · 1053</text>
+      <text x="660" y="85" font-size="12" fill="#1769aa">2300 TF/s BF16 roof</text>
+      <text x="380" y="402" font-size="13">Arithmetic Intensity（FLOP/Byte，对数位置示意）</text>
+      <text transform="translate(18 275) rotate(-90)" font-size="13">达到性能（TFLOP/s，对数位置示意）</text>
+    </svg>
+  </div>
+
+  <h3>计数器质量说明</h3>
+  <ul>
+    <li>工具完成了三轮 roof-only 计数器采集；其 v3→v2 CSV 自动合并在当前 ROCm 版本遇到 <code>Agent_Id</code> 类型不一致，内置 PDF 因而跳过。</li>
+    <li>报告直接读取 rocprof-compute 生成的原始 <code>counter_collection.csv</code>，严格使用其 gfx950 <code>0400_roofline.yaml</code> 公式：MFMA BF16 计数乘 512，HBM 读写请求按 32/64/128 Byte 换算。</li>
+    <li>采样是独立微基准，多次重复调用被聚合；其用途是判定瓶颈方向和 Roofline 距离，不代表完整训练墙钟。</li>
+  </ul>
+
+  <h2>5. Primus 单节点模型上限</h2>
+  <p>Primus 使用 Origami 对 gfx950 GEMM 建模，并使用 FAv3 SDPA 解析模型；配置为 TP=PP=CP=1、EP=8、MBS=2、SEQ=4096。模型的 48 层均为 MoE 层。</p>
+  <div class="grid2">
+    <div class="panel">
+      <h3>每个 microbatch 的解析分解</h3>
+      <table>
+        <tr><th>模块</th><th>前向</th><th>反向</th><th>合计</th></tr>
+        <tr><td>单个 MoE Transformer 层</td><td class="num">1.81 ms</td><td class="num">3.38 ms</td><td class="num">5.19 ms</td></tr>
+        <tr><td>其中 Attention</td><td class="num">0.51 ms</td><td class="num">1.30 ms</td><td class="num">1.81 ms</td></tr>
+        <tr><td>其中 MoE MLP</td><td class="num">0.99 ms</td><td class="num">1.75 ms</td><td class="num">2.74 ms</td></tr>
+        <tr><td>48 层 + output/loss</td><td colspan="2">—</td><td class="num">257.36 ms</td></tr>
+      </table>
+    </div>
+    <div class="panel">
+      <h3>单节点上限</h3>
+      <div class="formula">16 microbatches × 257.36 ms
++ overlapped grad AR residual 4.6 ms
++ optimizer 10.8 ms
+= 4.133 s / step
+
+1,048,576 tokens ÷ 4.133 s
+= 253.7k tokens/s/node
+= 31.7k tokens/s/GPU</div>
+      <p>31.7k tokens/s/GPU 是芯片屋顶 100k 的 31.7%。这个数字已经扣了 Origami 的形状利用率，但通信模型是 DeepEP，attention / grouped GEMM 是 Turbo。本栈是 RCCL all-to-all 加 FlyDSL。FlyDSL 专家反向大约 <b>3.1 ms/次</b>（768 次/step），表中 MoE MLP 反向是 <b>1.75 ms</b>。只这一项，本栈就比这张表慢大约 1.4 ms × 768 ≈ 1.0 s 的 GPU 时间，而且其中只有一部分能被别的 microbatch 盖住。因此 4.13 s 是更乐观软件栈的包络，不是 FlyDSL 路径的预测值。</p>
+    </div>
+  </div>
+
+  <h2>6. 集群投影</h2>
+  <h3>固定 GBS=256：强扩展上限</h3>
+  <table>
+    <thead><tr><th>节点</th><th>GPU</th><th>microbatches</th><th>投影 step</th><th>集群 tokens/s</th><th>相对 1 节点加速</th><th>强扩展效率</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>8</td><td>16</td><td class="num">4.133 s</td><td class="num">0.254 M</td><td class="num">1.00×</td><td class="num">100%</td></tr>
+      <tr><td>2</td><td>16</td><td>8</td><td class="num">2.107 s</td><td class="num">0.498 M</td><td class="num">1.96×</td><td class="num">98.1%</td></tr>
+      <tr><td>4</td><td>32</td><td>4</td><td class="num">1.074 s</td><td class="num">0.976 M</td><td class="num">3.85×</td><td class="num">96.2%</td></tr>
+      <tr><td>8</td><td>64</td><td>2</td><td class="num">0.558 s</td><td class="num">1.878 M</td><td class="num">7.40×</td><td class="num">92.5%</td></tr>
+      <tr><td>16</td><td>128</td><td>1</td><td class="num">0.300 s</td><td class="num">3.491 M</td><td class="num">13.76×</td><td class="num">86.0%</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn">固定 GBS 下，16 节点已经只有 1 个 microbatch。32 节点需要至少 GBS=512 才满足 <code>GBS ≥ MBS × DP</code>，因此不能把固定 GBS=256 的曲线继续外推。</div>
+
+  <h3>保持每 DP rank 16 个 microbatches：弱扩展上限</h3>
+  <div class="grid2">
+    <div class="panel">
+      <table>
+        <thead><tr><th>节点</th><th>GBS</th><th>step</th><th>tokens/s/GPU</th><th>集群 tokens/s</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>256</td><td class="num">4.133 s</td><td class="num">31,713</td><td class="num">0.254 M</td></tr>
+          <tr><td>2</td><td>512</td><td class="num">4.165 s</td><td class="num">31,467</td><td class="num">0.503 M</td></tr>
+          <tr><td>4</td><td>1,024</td><td class="num">4.163 s</td><td class="num">31,487</td><td class="num">1.008 M</td></tr>
+          <tr><td>8</td><td>2,048</td><td class="num">4.161 s</td><td class="num">31,497</td><td class="num">2.016 M</td></tr>
+          <tr><td>16</td><td>4,096</td><td class="num">4.161 s</td><td class="num">31,502</td><td class="num">4.032 M</td></tr>
+          <tr><td>32</td><td>8,192</td><td class="num">4.160 s</td><td class="num">31,505</td><td class="num">8.065 M</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h3>弱扩展效率</h3>
+      <div class="barrow"><span>1 node</span><div class="bar"><i style="width:100%"></i></div><b>100.0%</b></div>
+      <div class="barrow"><span>2 nodes</span><div class="bar green"><i style="width:99.2%"></i></div><b>99.2%</b></div>
+      <div class="barrow"><span>4 nodes</span><div class="bar green"><i style="width:99.3%"></i></div><b>99.3%</b></div>
+      <div class="barrow"><span>8 nodes</span><div class="bar green"><i style="width:99.3%"></i></div><b>99.3%</b></div>
+      <div class="barrow"><span>16 nodes</span><div class="bar green"><i style="width:99.3%"></i></div><b>99.3%</b></div>
+      <div class="barrow"><span>32 nodes</span><div class="bar green"><i style="width:99.3%"></i></div><b>99.3%</b></div>
+      <p class="small">该效率来自 Primus 默认拓扑参数与通信重叠假设，是理想上限，不是容量承诺。32 节点的 8.07M tokens/s 约为芯片绝对屋顶 25.6M 的 31.5%。</p>
+    </div>
+  </div>
+
+  <h2>7. 这台机器上这条路径的上限</h2>
+  <p>数字来自 <code>profile-flydsl-opus-step11</code>（atomic16、Q RMSNorm、router bf16 之前的那一档，墙钟约 10.7 s）和之后测到的 9.88 s。Profile 的 self CUDA 合计 15.7 s，其中 NCCL 包装和 kernel 各记了一次约 5.8 s；扣掉这次重复后，GPU 上的 kernel 时间大约 9.9 s，和 10.7 s 的设备时间对齐，重叠掉的主要就是 all-to-all。</p>
+  <table>
+    <thead><tr><th>层</th><th>一步多长</th><th>依据</th><th>要碰到它得先发生什么</th></tr></thead>
+    <tbody>
+      <tr><td>已经测到</td><td class="num">9.88 s</td><td>steps 11–20 中位数，25.92 samples/s</td><td>FlyDSL 专家、OPUS 前向、atomic16、Q RMSNorm、router bf16、异步 split</td></tr>
+      <tr><td>现有 kernel 再快一档</td><td class="num">7.5–8 s</td><td>专家 GEMM 从现在的约 3.4 s GPU 时间靠近 rocprof 孤立采样的约 2.6 s，再从 permute / sort / 逐元素里拿下大约 1 s</td><td>新的专家 kernel，以及一条还没做成的索引融合。残差加进 norm、层内切块 all-to-all 都试过，没有变快</td></tr>
+      <tr><td>这条 RCCL 的硬底</td><td class="num">5.3 s</td><td><code>nccl:all_to_all</code> 5.33 s，4608 次，平均 1.16 ms，串在一条通信流上</td><td>计算链降到 5.3 s 以下之前，这段被盖住，所以它不是 9.88 s 的原因。计算一旦短过它，墙钟就停在这里。channels、MSCCL、协议、MORI、IPC 都没有缩短它</td></tr>
+      <tr><td>芯片屋顶</td><td class="num">1.31 s</td><td>23 GFLOP/token，8×2.3 PFLOP/s</td><td>MoE GEMM 现在只有峰值的 25–32%，稠密 GEMM 调 tile 只剩约 20 ms。到不了这一层</td></tr>
+    </tbody>
+  </table>
+  <div class="callout"><b>计算链现在比通信流长。</b>专家前后向大约 3.4 s，attention 大约 1.2 s（atomic16 之后反向主 kernel 还会再短一截），QKV 和输出投影大约 1.4 s，LM head 0.24 s，permute / sort / 逐元素大约 2 s。这些大部分前后依赖，加起来大约 8–9 s，长于 all-to-all 的 5.3 s，所以墙钟跟着计算走。9.88 s 和这个估计相符：overlap 还能拿的就是 profile 里那大约 0.3 s 空闲。</div>
+  <h3>各块还能短多少</h3>
+  <ul>
+    <li><b>专家 GEMM，大约还能少 0.7 s GPU 时间。</b>FlyDSL 反向 2.37 s、前向 0.98 s。rocprof 在同样的 16 专家、8192 token 形状上，前向两段 GEMM 是 730 / 564 TFLOP/s，反向 NN / TN 是 563 / 462 TFLOP/s，按 FLOP 折回来大约 2.6 s。孤立采样和训练 step 之间还差这 0.7 s，主要是 ragged 的专家长度和反向的四次 grouped launch。再往下要新 kernel，不是把现在的 kernel 重新调度。</li>
+    <li><b>Attention 剩下的空间小于 0.2 s。</b>OPUS 前向 227 ms（768 次，296 µs）。反向主 kernel 在改 atomic16 之前是 857 ms；那一次改动已经把墙钟降下 0.30 s。rocprof 里这条反向是 695 TFLOP/s，和现在的耗时同一量级。</li>
+    <li><b>QKV / 输出投影几乎到头了。</b>hipBLASLt 上这 6 个形状再换 tile，六次加起来大约 20 ms 墙钟。LM head 的 48 次 <code>aten::mm</code> 共 239 ms，大约 1 PFLOP/s，不是缺口。</li>
+    <li><b>Permute、sort、残差加，账面上大约 2 s，但融合没有换成墙钟。</b>Q RMSNorm 已经留下 0.34 s。K 的行数只有 Q 的八分之一，换 Triton 更慢。残差加进下一层 norm 在 graph replay 上要么算错，要么更慢。</li>
+    <li><b>All-to-all 的 5.3 s 不是带宽打满。</b>一次 dispatch 的有效载荷大约是 200 MB 量级（8192 token × top-8 × 7/8 出卡 × 2048×2 字节）。1.16 ms 的平均调用里，大消息本身可以更快，小的 count 交换则是延迟。4608 次串行之后，总时间停在 5.3 s。这就是这条通信实现的底。</li>
+  </ul>
+
+  <h2>8. 仍然值得做的顺序</h2>
+  <p>下面按已经发生的训练结果改写，不再把「离屋顶远」直接翻译成「再做 overlap」。</p>
+  <ol>
+    <li><b>9.88 s 相对 1.31 s 的差距，大部分是 kernel 还慢，不是 GPU 在等。</b>10.66 s 那一档（atomic16 之前）的 step 11 profile：设备跨度 10.66 s，忙 10.34 s，空闲 0.32 s。再把通信和计算叠一层，天花板就是这 0.3 s。</li>
+    <li><b>专家 GEMM 仍然是最大的计算项，而且 FlyDSL 已经吃过一轮。</b>孤立采样里 GEMM1/GEMM2 只有计算屋顶的 25–32%。端到端里 FlyDSL 反向大约 3.1 ms/次，前向大约 1.3 ms/次，768 次合计大约 3.4 s GPU 时间。Primus 那张表更乐观。下一刀如果还在专家上，得比现在的 FlyDSL kernel 更快，而不是把同一个 kernel 再调度一次。</li>
+    <li><b>TN 在拐点左边，但没有贴住 HBM。</b>1.76 TB/s 对 8 TB/s。先减流量会漏掉 tile 和尾波；等 kernel 真的靠近 8 TB/s 再谈流量。</li>
+    <li><b>Attention 前向可以少投，反向的原子加还不能算做完。</b>OPUS 前向 45.8% 的屋顶效率是表里最高的，端到端只值 0.42 s。反向从 fp32 atomic 改成 atomic16，同一条路径上又少了 0.30 s。旧结论「不必再碰 attention」只覆盖了前向。</li>
+    <li><b>路由索引是低算术强度，但几次融合没有变成墙钟。</b>残差加进 RMSNorm、层内把 all-to-all 切块、IPC 可变长 all-to-all，都试过。前两个更慢或直接出错，第三个把 step 拖到大约 29 s。Q RMSNorm 是这里面真正留下的 0.34 s，而且只换了 Q。</li>
+    <li><b>第 6 节的 32 节点曲线先不要用来排期。</b>固定 GBS=256 到 16 节点就没有 microbatch 可拆，这句几何关系是对的。99% 弱扩展效率来自 Primus 默认拓扑，不是这台机器的网络测量。单节点还在 9.88 s 时，多节点效率不是当前的限制项。</li>
+  </ol>
+
+  <h2>9. 限制与复现口径</h2>
+  <ul>
+    <li>9.88 s、305 TFLOP/s/GPU、13.3% MFU 来自 <code>qwen3-30b-a3b-sonic-flydsl-opus-attnbwda16-mbs2-gbs256-seq4096-mbs2-gbs256.log</code> 的 steps 11–20 中位数。atomic16 默认关闭，不设环境变量时同一路径是 10.17 s。</li>
+    <li>Primus 配置启用 Turbo Attention、Turbo grouped GEMM、DeepEP 与 sync-free MoE stage 2。4.13 s 保留为对照包络，不再写成这条 FlyDSL + OPUS + RCCL 路径的可执行上限。</li>
+    <li>Primus 默认硬件拓扑模型在 2–32 节点给出近乎固定的梯度 AllReduce 时间，因此 99% 弱扩展效率应视为“模型内理想包络”，必须用目标集群网络 benchmark 再收紧。</li>
+    <li>单节点 benchmark-anchored Primus 投影未完成；当前运行环境缺少完整 Primus benchmark 依赖。报告保留纯模拟结果并明确标注，未填造 artifact。</li>
+    <li>知乎页面受反爬限制；报告采用文章所述的标准 Roofline 方法，不引用无法核验的文章专有数值。</li>
+  </ul>
+
+  <h2>10. 来源</h2>
+  <ul class="sources">
+    <li><a href="https://zhuanlan.zhihu.com/p/2059233543776163779">《Roofline：性能优化的第一步》</a></li>
+    <li><a href="https://www.amd.com/en/products/accelerators/instinct/mi350/mi350x.html">AMD Instinct MI350X 官方规格</a></li>
+    <li><a href="https://rocm.docs.amd.com/en/latest/reference/gpu-arch/mi350.html">ROCm MI350 Series 架构资料</a></li>
+    <li><a href="https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/">rocprofiler-compute 文档</a></li>
+    <li><a href="https://rocm.docs.amd.com/projects/primus/en/main/02-user-guide/projection.html">Primus Projection 文档</a></li>
+    <li>模型配置：Qwen3-30B-A3B，48 layers，128 experts，top-8，hidden 2048，MoE intermediate 768。</li>
+  </ul>
+  <p class="small">初稿 2026-09-24，2026-09-29 按本机 BF16 训练日志改了屋顶读法和优先级。报告对应 BF16、SEQ=4096、MBS=2、GBS=256、EP=8、TP=PP=CP=1。</p>
+</main></body></html>
