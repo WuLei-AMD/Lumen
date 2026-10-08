@@ -80,8 +80,9 @@ bash examples/qwen3-30b-a3b/run_docker.sh
 ```
 
 Host paths under `HOST_ASSET_ROOT` are mounted at `/nobackup` in the
-container. Attribution, profiles, and A/B notes:
-`docs/qwen3-30b-a3b-perf-optimization.md`.
+container. Optimization notes:
+`docs/qwen3-30b-a3b-bf16-megatron-optimization.md` and
+`docs/qwen3-30b-a3b-bf16-fsdp-optimization.md`.
 
 ### Smoke (mock data, default MBS=1 GBS=8)
 
