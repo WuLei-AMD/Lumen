@@ -505,12 +505,30 @@ def _sonic_grouped_linear_backward(
         if fp8_dtype is None:
             fp8_dtype = _default_fp8_dtype()
         from lumen.ops.quantize.ops import (
-            quant_fp8_blockwise_impl,
+            quant_fp8_blockwise_row_and_segment_impl,
             quant_fp8_blockwise_segment_m_impl,
         )
 
-        grad_row, grad_row_scale = quant_fp8_blockwise_impl(
-            grad_output, fp8_dtype, axis=1, block_size=block_size
+        scale_counts = torch.div(
+            group_sizes.to(torch.int32) + block_size - 1,
+            block_size,
+            rounding_mode="trunc",
+        )
+        scale_cu_seqlens = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32, device=group_sizes.device),
+                torch.cumsum(scale_counts, dim=0).to(torch.int32),
+            ]
+        )
+        grad_row, grad_row_scale, grad_col, grad_col_scale = (
+            quant_fp8_blockwise_row_and_segment_impl(
+                grad_output,
+                len(group_sizes),
+                cu_seqlens,
+                scale_cu_seqlens,
+                fp8_dtype,
+                block_size,
+            )
         )
         weight_fp8, weight_scale = _quant_blockwise_2d(
             weight, fp8_dtype, block_size
@@ -526,28 +544,8 @@ def _sonic_grouped_linear_backward(
             out_dtype=torch.bfloat16,
         )
 
-        scale_counts = torch.div(
-            group_sizes.to(torch.int32) + block_size - 1,
-            block_size,
-            rounding_mode="trunc",
-        )
-        scale_cu_seqlens = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.int32, device=group_sizes.device),
-                torch.cumsum(scale_counts, dim=0).to(torch.int32),
-            ]
-        )
         inp_col, inp_col_scale = quant_fp8_blockwise_segment_m_impl(
             inp,
-            len(group_sizes),
-            group_sizes,
-            cu_seqlens,
-            scale_cu_seqlens,
-            fp8_dtype,
-            block_size,
-        )
-        grad_col, grad_col_scale = quant_fp8_blockwise_segment_m_impl(
-            grad_output,
             len(group_sizes),
             group_sizes,
             cu_seqlens,

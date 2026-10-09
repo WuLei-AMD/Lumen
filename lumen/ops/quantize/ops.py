@@ -21,6 +21,7 @@ from aiter.ops.quant import static_per_tensor_quant
 from aiter.ops.triton._triton_kernels.quant.quant_fp8_blockwise import (
     quant_fp8_blockwise_for_act_grad_kernel,
     quant_fp8_blockwise_kernel,
+    quant_fp8_blockwise_row_and_segment_kernel,
     quant_fp8_blockwise_segment_m_kernel,
 )
 try:
@@ -314,6 +315,53 @@ def quant_fp8_blockwise_segment_m_impl(
         torch.finfo(dtype).max,
     )
     return x_fp8, x_scales
+
+
+def quant_fp8_blockwise_row_and_segment_impl(
+    x: torch.Tensor,
+    batch_size: int,
+    seg_indptr: torch.Tensor,
+    scales_seg_indptr: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int = 128,
+):
+    """Row-wise 1×block and per-expert segment scales from one BF16 read.
+
+    Row layout matches ``quant_fp8_blockwise_impl(..., axis=1)``. Segment
+    layout matches ``quant_fp8_blockwise_segment_m_impl``. Used for the
+    expert grad, which feeds dgrad (row) and wgrad (segment).
+    """
+    assert x.is_contiguous() and x.dim() == 2, "Input must be 2D and contiguous"
+    m_rows, n_cols = x.shape
+    row_fp8 = torch.empty((m_rows, n_cols), dtype=dtype, device=x.device)
+    row_scales = torch.empty(
+        (m_rows, triton.cdiv(n_cols, block_size)), dtype=torch.float32, device=x.device
+    )
+    col_fp8 = torch.empty((m_rows, n_cols), dtype=dtype, device=x.device)
+    col_scales = torch.empty(
+        (triton.cdiv(m_rows, block_size) + batch_size, n_cols),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    grid = (
+        triton.cdiv(m_rows, block_size) + batch_size,
+        triton.cdiv(n_cols, block_size),
+    )
+    quant_fp8_blockwise_row_and_segment_kernel[grid](
+        x,
+        row_fp8,
+        row_scales,
+        col_fp8,
+        col_scales,
+        n_cols,
+        batch_size,
+        seg_indptr,
+        scales_seg_indptr,
+        block_size,
+        torch.finfo(dtype).max,
+        num_warps=4,
+    )
+    return row_fp8, row_scales, col_fp8, col_scales
 
 
 # ---------------------------------------------------------------------------
