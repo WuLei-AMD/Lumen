@@ -30,6 +30,22 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+o_proj_linear_count = 0
+
+
+def _o_proj_linear(activation, weight, bias):
+    """o_proj GEMM. The tuned ASM split-K kernel is not bitwise across launches."""
+    global o_proj_linear_count
+    import torch.nn.functional as F
+
+    o_proj_linear_count += 1
+    if activation.dim() >= 3:
+        flat = activation.reshape(-1, activation.size(-1))
+        out = F.linear(flat, weight, bias)
+        return out.view(*activation.shape[:-1], weight.shape[0])
+    return F.linear(activation, weight, bias)
+
+
 def _rank0_print(msg: str) -> None:
     try:
         import torch.distributed as dist
@@ -245,9 +261,19 @@ class LumenConfig:
         import torch
 
         if self.rollout.upper() == "ATOM":
+            try:
+                from lumenrl.core.atom_train_align import bind_lumen_rollout
+
+                bind_lumen_rollout()
+            except ImportError:
+                pass
             self._patch_norms(model, atom_mode=True)
+            self._patch_residual_stream(model)
+            self._patch_rope(model)
             self._patch_sdpa()
+            self._patch_atom_attention()
             self._patch_linear(model, atom_mode=True)
+            self._patch_merged_qkv(model)
             self._patch_mlp_activation(model)
             model._lumen_config = self
             _rank0_print("> ATOM rollout mode: forward ops aligned with ATOM inference")
@@ -367,6 +393,187 @@ class LumenConfig:
         )
         return model
 
+    def _patch_residual_stream(self, model) -> None:
+        """Thread the residual through RMSNorm the way ATOM's Qwen3 decoder does."""
+        inner = getattr(model, "model", None)
+        if inner is None or type(inner).__name__ != "Qwen3Model":
+            return
+
+        import torch
+        from transformers.cache_utils import DynamicCache
+        from transformers.masking_utils import (
+            create_causal_mask,
+            create_sliding_window_causal_mask,
+        )
+        from transformers.modeling_outputs import BaseModelOutputWithPast
+
+        def _layer(layer, hidden, residual, attention_mask, position_embeddings, position_ids, past_key_values, use_cache, kwargs):
+            if residual is None:
+                residual = hidden
+                hidden = layer.input_layernorm(hidden)
+            else:
+                hidden, residual = layer.input_layernorm(hidden, residual)
+            hidden, _ = layer.self_attn(
+                hidden_states=hidden,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+            hidden, residual = layer.post_attention_layernorm(hidden, residual)
+            hidden = layer.mlp(hidden)
+            return hidden, residual
+
+        def forward(
+            input_ids=None,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=None,
+            use_cache=None,
+            **kwargs,
+        ):
+            if (input_ids is None) ^ (inputs_embeds is not None):
+                raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+            if inputs_embeds is None:
+                inputs_embeds = inner.embed_tokens(input_ids)
+            if use_cache and past_key_values is None:
+                past_key_values = DynamicCache(config=inner.config)
+            if position_ids is None:
+                past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+                position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
+                position_ids = position_ids.unsqueeze(0)
+            if not isinstance(causal_mask_mapping := attention_mask, dict):
+                mask_kwargs = {
+                    "config": inner.config,
+                    "inputs_embeds": inputs_embeds,
+                    "attention_mask": attention_mask,
+                    "past_key_values": past_key_values,
+                    "position_ids": position_ids,
+                }
+                causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
+                if inner.has_sliding_layers:
+                    causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+
+            hidden = inputs_embeds
+            position_embeddings = inner.rotary_emb(hidden, position_ids)
+            residual = None
+            for i, layer in enumerate(inner.layers[: inner.config.num_hidden_layers]):
+                hidden, residual = _layer(
+                    layer,
+                    hidden,
+                    residual,
+                    causal_mask_mapping[inner.config.layer_types[i]],
+                    position_embeddings,
+                    position_ids,
+                    past_key_values,
+                    use_cache,
+                    kwargs,
+                )
+            hidden, _residual = inner.norm(hidden, residual)
+            return BaseModelOutputWithPast(
+                last_hidden_state=hidden,
+                past_key_values=past_key_values if use_cache else None,
+            )
+
+        inner.forward = forward
+        _rank0_print("> Qwen3 residual stream uses aiter.rmsnorm2d_fwd_with_add")
+
+    def _patch_rope(self, model) -> None:
+        """Qwen3 RoPE: same kernel and cos/sin cache as ATOM ``RotaryEmbedding``."""
+        import contextvars
+
+        import torch
+
+        config = getattr(model, "config", None)
+        if config is None or getattr(config, "model_type", None) != "qwen3":
+            return
+
+        from transformers.models.qwen3 import modeling_qwen3
+
+        head_dim = getattr(config, "head_dim", None) or (
+            config.hidden_size // config.num_attention_heads
+        )
+        rope_params = getattr(config, "rope_parameters", None) or {}
+        base = float(rope_params.get("rope_theta", getattr(config, "rope_theta", 10000.0)))
+        max_pos = int(config.max_position_embeddings)
+        positions_ctx: contextvars.ContextVar = contextvars.ContextVar(
+            "atom_rope_positions", default=None
+        )
+        cache: dict = {}
+        orig_apply = modeling_qwen3.apply_rotary_pos_emb
+
+        def _cos_sin(device, dtype):
+            key = (str(device), dtype)
+            if key not in cache:
+                inv_freq = 1.0 / (
+                    base ** (
+                        torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+                        / head_dim
+                    )
+                )
+                t = torch.arange(max_pos, dtype=torch.float32, device=device)
+                freqs = torch.einsum("i,j->ij", t, inv_freq)
+                cache[key] = (
+                    freqs.cos().unsqueeze(-2).unsqueeze(-2).to(dtype),
+                    freqs.sin().unsqueeze(-2).unsqueeze(-2).to(dtype),
+                )
+            return cache[key]
+
+        def _atom_apply(q, k, cos, sin, unsqueeze_dim=1):
+            pos = positions_ctx.get()
+            if pos is None:
+                return orig_apply(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+            from aiter import rope_cached_positions_2c_fwd_inplace
+
+            b, h, s, d = q.shape
+            q_tok = q.transpose(1, 2).reshape(b * s, h, d).contiguous()
+            k_tok = k.transpose(1, 2).reshape(b * s, k.shape[1], d).contiguous()
+            num_tokens = q_tok.shape[0]
+            q_in = q_tok.view(1, num_tokens, h, d)
+            k_in = k_tok.view(1, num_tokens, k_tok.shape[1], d)
+            positions = pos.to(device=q.device).reshape(1, num_tokens)
+            cos_cache, sin_cache = _cos_sin(q.device, q.dtype)
+            rope_cached_positions_2c_fwd_inplace(
+                q_in,
+                k_in,
+                cos_cache,
+                sin_cache,
+                positions,
+                0,
+                reuse_freqs_front_part=True,
+                nope_first=False,
+            )
+            q_out = q_tok.view(b, s, h, d).transpose(1, 2).contiguous()
+            k_out = k_tok.view(b, s, k_tok.shape[1], d).transpose(1, 2).contiguous()
+            return q_out, k_out
+
+        modeling_qwen3.apply_rotary_pos_emb = _atom_apply
+        wrapped = 0
+        for module in model.modules():
+            if type(module).__name__ != "Qwen3Attention":
+                continue
+            orig_fwd = module.forward
+
+            def _make(fwd):
+                def _forward(*args, **kwargs):
+                    token = positions_ctx.set(kwargs.get("position_ids"))
+                    try:
+                        return fwd(*args, **kwargs)
+                    finally:
+                        positions_ctx.reset(token)
+                return _forward
+
+            module.forward = _make(orig_fwd)
+            wrapped += 1
+        if wrapped:
+            _rank0_print(
+                f"> Replaced {wrapped} Qwen3 RoPE calls with "
+                "aiter.rope_cached_positions_2c_fwd_inplace"
+            )
+
     def _patch_norms(self, model, *, atom_mode: bool = False) -> None:
         import torch
 
@@ -404,14 +611,27 @@ class LumenConfig:
                     self.weight = torch.nn.Parameter(weight.data.clone())
                     self.eps = eps
 
-                def forward(self, x):
-                    return _AtomRMSNormFn.apply(x, self.weight, self.eps)
+                def forward(self, x, residual=None):
+                    if residual is None:
+                        return _AtomRMSNormFn.apply(x, self.weight, self.eps)
+                    from aiter import rmsnorm2d_fwd_with_add
+
+                    dim = self.weight.shape[0]
+                    x_2d = x.reshape(-1, dim).contiguous()
+                    residual_2d = residual.reshape(-1, dim).contiguous()
+                    out = torch.empty_like(x_2d)
+                    residual_out = torch.empty_like(x_2d)
+                    rmsnorm2d_fwd_with_add(
+                        out, x_2d, residual_2d, residual_out, self.weight, self.eps
+                    )
+                    return out.view(x.shape), residual_out.view(x.shape)
 
             _ATOM_RMSNORM_CLASSES = (
                 "RMSNorm",
                 "LlamaRMSNorm",
                 "MistralRMSNorm",
                 "Qwen2RMSNorm",
+                "Qwen3RMSNorm",
                 "MegatronRMSNorm",
                 "TENorm",
                 "LumenRMSNorm",
@@ -533,19 +753,27 @@ class LumenConfig:
 
             # HF path: patch nn.Linear modules
             count = 0
-            for _name, module in model.named_modules():
+            o_count = 0
+            for name, module in model.named_modules():
                 if isinstance(module, nn.Linear):
 
-                    def _make_atom_forward(mod):
+                    def _make_atom_forward(mod, linear_name):
                         def _forward(input):
+                            if linear_name.endswith("o_proj"):
+                                return _o_proj_linear(input, mod.weight, mod.bias)
                             return _AtomLinearFn.apply(input, mod.weight, mod.bias)
                         return _forward
 
-                    module.forward = _make_atom_forward(module)
+                    module.forward = _make_atom_forward(module, name)
                     count += 1
+                    if name.endswith("o_proj"):
+                        o_count += 1
 
             if count:
-                _rank0_print(f"> Replaced {count} nn.Linear forward with ATOM TunedGemm.mm()")
+                _rank0_print(
+                    f"> Replaced {count} nn.Linear forward with ATOM TunedGemm.mm(); "
+                    f"{o_count} o_proj use F.linear"
+                )
 
             # Megatron path: patch _do_gemm only if model contains Lumen parallel linears
             try:
@@ -624,11 +852,112 @@ class LumenConfig:
         if count:
             _rank0_print(f"> Replaced {count} nn.Linear forward with AITER GEMM (ASM→HIP→Triton)")
 
+    def _patch_atom_attention(self) -> None:
+        """Qwen3 SDPA path: ATOM prefill's ``flash_attn_varlen_func``."""
+        import torch
+        from aiter import flash_attn_varlen_func
+        from transformers.modeling_utils import AttentionInterface
+
+        def _varlen(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            dropout=0.0,
+            scaling=None,
+            is_causal=None,
+            **kwargs,
+        ):
+            del attention_mask, kwargs
+            b, hq, seqlen, dim = query.shape
+            hk = key.shape[1]
+            q = query.transpose(1, 2).reshape(b * seqlen, hq, dim).contiguous()
+            k = key.transpose(1, 2).reshape(b * seqlen, hk, dim).contiguous()
+            v = value.transpose(1, 2).reshape(b * seqlen, value.shape[1], dim).contiguous()
+            cu = torch.arange(
+                0, (b + 1) * seqlen, seqlen, device=query.device, dtype=torch.int32
+            )
+            sw = getattr(module, "sliding_window", None)
+            window_size = (-1, 0, 0) if sw is None or sw == -1 else (sw, 0, 0)
+            # ATOM prefill sets causal=True. HF folds a dense causal mask into
+            # is_causal=False before SDPA; the module flag is the contract.
+            del is_causal
+            causal = seqlen > 1 and bool(getattr(module, "is_causal", True))
+            out = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu,
+                cu_seqlens_k=cu,
+                max_seqlen_q=seqlen,
+                max_seqlen_k=seqlen,
+                min_seqlen_q=seqlen,
+                dropout_p=dropout,
+                softmax_scale=scaling if scaling is not None else dim ** -0.5,
+                causal=causal,
+                window_size=window_size,
+                sink_ptr=None,
+            )
+            if isinstance(out, tuple):
+                out = out[0]
+            return out.view(b, seqlen, hq, dim), None
+
+        AttentionInterface.register("sdpa", _varlen)
+        _rank0_print("> Qwen3 SDPA routed to aiter.flash_attn_varlen_func")
+
+    def _patch_merged_qkv(self, model) -> None:
+        """One QKV GEMM per layer, weight stacked as q then k then v."""
+        import torch
+        from aiter.tuned_gemm import tgemm
+
+        count = 0
+        for module in model.modules():
+            if type(module).__name__ != "Qwen3Attention":
+                continue
+            q_proj, k_proj, v_proj = module.q_proj, module.k_proj, module.v_proj
+            sizes = (q_proj.out_features, k_proj.out_features, v_proj.out_features)
+            box: dict = {}
+
+            def _bias(x, layers):
+                if all(layer.bias is None for layer in layers):
+                    return None
+                parts = []
+                for layer in layers:
+                    if layer.bias is None:
+                        parts.append(torch.zeros(layer.out_features, device=x.device, dtype=x.dtype))
+                    else:
+                        parts.append(layer.bias)
+                return torch.cat(parts, dim=0)
+
+            def _q(x, q_proj=q_proj, k_proj=k_proj, v_proj=v_proj, sizes=sizes, box=box):
+                layers = (q_proj, k_proj, v_proj)
+                weight = torch.cat([layer.weight for layer in layers], dim=0)
+                y = tgemm.mm(x, weight, _bias(x, layers), otype=x.dtype)
+                q_out, k_out, v_out = y.split(sizes, dim=-1)
+                box["k"] = k_out
+                box["v"] = v_out
+                return q_out
+
+            def _k(_x, box=box):
+                return box.pop("k")
+
+            def _v(_x, box=box):
+                return box.pop("v")
+
+            q_proj.forward = _q
+            k_proj.forward = _k
+            v_proj.forward = _v
+            count += 1
+        if count:
+            _rank0_print(f"> Merged {count} Qwen3 QKV projections into one TunedGemm.mm")
+
     def _patch_mlp_activation(self, model) -> None:
         """Replace HF MLP forward with ATOM's fused ``aiter.silu_and_mul``."""
         import torch
 
         from aiter import silu_and_mul
+        from aiter.tuned_gemm import tgemm
 
         class _AtomSiluAndMulFn(torch.autograd.Function):
             @staticmethod
@@ -659,9 +988,21 @@ class LumenConfig:
 
                 def _make_atom_mlp_forward(m):
                     def _forward(x):
-                        gate = m.gate_proj(x)
-                        up = m.up_proj(x)
-                        gate_up = torch.cat([gate, up], dim=-1)
+                        layers = (m.gate_proj, m.up_proj)
+                        weight = torch.cat([layer.weight for layer in layers], dim=0)
+                        if all(layer.bias is None for layer in layers):
+                            bias = None
+                        else:
+                            parts = []
+                            for layer in layers:
+                                if layer.bias is None:
+                                    parts.append(torch.zeros(
+                                        layer.out_features, device=x.device, dtype=x.dtype
+                                    ))
+                                else:
+                                    parts.append(layer.bias)
+                            bias = torch.cat(parts, dim=0)
+                        gate_up = tgemm.mm(x, weight, bias, otype=x.dtype)
                         hidden = _AtomSiluAndMulFn.apply(gate_up)
                         return m.down_proj(hidden)
                     return _forward
