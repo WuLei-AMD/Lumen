@@ -30,22 +30,6 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-o_proj_linear_count = 0
-
-
-def _o_proj_linear(activation, weight, bias):
-    """o_proj GEMM. The tuned ASM split-K kernel is not bitwise across launches."""
-    global o_proj_linear_count
-    import torch.nn.functional as F
-
-    o_proj_linear_count += 1
-    if activation.dim() >= 3:
-        flat = activation.reshape(-1, activation.size(-1))
-        out = F.linear(flat, weight, bias)
-        return out.view(*activation.shape[:-1], weight.shape[0])
-    return F.linear(activation, weight, bias)
-
-
 def _rank0_print(msg: str) -> None:
     try:
         import torch.distributed as dist
@@ -729,16 +713,14 @@ class LumenConfig:
         import torch.nn as nn
 
         if atom_mode:
-            from aiter.tuned_gemm import TunedGemm
-
-            tgemm = TunedGemm()
+            from lumen.ops.gemm.atom_bf16 import dense_bf16_gemm, o_proj_linear
 
             class _AtomLinearFn(torch.autograd.Function):
                 @staticmethod
                 def forward(ctx, input, weight, bias):
                     ctx.save_for_backward(input, weight)
                     ctx.has_bias = bias is not None
-                    return tgemm.mm(input, weight, bias, otype=input.dtype)
+                    return dense_bf16_gemm(input, weight, bias)
 
                 @staticmethod
                 def backward(ctx, grad_output):
@@ -760,7 +742,7 @@ class LumenConfig:
                     def _make_atom_forward(mod, linear_name):
                         def _forward(input):
                             if linear_name.endswith("o_proj"):
-                                return _o_proj_linear(input, mod.weight, mod.bias)
+                                return o_proj_linear(input, mod.weight, mod.bias)
                             return _AtomLinearFn.apply(input, mod.weight, mod.bias)
                         return _forward
 
@@ -771,7 +753,7 @@ class LumenConfig:
 
             if count:
                 _rank0_print(
-                    f"> Replaced {count} nn.Linear forward with ATOM TunedGemm.mm(); "
+                    f"> Replaced {count} nn.Linear forward with lumen.ops.gemm.atom_bf16; "
                     f"{o_count} o_proj use F.linear"
                 )
 
@@ -806,10 +788,10 @@ class LumenConfig:
                             delay_wgrad, deferred_wgrad, activation_tensor_id,
                             pre_quantized_input,
                         )
-                    return tgemm.mm(input_, weight, bias, otype=input_.dtype)
+                    return dense_bf16_gemm(input_, weight, bias)
 
                 _pl._do_gemm = _atom_do_gemm
-                _rank0_print("> ATOM rollout: patched parallel linear GEMM to use TunedGemm.mm()")
+                _rank0_print("> ATOM rollout: patched parallel linear GEMM to use lumen.ops.gemm.atom_bf16")
 
             return
 
@@ -909,7 +891,8 @@ class LumenConfig:
     def _patch_merged_qkv(self, model) -> None:
         """One QKV GEMM per layer, weight stacked as q then k then v."""
         import torch
-        from aiter.tuned_gemm import tgemm
+
+        from lumen.ops.gemm.atom_bf16 import qkv_gemm
 
         count = 0
         for module in model.modules():
@@ -933,7 +916,7 @@ class LumenConfig:
             def _q(x, q_proj=q_proj, k_proj=k_proj, v_proj=v_proj, sizes=sizes, box=box):
                 layers = (q_proj, k_proj, v_proj)
                 weight = torch.cat([layer.weight for layer in layers], dim=0)
-                y = tgemm.mm(x, weight, _bias(x, layers), otype=x.dtype)
+                y = qkv_gemm(x, weight, _bias(x, layers))
                 q_out, k_out, v_out = y.split(sizes, dim=-1)
                 box["k"] = k_out
                 box["v"] = v_out
@@ -950,14 +933,15 @@ class LumenConfig:
             v_proj.forward = _v
             count += 1
         if count:
-            _rank0_print(f"> Merged {count} Qwen3 QKV projections into one TunedGemm.mm")
+            _rank0_print(f"> Merged {count} Qwen3 QKV projections into lumen.ops.gemm.atom_bf16.qkv_gemm")
 
     def _patch_mlp_activation(self, model) -> None:
         """Replace HF MLP forward with ATOM's fused ``aiter.silu_and_mul``."""
         import torch
 
         from aiter import silu_and_mul
-        from aiter.tuned_gemm import tgemm
+
+        from lumen.ops.gemm.atom_bf16 import dense_bf16_gemm
 
         class _AtomSiluAndMulFn(torch.autograd.Function):
             @staticmethod
@@ -1002,7 +986,7 @@ class LumenConfig:
                                 else:
                                     parts.append(layer.bias)
                             bias = torch.cat(parts, dim=0)
-                        gate_up = tgemm.mm(x, weight, bias, otype=x.dtype)
+                        gate_up = dense_bf16_gemm(x, weight, bias)
                         hidden = _AtomSiluAndMulFn.apply(gate_up)
                         return m.down_proj(hidden)
                     return _forward
