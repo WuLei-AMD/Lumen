@@ -24,6 +24,27 @@ CANDIDATE_MARKER = "CANDIDATE"
 DEPLOYABLE_MARKER = "DEPLOYABLE"
 
 
+def _hf_quantization_config(
+    *,
+    fp8_format: str,
+    block_size: int,
+    preserved_modules: set[str],
+) -> dict:
+    if fp8_format not in {"e4m3fn", "e4m3fnuz"}:
+        raise ValueError(f"unsupported HF FP8 format: {fp8_format}")
+    return {
+        "quant_method": "fp8",
+        # Hugging Face/vLLM use the portable checkpoint name. The exact
+        # PyTorch storage dtype remains recorded in fp8_manifest.json.
+        "fmt": "e4m3",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [block_size, block_size],
+        # Without this list runtimes may replace preserved routers, norms, or
+        # lm_head with FP8 modules despite there being no matching scale tensor.
+        "modules_to_not_convert": sorted(preserved_modules),
+    }
+
+
 def quantize_state(
     state: Mapping[str, object],
     *,
@@ -108,6 +129,7 @@ def export_fp8_checkpoint(
     weight_map = dict(index["weight_map"]) if index else {}
     total_quantized = 0
     total_size = 0
+    preserved_modules: set[str] = set()
     minimum_snr_db = float("inf")
     maximum_rmse = 0.0
     for shard_name in shard_names:
@@ -136,6 +158,11 @@ def export_fp8_checkpoint(
             )
         for key in quantized:
             weight_map[scale_key_for(key)] = shard_name
+        preserved_modules.update(
+            name[: -len(".weight")]
+            for name in skipped
+            if name.endswith(".weight")
+        )
         total_size += sum(
             value.numel() * value.element_size() for value in converted.values()
         )
@@ -175,12 +202,11 @@ def export_fp8_checkpoint(
         }:
             shutil.copy2(path, output / path.name)
 
-    quantization_config = {
-        "quant_method": "fp8",
-        "fmt": actual_fp8_format,
-        "activation_scheme": "dynamic",
-        "weight_block_size": [block_size, block_size],
-    }
+    quantization_config = _hf_quantization_config(
+        fp8_format=actual_fp8_format,
+        block_size=block_size,
+        preserved_modules=preserved_modules,
+    )
     config_path = output / "config.json"
     if config_path.exists():
         config = json.loads(config_path.read_text(encoding="utf-8"))
