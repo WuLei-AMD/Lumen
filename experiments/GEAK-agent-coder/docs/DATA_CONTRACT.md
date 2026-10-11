@@ -79,3 +79,83 @@ checksums and generated manifest must still be pinned.
 `data-build` materializes the sampling plan into `train.tokenized.jsonl`
 instead of merely recording planned indices. Training authorization verifies
 the manifest SHA256, tokenizer identity and emitted training-file SHA256.
+
+## SFT-f Messages Format Dataset (2026-10-11)
+
+### New data source: unified messages format
+
+SFT-f bypasses the `geak_kernel_sft_v1` exporter and uses a direct messages
+chat format tokenizer (`scripts/tokenize_messages_dataset.py`). This enables
+training on both patch optimization and complete kernel implementation data.
+
+### Input format
+
+```json
+{
+  "messages": [
+    {"role": "system", "content": "You are an expert GPU kernel engineer..."},
+    {"role": "user", "content": "<task description + kernel code>"},
+    {"role": "assistant", "content": "<diff patch or complete kernel>"}
+  ],
+  "task_type": "direction_conditioned|complete_implementation|...",
+  "operator": "gemm|rms_norm|...",
+  "schema_version": "messages_v1"
+}
+```
+
+### Dataset composition (train.jsonl: 3164 samples)
+
+| Task Type | Count | Input | Output |
+|-----------|-------|-------|--------|
+| direction_conditioned | 907 | kernel + optimization direction | diff patch |
+| complete_implementation | 1164 | operator spec (no code) | complete kernel |
+| cold_start | 307 | kernel, no direction | diff patch |
+| error_recovery | 293 | broken kernel + error | fix patch |
+| profile_guided | 293 | kernel + profiling data | optimization patch |
+| regression_balance | 200 | kernel + constraints | balanced patch |
+
+### Tokenization
+
+Uses `tokenizer.apply_chat_template()` directly on the messages list.
+Loss mask: `0` for system/user prompt tokens, `1` for assistant content + EOT.
+
+```text
+train: 3164 samples, 6.1M total tokens, 3.5M loss tokens, avg 1937 tok/sample
+dev:   200 samples, 821K total tokens, 142K loss tokens, avg 4106 tok/sample
+```
+
+### Data sources
+
+- **patch_v1** (2000): `phase1-production-wave-2000-v1` verified agent runs
+- **complete_impl_v2** (1164): Fuzzy patch apply on wave-2000 parent→optimized
+- **dev** (200): `phase1-dev-wave-200-v1` (evaluation only)
+
+### No overlap with benchmark
+
+Training data from `phase1-production-wave-*` (23 operators).
+Benchmark from `held-out-benchmark-aiter` (8 operators, 100 tasks).
+Verified: 0 content overlap.
+
+### Build pipeline
+
+```bash
+# 1. Generate complete implementation samples
+python3 scripts/gen_complete_impl.py
+
+# 2. Unify to messages format + upload to HF
+python3 scripts/unify_sft_format.py
+
+# 3. Tokenize
+python3 scripts/tokenize_messages_dataset.py
+# → data/build/qwen3_30b_a3b_sft_f/{train,dev}.tokenized.jsonl
+
+# 4. Train
+python3 -m torch.distributed.run --nnodes=1 --nproc-per-node=8 --standalone \
+    -m geak_agent_coder.sft.train \
+    --config configs/sft/qwen3_coder_sft_f_2epoch.yaml
+```
+
+### Manifest
+
+Schema: `geak_training_data_manifest_v2` (required by `assert_training_authorized`).
+Tokenizer SHA256 pinned to `4dbc3bb2...` (Qwen3-Coder-30B-A3B-Instruct).
