@@ -377,80 +377,80 @@ python3 -m torch.distributed.run --nnodes=1 --nproc-per-node=8 --standalone \
     --config configs/sft/qwen3_coder_sft_f_2epoch.yaml
 ```
 
-## OPUS Header Inlining
+## OPUS Sample Rebalancing
 
-OPUS C++ kernel samples depend on aiter project-internal headers. To make
-training and evaluation samples self-contained, case-specific headers are
-recursively inlined while language-level and standard library headers are
-preserved as external `#include` directives.
+OPUS C++ kernel samples originally had case-specific aiter headers recursively
+inlined, inflating many samples to 100K–515K characters. All inlined headers
+have been **stripped and restored to correct `#include` references** so the model
+learns proper header usage patterns (preventing hallucinated header content).
+Large files are split into functional kernel units, each ≤ 32K characters.
 
-### Classification Rules
+### Design Rationale
 
-Headers are classified into three categories:
+- **Correct `#include` references**: All headers (both language-level and
+  project-internal) are kept as `#include` directives. The model learns which
+  headers to include for which operations, rather than memorizing inlined content.
+- **Functional splitting**: Large files are split at function/struct boundaries
+  (C++) or `def`/`class` boundaries (Python/FlyDSL), producing one kernel
+  function or variant per sample.
+- **Boilerplate removal**: Dispatch macros, pybind11 bindings, type switch
+  tables, test code, and tuner code are classified and removed — they add no
+  kernel implementation knowledge.
 
-**Preserved (external `#include` kept as-is):**
+### Processing Pipeline
 
-| Category | Prefixes / Headers |
-|---|---|
-| HIP runtime | `hip/hip_runtime.h`, `hip/hip_bf16.h`, `hip/hip_fp16.h`, `hip/hip_fp8.h` |
-| PyTorch/ATen | `torch/extension.h`, `torch/all.h`, `ATen/ATen.h`, `ATen/hip/HIPContext.h`, `c10/` |
-| OPUS library | `opus/opus.hpp`, `opus/hip_minimal.hpp`, `rocm_ops.hpp` |
-| Composable Kernel | `ck/`, `ck_tile/core.hpp`, `ck_tile/host/`, `ck_tile/ops/` |
-| ROCm libraries | `hipcub/`, `rocprim/`, `rocblas/`, `hipblas/`, `hipblaslt/`, `hiprand/` |
-| C/C++ standard | `cstdint`, `string`, `vector`, `algorithm`, `iostream`, `memory`, etc. |
-| System | `dlfcn.h`, `sys/stat.h`, `fcntl.h`, `unistd.h`, etc. |
-| Other | `kittens`, `pybind11/`, `rccl/`, `rocsolver/`, `cuda_fp8.h` |
+**Step 1 — Strip inlined headers:**
+- Remove all `// === INLINED: xxx ===` ... `// === END INLINED: xxx ===` blocks
+- Remove all `// === BEGIN INLINED: xxx ===` ... `// === END INLINED: xxx ===` blocks
+- Restore each to its original `#include "xxx"` directive
 
-**Inlined (content substituted in-place):**
+**Step 2 — Split oversized samples (> 32K chars):**
 
-| Header | Train | Heldout | Lines | Description |
-|---|---|---|---|---|
-| `aiter_hip_common.h` | 333x | 37x | 44 | HIP common macros and utilities |
-| `aiter_enum.h` | 333x | 37x | 78 | Enum definitions |
-| `aiter_logger.h` | 333x | 37x | 92 | Logger utilities |
-| `ck_tile_shim.h` | 334x | 37x | 35 | CK tile compatibility shim |
-| `aiter_opus_plus.h` | 71x | 7x | 934 | OPUS+ extension utilities |
-| `hip_reduce.h` | 71x | 8x | 354 | HIP reduction primitives |
-| `attention_generic.cuh` | 21x | — | 245 | Generic attention template |
-| `opus_moe_common.cuh` | 21x | — | 180 | MOE common definitions |
-| `aiter_tensor.h` | 10x | 16x | 226 | Tensor wrapper utilities |
-| `aiter_dispatch.h` | — | 7x | 438 | Dispatch table utilities |
-| `py_itfs_common.h` | 6x | 13x | 156 | Python interface common |
-| `aiter_stream.h` | 6x | 14x | 89 | Stream management |
-| `dispatch_utils.h` | — | 4x | 312 | Dispatch helper utilities |
-| Other (60+ headers) | varied | varied | <1000 | GEMM traits, MOE pipeline, MLA utils, etc. |
+For C++ files:
+1. Extract header section (includes, pragmas, using, namespace, block comments)
+2. Split body at blank-line boundaries (min 20 lines per section)
+3. Group sections into chunks ≤ 32K chars (minus header budget)
+4. Classify each chunk: `kernel` / `dispatch` / `pybind` / `macro` / `empty`
+5. Keep only `kernel` chunks; prepend original header to each
 
-Total: **74 unique headers** inlined in training data (1,742 substitutions),
-**63 unique headers** inlined in heldout data (303 substitutions).
+For Python/FlyDSL files:
+1. Extract header section (imports, docstrings, constants)
+2. Split body at top-level `def` / `class` / `async def` boundaries
+3. Group into chunks ≤ 32K chars
+4. Classify each chunk: `kernel` / `test` / `tuner`
+5. Keep only `kernel` chunks; prepend original header to each
 
-**Not inlined (remaining as `#include`):**
+**Step 3 — Deduplicate** by SHA256 of `(task_type || assistant_content)`.
 
-| Reason | Count (train) | Count (heldout) | Examples |
-|---|---|---|---|
-| Not found in aiter | 55 types | 19 types | `opus_gemm_manifest.h`, `fmha_fwd.hpp`, `flatmm_basic.hpp` (auto-generated or CK submodule) |
-| Too large (>1000 lines) | 15 types | 2 types | `custom_all_reduce.cuh` (4889L), `rope_common.h` (8349L), `hk_mla_v40_buffer_managers_gen1.cuh` (2058L) |
+### Chunk Classification Heuristics
 
-### Inlining Parameters
+| Category | Detection | Action |
+|---|---|---|
+| `pybind` | ≥5 hits of: `pybind11`, `py::arg`, `py::module`, `m.def(`, `TORCH_LIBRARY` | Remove |
+| `dispatch` | ≥5 dispatch indicators (`case at::ScalarType::`, `AT_DISPATCH_`, `#define DISPATCH`, `TORCH_CHECK(false`) or macro_ratio > 0.5 with ≥2 indicators | Remove |
+| `macro` | >70% of lines inside `#define` blocks | Remove |
+| `test` | ≥2 of: `unittest`, `assert `, `def test_`, `pytest`, `class Test` | Remove |
+| `tuner` | ≥2 of: `Tuner`, `tune_`, `argparse`, `if __name__` | Remove |
+| `kernel` | None of the above | Keep |
 
-```
-MAX_INLINE_LINES   = 1000      # Skip headers larger than 1000 lines
-MAX_INLINE_DEPTH   = 5         # Maximum recursive inlining depth
-MAX_TOTAL_INLINED  = 150,000   # Maximum total inlined characters per sample
-```
+### Results
 
-### Impact
+| Metric | Before | After |
+|---|---|---|
+| Total samples | 3,670 | 3,975 |
+| Max assistant chars | 515,793 | 32,000 |
+| Samples > 32K | 280 (7.6%) | 0 |
+| INLINED markers | 1,742 | 0 |
 
-| Dataset | C++ Samples | Samples Inlined | Headers Resolved |
-|---|---|---|---|
-| train.jsonl | 1,236 | 402 (32.5%) | 74 unique headers |
-| heldout kernel.cu | 50 | 50 (100%) | 63 unique headers |
+The increase in sample count (3,670 → 3,975) comes from splitting large
+multi-function files into individual kernel samples.
 
 ### Build
 
 ```bash
-python3 inline_case_headers.py
-# Processes both train.jsonl and heldout kernel.cu files
-# Requires: /home/danyzhan/aiter as header source
+python3 rebalance_opus_samples.py
+# Processes: train.jsonl, artifacts/*/candidate/kernel.cu, heldout kernel.cu
+# No external dependencies (aiter repo not needed — operates on already-built data)
 ```
 
 ## No Overlap with Benchmarks
