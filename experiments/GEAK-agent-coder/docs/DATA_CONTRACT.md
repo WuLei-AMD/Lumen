@@ -377,9 +377,85 @@ python3 -m torch.distributed.run --nnodes=1 --nproc-per-node=8 --standalone \
     --config configs/sft/qwen3_coder_sft_f_2epoch.yaml
 ```
 
+## OPUS Header Inlining
+
+OPUS C++ kernel samples depend on aiter project-internal headers. To make
+training and evaluation samples self-contained, case-specific headers are
+recursively inlined while language-level and standard library headers are
+preserved as external `#include` directives.
+
+### Classification Rules
+
+Headers are classified into three categories:
+
+**Preserved (external `#include` kept as-is):**
+
+| Category | Prefixes / Headers |
+|---|---|
+| HIP runtime | `hip/hip_runtime.h`, `hip/hip_bf16.h`, `hip/hip_fp16.h`, `hip/hip_fp8.h` |
+| PyTorch/ATen | `torch/extension.h`, `torch/all.h`, `ATen/ATen.h`, `ATen/hip/HIPContext.h`, `c10/` |
+| OPUS library | `opus/opus.hpp`, `opus/hip_minimal.hpp`, `rocm_ops.hpp` |
+| Composable Kernel | `ck/`, `ck_tile/core.hpp`, `ck_tile/host/`, `ck_tile/ops/` |
+| ROCm libraries | `hipcub/`, `rocprim/`, `rocblas/`, `hipblas/`, `hipblaslt/`, `hiprand/` |
+| C/C++ standard | `cstdint`, `string`, `vector`, `algorithm`, `iostream`, `memory`, etc. |
+| System | `dlfcn.h`, `sys/stat.h`, `fcntl.h`, `unistd.h`, etc. |
+| Other | `kittens`, `pybind11/`, `rccl/`, `rocsolver/`, `cuda_fp8.h` |
+
+**Inlined (content substituted in-place):**
+
+| Header | Train | Heldout | Lines | Description |
+|---|---|---|---|---|
+| `aiter_hip_common.h` | 333x | 37x | 44 | HIP common macros and utilities |
+| `aiter_enum.h` | 333x | 37x | 78 | Enum definitions |
+| `aiter_logger.h` | 333x | 37x | 92 | Logger utilities |
+| `ck_tile_shim.h` | 334x | 37x | 35 | CK tile compatibility shim |
+| `aiter_opus_plus.h` | 71x | 7x | 934 | OPUS+ extension utilities |
+| `hip_reduce.h` | 71x | 8x | 354 | HIP reduction primitives |
+| `attention_generic.cuh` | 21x | — | 245 | Generic attention template |
+| `opus_moe_common.cuh` | 21x | — | 180 | MOE common definitions |
+| `aiter_tensor.h` | 10x | 16x | 226 | Tensor wrapper utilities |
+| `aiter_dispatch.h` | — | 7x | 438 | Dispatch table utilities |
+| `py_itfs_common.h` | 6x | 13x | 156 | Python interface common |
+| `aiter_stream.h` | 6x | 14x | 89 | Stream management |
+| `dispatch_utils.h` | — | 4x | 312 | Dispatch helper utilities |
+| Other (60+ headers) | varied | varied | <1000 | GEMM traits, MOE pipeline, MLA utils, etc. |
+
+Total: **74 unique headers** inlined in training data (1,742 substitutions),
+**63 unique headers** inlined in heldout data (303 substitutions).
+
+**Not inlined (remaining as `#include`):**
+
+| Reason | Count (train) | Count (heldout) | Examples |
+|---|---|---|---|
+| Not found in aiter | 55 types | 19 types | `opus_gemm_manifest.h`, `fmha_fwd.hpp`, `flatmm_basic.hpp` (auto-generated or CK submodule) |
+| Too large (>1000 lines) | 15 types | 2 types | `custom_all_reduce.cuh` (4889L), `rope_common.h` (8349L), `hk_mla_v40_buffer_managers_gen1.cuh` (2058L) |
+
+### Inlining Parameters
+
+```
+MAX_INLINE_LINES   = 1000      # Skip headers larger than 1000 lines
+MAX_INLINE_DEPTH   = 5         # Maximum recursive inlining depth
+MAX_TOTAL_INLINED  = 150,000   # Maximum total inlined characters per sample
+```
+
+### Impact
+
+| Dataset | C++ Samples | Samples Inlined | Headers Resolved |
+|---|---|---|---|
+| train.jsonl | 1,236 | 402 (32.5%) | 74 unique headers |
+| heldout kernel.cu | 50 | 50 (100%) | 63 unique headers |
+
+### Build
+
+```bash
+python3 inline_case_headers.py
+# Processes both train.jsonl and heldout kernel.cu files
+# Requires: /home/danyzhan/aiter as header source
+```
+
 ## No Overlap with Benchmarks
 
 Phase 2 performance analysis data covers operator `mxfp8_blockscale_gemm` only
 (OPUS C++ kernels from perf-turns campaigns). Held-out benchmark tasks
-(`agent-phase2-held-out-aiter`) are all Triton kernels from aiter with 0 content
-overlap verified by SHA256.
+(`agent-phase2-held-out-aiter`) cover 27 operators across 3 languages (Triton,
+OPUS, FlyDSL) with 0 content overlap verified by SHA256.
