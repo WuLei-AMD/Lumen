@@ -40,4 +40,4 @@ execution:
   allow_training: true
   data_manifest_path: /home/danyzhan/Lumen/experiments/GEAK-agent-coder/data/build/qwen3_30b_a3b_sft_f/manifest.json
   tokenizer_sha256: 4dbc3bb2f4583311d9745013e46f2e3dc2c066971c8f16fce90a2f8b5c4baa98
-  data_manifest_sha256: ce0c6dea3040916bcc987d3d138783ac9bf701919f6793ad30ae4ff456114198
+  data_manifest_sha256: bd0a4b9f8262bdac15f299f86e30ce6b633ccb00b04a77c26738b10acf1715df
