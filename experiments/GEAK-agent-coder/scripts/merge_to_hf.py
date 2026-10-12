@@ -1,5 +1,6 @@
 """Merge GEAK Sonic LoRA adapter into HF checkpoint for Qwen3-Coder ModuleList experts."""
 
+import argparse
 import json
 import os
 import shutil
@@ -112,9 +113,18 @@ def merge_adapter(base_dir: str, adapter_dir: str, output_dir: str):
     return manifest
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-model", required=True)
+    parser.add_argument("--adapter-dir", required=True)
+    parser.add_argument("--output-dir", required=True)
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
     merge_adapter(
-        base_dir="/home/danyzhan/Lumen/experiments/GEAK-agent-coder/models/Qwen3-Coder-30B-A3B-Instruct",
-        adapter_dir="/home/danyzhan/Lumen/experiments/GEAK-agent-coder/outputs/qwen3-coder-12k-production/best",
-        output_dir="/home/danyzhan/Lumen/experiments/GEAK-agent-coder/outputs/qwen3-coder-12k-merged",
+        base_dir=args.base_model,
+        adapter_dir=args.adapter_dir,
+        output_dir=args.output_dir,
     )

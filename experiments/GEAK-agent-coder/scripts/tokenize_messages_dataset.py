@@ -1,20 +1,33 @@
-"""Tokenize messages-format dataset into input_ids + loss_mask for SFT training.
+"""Tokenize every messages-format row without truncation and pin the result."""
 
-Reads train.jsonl (messages format) and produces train.tokenized.jsonl
-compatible with PretokenizedLossMaskDataset.
-"""
-import json
+import argparse
 import hashlib
+import json
+import math
 from pathlib import Path
+
 from transformers import AutoTokenizer
 
-TOKENIZER_PATH = "/home/danyzhan/Lumen/experiments/GEAK-agent-coder/models/Qwen3-Coder-30B-A3B-Instruct"
-TRAIN_INPUT = Path("/home/danyzhan/geak_sft_dataset/merged_sft_v2/train.jsonl")
-DEV_INPUT = Path("/home/danyzhan/geak_sft_dataset/phase1-dev-wave-200-v1/processed/dev.jsonl")
-OUTPUT_DIR = Path("/home/danyzhan/Lumen/experiments/GEAK-agent-coder/data/build/qwen3_30b_a3b_sft_f")
-MAX_LENGTH = 12288
+DEFAULT_ROOT = Path("/home/danyzhan/Lumen/experiments/GEAK-agent-coder")
 
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+def apply_chat_template_ids(tokenizer, messages, *, add_generation_prompt):
+    encoded = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=add_generation_prompt,
+    )
+    if hasattr(encoded, "get"):
+        encoded = encoded.get("input_ids")
+    if hasattr(encoded, "tolist"):
+        encoded = encoded.tolist()
+    if encoded and isinstance(encoded[0], list):
+        if len(encoded) != 1:
+            raise ValueError("chat template unexpectedly returned a batched result")
+        encoded = encoded[0]
+    if not isinstance(encoded, list) or not all(isinstance(token, int) for token in encoded):
+        raise TypeError("chat template did not return a flat token-id list")
+    return encoded
 
 
 def tokenize_messages_sample(tokenizer, sample, max_length):
@@ -24,14 +37,14 @@ def tokenize_messages_sample(tokenizer, sample, max_length):
         return None
 
     # Full sequence
-    full_ids = tokenizer.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=False
+    full_ids = apply_chat_template_ids(
+        tokenizer, messages, add_generation_prompt=False
     )
 
     # Prompt only (without assistant)
     prompt_messages = messages[:-1]
-    prompt_ids = tokenizer.apply_chat_template(
-        prompt_messages, tokenize=True, add_generation_prompt=True
+    prompt_ids = apply_chat_template_ids(
+        tokenizer, prompt_messages, add_generation_prompt=True
     )
 
     if len(full_ids) > max_length:
@@ -76,6 +89,7 @@ def tokenize_old_format_sample(tokenizer, sample, max_length):
 def process_file(tokenizer, input_path, output_path, max_length):
     tokenized = 0
     skipped = 0
+    max_observed_length = 0
 
     with open(input_path) as fin, open(output_path, "w") as fout:
         for line in fin:
@@ -93,13 +107,16 @@ def process_file(tokenizer, input_path, output_path, max_length):
                 continue
 
             if result is None:
-                skipped += 1
-                continue
+                raise ValueError(
+                    f"{input_path}: row {tokenized + skipped + 1} exceeds "
+                    f"max_length={max_length}; full-coverage tokenization forbids truncation"
+                )
 
             fout.write(json.dumps(result) + "\n")
             tokenized += 1
+            max_observed_length = max(max_observed_length, len(result["input_ids"]))
 
-    return tokenized, skipped
+    return tokenized, skipped, max_observed_length
 
 
 def file_sha256(path):
@@ -110,21 +127,102 @@ def file_sha256(path):
     return h.hexdigest()
 
 
+def path_sha256(path):
+    target = Path(path).expanduser().resolve()
+    digest = hashlib.sha256()
+    files = sorted(item for item in target.rglob("*") if item.is_file())
+    if not files:
+        raise ValueError(f"tokenizer directory is empty: {target}")
+    for item in files:
+        relative = item.relative_to(target).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(item.read_bytes())
+    return digest.hexdigest()
+
+
+def scan_max_length(tokenizer, paths):
+    maximum = 0
+    rows = 0
+    for input_path in paths:
+        with open(input_path) as fin:
+            for line_number, line in enumerate(fin, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                sample = json.loads(line)
+                if "messages" in sample:
+                    messages = sample["messages"]
+                elif "input" in sample and "output" in sample:
+                    converted = tokenize_old_format_sample(tokenizer, sample, 2**31 - 1)
+                    maximum = max(maximum, len(converted["input_ids"]))
+                    rows += 1
+                    continue
+                else:
+                    raise ValueError(f"{input_path}:{line_number}: unsupported sample schema")
+                ids = apply_chat_template_ids(
+                    tokenizer, messages, add_generation_prompt=False
+                )
+                maximum = max(maximum, len(ids))
+                rows += 1
+    if rows == 0:
+        raise ValueError("dataset contains no samples")
+    return maximum
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--tokenizer",
+        type=Path,
+        default=DEFAULT_ROOT / "models/Qwen3-Coder-30B-A3B-Instruct",
+    )
+    parser.add_argument("--train", type=Path, required=True)
+    parser.add_argument("--dev", type=Path, required=True)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_ROOT / "data/build/qwen3_30b_a3b_sft_f_mi350",
+    )
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=None,
+        help="Defaults to the observed maximum, rounded up to a multiple of 8.",
+    )
+    return parser.parse_args()
+
+
 def main():
-    print(f"Loading tokenizer from {TOKENIZER_PATH}...")
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH, trust_remote_code=True)
+    args = parse_args()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Loading tokenizer from {args.tokenizer}...")
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.tokenizer, local_files_only=True, trust_remote_code=False
+    )
     print(f"Tokenizer loaded. Vocab size: {tokenizer.vocab_size}")
+    observed_max = scan_max_length(tokenizer, (args.train, args.dev))
+    max_length = args.max_length or int(math.ceil(observed_max / 8) * 8)
+    if max_length < observed_max:
+        raise ValueError(
+            f"max_length={max_length} does not cover observed maximum={observed_max}"
+        )
+    print(f"Observed maximum: {observed_max}; configured maximum: {max_length}")
 
     # Train
-    train_out = OUTPUT_DIR / "train.tokenized.jsonl"
-    print(f"\nTokenizing train: {TRAIN_INPUT}")
-    train_tok, train_skip = process_file(tokenizer, TRAIN_INPUT, train_out, MAX_LENGTH)
+    train_out = args.output_dir / "train.tokenized.jsonl"
+    print(f"\nTokenizing train: {args.train}")
+    train_tok, train_skip, train_max = process_file(
+        tokenizer, args.train, train_out, max_length
+    )
     print(f"  Tokenized: {train_tok}, Skipped (overflow): {train_skip}")
 
     # Dev
-    dev_out = OUTPUT_DIR / "dev.tokenized.jsonl"
-    print(f"\nTokenizing dev: {DEV_INPUT}")
-    dev_tok, dev_skip = process_file(tokenizer, DEV_INPUT, dev_out, MAX_LENGTH)
+    dev_out = args.output_dir / "dev.tokenized.jsonl"
+    print(f"\nTokenizing dev: {args.dev}")
+    dev_tok, dev_skip, dev_max = process_file(
+        tokenizer, args.dev, dev_out, max_length
+    )
     print(f"  Tokenized: {dev_tok}, Skipped (overflow): {dev_skip}")
 
     # Token stats
@@ -147,6 +245,7 @@ def main():
 
     # Manifest
     manifest = {
+        "schema_version": "geak_training_data_manifest_v2",
         "artifacts": {
             "train": {
                 "path": "train.tokenized.jsonl",
@@ -160,13 +259,25 @@ def main():
             },
         },
         "source": {
-            "train": str(TRAIN_INPUT),
-            "dev": str(DEV_INPUT),
+            "train": {
+                "path": str(args.train.resolve()),
+                "sha256": file_sha256(args.train),
+            },
+            "dev": {
+                "path": str(args.dev.resolve()),
+                "sha256": file_sha256(args.dev),
+            },
         },
-        "max_length": MAX_LENGTH,
-        "tokenizer": TOKENIZER_PATH,
+        "max_length": max_length,
+        "observed_max_length": max(train_max, dev_max),
+        "split_max_lengths": {"train": train_max, "dev": dev_max},
+        "overflow_rows": train_skip + dev_skip,
+        "tokenizer": {
+            "path": str(args.tokenizer.resolve()),
+            "sha256": path_sha256(args.tokenizer),
+        },
     }
-    manifest_path = OUTPUT_DIR / "manifest.json"
+    manifest_path = args.output_dir / "manifest.json"
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
     print(f"\nManifest saved to {manifest_path}")
