@@ -47,59 +47,19 @@ Compile rate and correct rate are diagnostic (prerequisites, not goals).
 
 SFT models get prompts in `geak_kernel_sft_v1` format (contract + direction + baseline). Base model gets generic natural language prompt. Controlled by `sft_compat` flag.
 
-## Prerequisites
+## Setup and Execution
 
-```bash
-# Inside geak-sft-32k container
-cd /home/danyzhan/Lumen-RL/experiments/multi-tune-agent
-export PYTHONPATH="src:.:scripts:/home/danyzhan/Lumen-RL/experiments/sandbox:${PYTHONPATH}"
-export EVAL_GPU_IDS="2,3,4,5,6,7"
-```
+For complete instructions on server launch, GPU topology, benchmark orchestration,
+multi-model pipeline, monitoring, and troubleshooting, see:
 
-### vLLM Setup (Critical)
+**[MI308_RUNBOOK.md — From-Scratch Kernel Benchmark](MI308_RUNBOOK.md#from-scratch-kernel-benchmark)**
 
-```bash
-ROCR_VISIBLE_DEVICES=0 python3 -m vllm.entrypoints.openai.api_server \
-    --model <MODEL_PATH> \
-    --served-model-name <LABEL> \
-    --tensor-parallel-size 1 --max-model-len 262144 \
-    --enforce-eager --dtype bfloat16 --trust-remote-code \
-    --gpu-memory-utilization 0.95 --port 8000 \
-    --enable-auto-tool-choice --tool-call-parser qwen3_coder
-```
-
-**`--tool-call-parser qwen3_coder` is required.** Using `hermes` or other parsers silently breaks tool calling.
-
-### Dataset
-
-- Location: `/home/danyzhan/held-out-benchmark-aiter/`
-- 100 tasks, 8 operators: gemm(25), rms_norm(19), mha(14), paged_attention(12), rope_kv_cache(12), sampling(12), mla(6)
-- Baselines: AITER kernels with frozen optimal num_warps/num_stages configs
-
-## Running the Benchmark
-
-### Step 1: Verify Baselines
-
-```bash
-python3 -u scripts/run_aiter_benchmark.py --verify-only
-```
-
-### Step 2: Run Benchmark
-
-```bash
-python3 -u scripts/run_aiter_benchmark_geak.py \
-    --model-label sft2 --model-name sft2 --max-turns 50
-```
-
-The benchmark:
-1. Creates a session per task with AITER kernel as baseline (for timing reference)
-2. **Clears kernel.py** to a skeleton (model starts from zero)
-3. Runs 50-turn agent loop (no early stopping)
-4. Records best speedup achieved
-
-### Step 3: Multi-Model Comparison
-
-The pipeline script runs SFT-2e → Base → SFT-4e sequentially, switching vLLM between each.
+Key points:
+- GPU 0: vLLM server (`--tool-call-parser qwen3_coder` required)
+- GPU 2-7: 6 parallel evaluation workers
+- 100 held-out tasks, 200 turns max per task
+- Dataset: `/home/danyzhan/held-out-benchmark-aiter/`
+- Results: `agent-loop-efficiency-results-MI308.md`
 
 ## Baseline Stability
 
