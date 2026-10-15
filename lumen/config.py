@@ -439,7 +439,12 @@ class LumenConfig:
 
                     x_2d = x.reshape(-1, x.shape[-1])
                     go_2d = grad_output.reshape(-1, grad_output.shape[-1])
-                    dx, dw = _rmsnorm_backward(go_2d, x_2d, weight, ctx.eps)
+                    # _rmsnorm_backward multiplies by rsigma. eps is about 1e-6;
+                    # rsigma is rsqrt(mean(x^2) + eps), the same value the
+                    # residual path recomputes before calling this kernel.
+                    variance = x_2d.float().pow(2).mean(dim=-1)
+                    rsigma = torch.rsqrt(variance + ctx.eps)
+                    dx, dw = _rmsnorm_backward(go_2d, x_2d, weight, rsigma)
                     return dx.reshape(x.shape), dw, None
 
             class _AtomAddRMSNormFn(torch.autograd.Function):
@@ -771,8 +776,10 @@ class LumenConfig:
                 def backward(ctx, grad_q, grad_k):
                     positions, = ctx.saved_tensors
                     index = positions.reshape(-1)
-                    cos = ctx.rotary.cos_cache.index_select(0, index).squeeze(-1).squeeze(-1)
-                    sin = ctx.rotary.sin_cache.index_select(0, index).squeeze(-1).squeeze(-1)
+                    # Cache is (positions, 1, 1, rotary_dim / 2). Squeeze the
+                    # two size-1 axes, matching RotaryEmbedding.forward_native.
+                    cos = ctx.rotary.cos_cache.index_select(0, index).squeeze(-2).squeeze(-2)
+                    sin = ctx.rotary.sin_cache.index_select(0, index).squeeze(-2).squeeze(-2)
                     grad_q = _apply_rotary_emb(grad_q, cos, -sin, True)
                     grad_k = _apply_rotary_emb(grad_k, cos, -sin, True)
                     return grad_q, grad_k, None
@@ -980,7 +987,12 @@ class LumenConfig:
             cu_q = torch.arange(0, (batch + 1) * tokens, tokens, device=query.device, dtype=torch.int32)
             cu_k = torch.arange(0, (batch + 1) * kv_tokens, kv_tokens, device=query.device, dtype=torch.int32)
             softmax_scale = dim ** -0.5 if scale is None else float(scale)
-            out = aiter.flash_attn_varlen_func(
+            # The varlen autograd function saves softmax_lse for the backward
+            # kernel and asserts that the forward asked for it.
+            needs_grad = torch.is_grad_enabled() and any(
+                t.requires_grad for t in (q, k, v)
+            )
+            result = aiter.flash_attn_varlen_func(
                 q,
                 k,
                 v,
@@ -995,7 +1007,9 @@ class LumenConfig:
                 softmax_scale=softmax_scale,
                 causal=True,
                 window_size=(-1, -1, 0),
+                return_lse=needs_grad,
             )
+            out = result[0] if isinstance(result, tuple) else result
             return out.view(batch, tokens, heads, dim).permute(0, 2, 1, 3).contiguous()
 
         F.scaled_dot_product_attention = varlen_sdpa
