@@ -45,6 +45,9 @@ def _rank0_print(msg: str) -> None:
 # Arg-name mapping: LumenConfig field → argparse attribute name(s)
 # ---------------------------------------------------------------------------
 
+# Per-shape cache: (M, N, K) -> stable_M with splitK <= 1.
+_stable_m_cache: dict[tuple[int, int, int], int] = {}
+
 _ARG_MAP: dict[str, tuple[str, ...]] = {
     "format": ("linear_fp8_format", "lumen_fp8_format"),
     "scaling": ("linear_fp8_scaling",),
@@ -570,6 +573,67 @@ class LumenConfig:
         if count:
             _rank0_print(f"> Replaced {count} norm modules with Lumen implementations")
 
+    @staticmethod
+    def _stable_tgemm_mm(tgemm, x, weight, bias, otype):
+        """Call tgemm.mm with M padded to the nearest splitK=1 stable bucket.
+
+        Some (M, N, K) shapes resolve via getPaddedM to a tuned row with
+        splitK > 1.  The atomic reduction used by those FlyDSL kernels is
+        non-deterministic in BF16 (floating-point addition is not
+        associative).  Padding the token dimension to the next stable M
+        forces a splitK=1 kernel without changing the result for the
+        original rows (each output row depends only on its own input row
+        and the full weight matrix).
+
+        Gated by LUMENRL_STABLE_GEMM=1.  When the env var is absent or 0,
+        falls through directly to tgemm.mm so the patch is a no-op.
+
+        The lookup is cached per (M, N, K) via a module-level dict so the
+        overhead is O(1) after the first call per shape.
+        """
+        import os
+
+        if os.environ.get("LUMENRL_STABLE_GEMM", "0") != "1":
+            return tgemm.mm(x, weight, bias, otype=otype)
+
+        import torch
+        from aiter.tuned_gemm import get_GEMM_A16W16_config
+
+        # x may be (B, T, K) from HF or (M, K) from ATOM; treat all leading
+        # dims as the token count because each row is independent.
+        m = x.shape[0] if x.dim() == 2 else x.numel() // x.shape[-1]
+        n, k = weight.shape
+        dtype_str = str(x.dtype)
+        orig_shape = x.shape
+        x_2d = x.reshape(m, k)
+
+        cache = _stable_m_cache
+        key = (m, n, k)
+        stable_m = cache.get(key)
+        if stable_m is None:
+            # Walk upward from m until we find an M with splitK <= 1.
+            candidate = m
+            for _ in range(512):
+                cfg = get_GEMM_A16W16_config(
+                    candidate, n, k, bias is not None, dtype_str, dtype_str
+                )
+                sk = cfg.get("splitK") if cfg else None
+                if sk is None or int(sk) <= 1:
+                    break
+                candidate += 1
+            stable_m = candidate
+            cache[key] = stable_m
+
+        if stable_m == m:
+            out = tgemm.mm(x_2d, weight, bias, otype=otype)
+            return out.reshape(*orig_shape[:-1], n)
+
+        # Pad to stable_m with zeros, run GEMM, slice original rows back.
+        pad = x_2d.new_zeros(stable_m - m, k)
+        x_padded = torch.cat([x_2d, pad], dim=0)
+        out_padded = tgemm.mm(x_padded, weight, bias, otype=otype)
+        return out_padded[:m].reshape(*orig_shape[:-1], n).contiguous()
+
     def _patch_qwen3_qkv(self, model) -> None:
         """Replace Qwen3 q/k/v projections with one concatenated GEMM.
 
@@ -596,7 +660,7 @@ class LumenConfig:
                     bias = torch.cat(parts, dim=0)
                 ctx.save_for_backward(x, wq, wk, wv)
                 ctx.bias_flags = (bq is not None, bk is not None, bv is not None)
-                return tgemm.mm(x, weight, bias, otype=x.dtype)
+                return LumenConfig._stable_tgemm_mm(tgemm, x, weight, bias, x.dtype)
 
             @staticmethod
             def backward(ctx, grad_output):
@@ -644,13 +708,17 @@ class LumenConfig:
                 cached = pending.pop("k", None)
                 if cached is not None:
                     return cached
-                return tgemm.mm(hidden, k_mod.weight, k_mod.bias, otype=hidden.dtype)
+                return LumenConfig._stable_tgemm_mm(
+                    tgemm, hidden, k_mod.weight, k_mod.bias, hidden.dtype
+                )
 
             def v_forward(hidden, v_mod=v_mod, pending=pending):
                 cached = pending.pop("v", None)
                 if cached is not None:
                     return cached
-                return tgemm.mm(hidden, v_mod.weight, v_mod.bias, otype=hidden.dtype)
+                return LumenConfig._stable_tgemm_mm(
+                    tgemm, hidden, v_mod.weight, v_mod.bias, hidden.dtype
+                )
 
             q_mod.forward = q_forward
             k_mod.forward = k_forward
@@ -685,7 +753,7 @@ class LumenConfig:
                     bias = torch.cat(parts, dim=0)
                 ctx.save_for_backward(x, w_gate, w_up)
                 ctx.bias_flags = (b_gate is not None, b_up is not None)
-                return tgemm.mm(x, weight, bias, otype=x.dtype)
+                return LumenConfig._stable_tgemm_mm(tgemm, x, weight, bias, x.dtype)
 
             @staticmethod
             def backward(ctx, grad_output):
@@ -727,7 +795,9 @@ class LumenConfig:
                 cached = pending.pop("up", None)
                 if cached is not None:
                     return cached
-                return tgemm.mm(hidden, up_mod.weight, up_mod.bias, otype=hidden.dtype)
+                return LumenConfig._stable_tgemm_mm(
+                    tgemm, hidden, up_mod.weight, up_mod.bias, hidden.dtype
+                )
 
             gate_mod.forward = gate_forward
             up_mod.forward = up_forward
@@ -880,7 +950,19 @@ class LumenConfig:
             _rank0_print("> residual_rmsnorm: Qwen3 decoder stack not found, skipped")
             return
 
-        backbone._atom_residual = None
+        import torch
+
+        # The residual used to live on backbone._atom_residual. Activation
+        # checkpointing recomputes one layer at a time and does not replay that
+        # attribute, so the recomputed layer took the no-residual branch and
+        # saved a different tensor (3D hidden vs the 2D fused residual). The
+        # residual now rides in the layer output, which is the next layer's
+        # positional input and is what checkpoint saves. Qwen3 hidden states
+        # are rank 3; rank 4 with a leading 2 is (hidden, residual).
+        def _split_residual(hidden_states):
+            if hidden_states.dim() == 4 and hidden_states.shape[0] == 2:
+                return hidden_states[0], hidden_states[1]
+            return hidden_states, None
 
         def layer_forward(layer):
             def forward(
@@ -892,8 +974,7 @@ class LumenConfig:
                 position_embeddings=None,
                 **kwargs,
             ):
-                carried = backbone._atom_residual
-                backbone._atom_residual = None
+                hidden_states, carried = _split_residual(hidden_states)
                 if carried is None:
                     residual = hidden_states
                     hidden_states = layer.input_layernorm(hidden_states)
@@ -910,8 +991,7 @@ class LumenConfig:
                 )
                 hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
                 hidden_states = layer.mlp(hidden_states)
-                backbone._atom_residual = residual
-                return hidden_states
+                return torch.stack((hidden_states, residual), dim=0)
 
             return forward
 
@@ -922,15 +1002,14 @@ class LumenConfig:
         orig_model_forward = backbone.forward
 
         def norm_forward(hidden_states, residual=None):
-            carried = backbone._atom_residual if residual is None else residual
-            backbone._atom_residual = None
-            if carried is None:
+            if residual is None:
+                hidden_states, residual = _split_residual(hidden_states)
+            if residual is None:
                 return orig_norm(hidden_states)
-            out, _ = orig_norm(hidden_states, carried)
+            out, _ = orig_norm(hidden_states, residual)
             return out
 
         def model_forward(*args, **kwargs):
-            backbone._atom_residual = None
             return orig_model_forward(*args, **kwargs)
 
         norm.forward = norm_forward
@@ -1044,7 +1123,7 @@ class LumenConfig:
                 def forward(ctx, input, weight, bias):
                     ctx.save_for_backward(input, weight)
                     ctx.has_bias = bias is not None
-                    return tgemm.mm(input, weight, bias, otype=input.dtype)
+                    return LumenConfig._stable_tgemm_mm(tgemm, input, weight, bias, input.dtype)
 
                 @staticmethod
                 def backward(ctx, grad_output):
@@ -1104,7 +1183,9 @@ class LumenConfig:
                             delay_wgrad, deferred_wgrad, activation_tensor_id,
                             pre_quantized_input,
                         )
-                    return tgemm.mm(input_, weight, bias, otype=input_.dtype)
+                    return LumenConfig._stable_tgemm_mm(
+                        tgemm, input_, weight, bias, input_.dtype
+                    )
 
                 _pl._do_gemm = _atom_do_gemm
                 _rank0_print("> ATOM rollout: patched parallel linear GEMM to use TunedGemm.mm()")
