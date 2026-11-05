@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Add the aiter modules Lumen needs but upstream aiter does not ship.
 
-Lumen imports 8 module paths at the top level of its own modules that only exist
-on its aiter fork (ZhangDanyang-AMD/aiter @ lumen/triton_kernels). Without them
-`import lumen` raises ModuleNotFoundError. Dockerfile.lumen solves this by
-overlaying individual files onto an existing aiter install, and warns against
-copying more than that: newer aiter Python expects newer CK/csrc source, which
-breaks the runtime JIT build. This does the same overlay against the aiter that
-is already installed in this container.
+Lumen imports aiter Triton modules at the top level of its own modules
+(cross_entropy, sparse_mla_dsv4_train) that aiter 0.1.12.post2 does not ship.
+Without them `import lumen` raises ModuleNotFoundError. Copying whole
+directories of newer aiter Python over an install is not an option: it expects
+newer CK/csrc source, which breaks the runtime JIT build. This adds only the
+missing files to the aiter that is already installed in this container.
 
 Safety: only files that do not already exist are written, so nothing aiter
 currently ships is modified. Anything already present is reported and skipped --
@@ -22,8 +21,16 @@ The files under aiter_overlay/ come from two places, and are copied into the
 example rather than fetched so that reproducing this does not require cloning
 several hundred MB of aiter:
 
-* ops/triton/** -- Lumen's aiter fork (third_party/aiter,
-  ZhangDanyang-AMD/aiter @ lumen/triton_kernels), the nine files above.
+* ops/triton/** -- aiter main as pinned by third_party/aiter (ff745fb0), byte
+  for byte: the Triton modules Lumen calls, plus the helpers they import that
+  0.1.12.post2 lacks (utils/config_utils.py, utils/tuned_config_utils.py,
+  _triton_kernels/common/segment_tile.py). Each was checked to import on
+  0.1.12.post2 with only the files it already ships. fusions/mhc.py,
+  mxfp8_attention_kernel.py and block_scale_fp8_attention_kernel.py are left
+  out: they need newer versions of files 0.1.12.post2 already has
+  (ops/mhc.py, utils/logger.py, arch_info.is_cdna4), which this overlay never
+  replaces. Lumen guards those imports, so only the DSv4 hyper-connection and
+  the FP8/MXFP8 Triton attention paths are unavailable on such an install.
 * ops/flydsl/conv_kernels.py, ops/flydsl/conv3d_policy.py,
   ops/flydsl/kernels/conv/*, configs/*conv3d*.csv and the Qwen-Image / Wan2.1
   tables in configs/model_configs/ -- the FlyDSL implicit-GEMM convolution and
