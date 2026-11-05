@@ -193,7 +193,7 @@ def _probe_aiter_fused_silu_mul_fp8():
 @functools.lru_cache(maxsize=1)
 def _probe_aiter_gmm():
     try:
-        from aiter.ops.triton.gmm import gmm as _  # noqa: F401
+        from aiter.ops.triton.gemm.grouped.gmm import gmm as _  # noqa: F401
 
         return True
     except (ImportError, OSError):
@@ -212,9 +212,15 @@ def _probe_aiter_deepgemm():
 
 @functools.lru_cache(maxsize=1)
 def _probe_aiter_triton_gemm_mxfp8():
-    """Check if AITER Triton MXFP8 GEMM is available."""
+    """Check if the AITER kernel behind Lumen's MXFP8 GEMM is available.
+
+    AITER no longer ships a dedicated ``gemm_mxfp8``; Lumen converts the E8M0
+    scales to FP32 itself and runs AITER's block-scale GEMM.
+    """
     try:
-        from aiter.ops.triton.gemm.basic.gemm_mxfp8 import gemm_mxfp8 as _  # noqa: F401
+        from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (  # noqa: F401
+            gemm_a8w8_blockscale as _,
+        )
 
         return True
     except (ImportError, OSError):

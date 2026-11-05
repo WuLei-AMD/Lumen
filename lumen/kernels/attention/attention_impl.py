@@ -32,7 +32,7 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 try:
-    from aiter.ops.triton._triton_kernels.attention.fp8_attention_kernel import (
+    from aiter.ops.triton._triton_kernels.attention.block_scale_fp8_attention_kernel import (
         DEBUG,
         FIXED_BLOCK_M,
         FIXED_BLOCK_N,
@@ -41,11 +41,6 @@ try:
         _bwd_kernel_dq,
         _bwd_preprocess_use_o,
         attn_fwd,
-        get_padded_head_dim,
-        get_shape_from_layout,
-        get_strides_from_layout,
-        get_tl_f8_bwd_dtype,
-        is_cdna4,
         philox_offset,
         philox_seed,
     )
@@ -89,7 +84,7 @@ _torch_custom_op_wrapper = torch.library.custom_op
 
 if attn_fwd is None:
     logger.warning(
-        "aiter fp8_attention_kernel unavailable; FP8 Triton attention disabled "
+        "aiter block_scale_fp8_attention_kernel unavailable; FP8 Triton attention disabled "
         "(csrc and BF16 backends unaffected)"
     )
 if attn_fwd_mxfp8 is None:
@@ -173,6 +168,84 @@ F8_BWD_MAX: tl.constexpr = torch.finfo(get_f8_bwd_dtype()).max
 
 def round_multiple(x, m):
     return (x + m - 1) // m * m
+
+
+def is_cdna4() -> bool:
+    """True on gfx950, the only arch the MXFP8 Triton kernels support."""
+    target = triton.runtime.driver.active.get_current_target()
+    return target is not None and target.backend == "hip" and target.arch == "gfx950"
+
+
+def get_tl_f8_bwd_dtype():
+    """Triton dtype of the FP8 operands in the backward kernels."""
+    fnuz = not is_cdna4()
+    if USE_FP8E5M2_BWD:
+        return tl.float8e5b16 if fnuz else tl.float8e5
+    return tl.float8e4b8 if fnuz else tl.float8e4nv
+
+
+def get_padded_head_dim(head_size: int) -> int:
+    """Head dim rounded up to a power of two, at least 16 (the kernels' minimum tile)."""
+    return max(1 << (head_size - 1).bit_length(), 16)
+
+
+def get_shape_from_layout(
+    q, k, v, layout, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=None, max_seqlen_k=None
+):
+    """``(batch, nheads_q, nheads_k, head_size_qk, head_size_v, max_seqlen_q, max_seqlen_k)``."""
+    if layout == "bhsd":
+        batch_q, nheads_q, max_seqlen_q, head_size_q = q.shape
+        batch_k, nheads_k, max_seqlen_k, head_size_k = k.shape
+        head_size_v = v.shape[3]
+    elif layout == "bshd":
+        batch_q, max_seqlen_q, nheads_q, head_size_q = q.shape
+        batch_k, max_seqlen_k, nheads_k, head_size_k = k.shape
+        head_size_v = v.shape[3]
+    elif layout == "thd":
+        batch_q, nheads_q, head_size_q = len(cu_seqlens_q) - 1, q.shape[1], q.shape[2]
+        batch_k, nheads_k, head_size_k = len(cu_seqlens_k) - 1, k.shape[1], k.shape[2]
+        head_size_v = v.shape[2]
+    else:
+        raise ValueError(f"unsupported attention layout {layout!r}")
+
+    assert batch_q == batch_k
+    assert head_size_q == head_size_k
+
+    return batch_q, nheads_q, nheads_k, head_size_q, head_size_v, max_seqlen_q, max_seqlen_k
+
+
+def get_strides_from_layout(q, layout):
+    """``(batch, head, seq, dim)`` strides of ``q`` for the given layout."""
+    if layout == "thd":
+        return (0, q.stride(1), q.stride(0), q.stride(2))
+    if layout == "bhsd":
+        return (q.stride(0), q.stride(1), q.stride(2), q.stride(3))
+    if layout == "bshd":
+        return (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
+    raise ValueError(f"unsupported attention layout {layout!r}")
+
+
+def _mxfp8_flag_args(kernel, use_mxfp8):
+    """``(use_mxfp8,)`` for an MXFP8 kernel that still declares the switch, else ``()``.
+
+    Older aiter MXFP8 kernels took ``use_mxfp8`` (False pushed BF16 through the
+    same kernel). Current aiter dropped it: those kernels are always MXFP8. Both
+    callers in :mod:`lumen.ops.attention` pass ``True``, so the only thing lost
+    is a mode nothing selects; fail loudly if that ever stops being true rather
+    than silently running MXFP8 on data the caller left unquantized.
+    """
+    if "use_mxfp8" in kernel.arg_names:
+        return (use_mxfp8,)
+    assert use_mxfp8, (
+        "this aiter's MXFP8 kernels have no use_mxfp8 switch; the Triton MXFP8 path "
+        "cannot run on unquantized inputs"
+    )
+    return ()
+
+
+def _mxfp8_flag_kwargs(kernel, use_mxfp8):
+    """Keyword form of :func:`_mxfp8_flag_args`."""
+    return {"use_mxfp8": use_mxfp8} if _mxfp8_flag_args(kernel, use_mxfp8) else {}
 
 
 ###########################################################################
@@ -1274,7 +1347,7 @@ def attention_mxfp8_forward_triton_impl(
         q_scale,
         k_scale,
         v_scale,
-        use_mxfp8,
+        *_mxfp8_flag_args(attn_fwd_mxfp8, use_mxfp8),
         sm_scale,
         softmax_lse,
         o,
@@ -1568,7 +1641,7 @@ def attention_triton_mxfp8_backward_triton_impl(
         do_fp8,
         do_scale,
         delta,
-        use_mxfp8,
+        *_mxfp8_flag_args(_bwd_preprocess_use_o_mxfp8, use_mxfp8),
         stride_oz,
         stride_oh,
         stride_om,
@@ -1703,7 +1776,7 @@ def attention_triton_mxfp8_backward_triton_impl(
         CAUSAL=causal,
         USE_EXP2=use_exp2,
         IS_VARLEN=is_varlen,
-        use_mxfp8=use_mxfp8,
+        **_mxfp8_flag_kwargs(_bwd_kernel_dq_mxfp8, use_mxfp8),
         F8_BWD_DTYPE=get_tl_f8_bwd_dtype(),
         QUANT_BLOCK_SIZE=quant_block_size,
         QUANT_SIZE=quant_size,
@@ -1789,7 +1862,7 @@ def attention_triton_mxfp8_backward_triton_impl(
         CAUSAL=causal,
         USE_EXP2=use_exp2,
         IS_VARLEN=is_varlen,
-        use_mxfp8=use_mxfp8,
+        **_mxfp8_flag_kwargs(_bwd_kernel_dkdv_mxfp8, use_mxfp8),
         F8_BWD_DTYPE=get_tl_f8_bwd_dtype(),
         QUANT_BLOCK_SIZE=quant_block_size,
         QUANT_SIZE=quant_size,
