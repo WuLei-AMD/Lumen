@@ -620,6 +620,44 @@ def _scale_to_f32_1x1(scale, device):
     return torch.tensor([[scale]], dtype=torch.float32, device=device)
 
 
+def _hipb_mm_accepts(*tensors):
+    """Whether AITER's ``hipb_mm`` takes these operand dtypes.
+
+    AITER marshals ``hipb_mm`` arguments through ``aiter_tensor_t``, whose dtype
+    table holds a single FP8 type (E4M3), so an E5M2 operand raises before it
+    reaches hipBLASLt.
+    """
+    try:
+        from aiter.utility.dtypes import _torch_to_aiter_dtype
+    except ImportError:
+        return True
+    return all(t.dtype in _torch_to_aiter_dtype for t in tensors)
+
+
+def _fp8_mm(mat1, mat2, sol, scale1, scale2):
+    """``mat1 @ mat2`` in BF16 on hipBLASLt, via ``hipb_mm`` or ``torch._scaled_mm``.
+
+    ``torch._scaled_mm`` covers the dtypes ``hipb_mm`` rejects (E5M2 grads) but
+    needs a row-major LHS and a column-major RHS, so a mismatched operand is
+    transposed once.
+    """
+    if _hipb_mm_accepts(mat1, mat2):
+        from aiter.ops.gradlib import hipb_mm
+
+        return hipb_mm(mat1, mat2, sol, out_dtype=torch.bfloat16, scaleA=scale1, scaleB=scale2)
+
+    from lumen.ops.quantize.fast_transpose import fast_transpose_fp8
+
+    if mat1.stride(1) != 1:
+        mat1 = fast_transpose_fp8(mat1.t()) if mat1.stride(0) == 1 else mat1.contiguous()
+    if mat2.stride(0) != 1:
+        mat2 = fast_transpose_fp8(mat2.contiguous()).t()
+    return torch._scaled_mm(
+        mat1, mat2, scale_a=scale1.reshape(1), scale_b=scale2.reshape(1),
+        out_dtype=torch.bfloat16,
+    )
+
+
 def _gemm_per_tensor_hipblas(a_fp8, w_fp8, scale_a, scale_w, w_transposed=None, bias=None):
     """hipBLASLt per-tensor GEMM via AITER hipb_mm.
 
@@ -699,15 +737,13 @@ def _gemm_per_tensor_hipblas_mixed(a_fp8, w_fp8, scale_a, scale_w):
     weight ``(N_out, K_in)``.  hipb_mm computes ``mat1 @ mat2`` so we pass
     them directly — no transpose needed (saving ~224 MiB contiguous copy).
     """
-    from aiter.ops.gradlib import hipb_mm
-
     ensure_hipblaslt_ready()
     sa = _scale_to_f32_1x1(scale_a, a_fp8.device)
     sw = _scale_to_f32_1x1(scale_w, w_fp8.device)
     M = a_fp8.shape[0]
     N, K = w_fp8.shape
     sol = _get_tuned_solution(M, K, N)
-    return hipb_mm(a_fp8, w_fp8, sol, out_dtype=torch.bfloat16, scaleA=sa, scaleB=sw)
+    return _fp8_mm(a_fp8, w_fp8, sol, sa, sw)
 
 
 def gemm_per_tensor_mixed(a_fp8, w_fp8, scale_a, scale_w, w_transpose=None):
@@ -730,7 +766,7 @@ def gemm_per_tensor_mixed(a_fp8, w_fp8, scale_a, scale_w, w_transpose=None):
     #     GEMM, but needs a column-major RHS. Free when the weight transpose is
     #     already cached (dgrad): transpose_cached is (K_in,N_out) row-major, so
     #     .t() is exactly the (N_out,K_in) column-major RHS scaled_mm wants.
-    #  2. AITER Triton gemm_a8w8_mixed (FP32 tl.dot) — consumes any strides, no
+    #  2. AITER Triton gemm_a8w8 (FP32 tl.dot, any FP8 mix) — consumes any strides, no
     #     transpose copy needed. Fallback when no cached transpose is available.
     if a_fp8.dtype != w_fp8.dtype:
         if w_transpose is not None and w_transpose.dtype == w_fp8.dtype:
@@ -740,15 +776,18 @@ def gemm_per_tensor_mixed(a_fp8, w_fp8, scale_a, scale_w, w_transpose=None):
                 a_fp8, w_transpose.t(), scale_a=sa, scale_b=sw,
                 out_dtype=torch.bfloat16,
             )
-        from aiter.ops.triton.gemm.basic.gemm_a8w8_mixed import gemm_a8w8_mixed
+        from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8
 
         M = a_fp8.shape[0]
         K_in = w_fp8.shape[1]
         sa = _expand_per_tensor_scale(scale_a, M)
         sw = _expand_per_tensor_scale(scale_w, K_in)
-        return gemm_a8w8_mixed(
-            a_fp8, w_fp8, sa, sw, dtype=torch.bfloat16, w_transposed=True,
-        )
+        # gemm_a8w8 computes X @ W^T and requires W shaped (N, K) before its
+        # own transpose. ``w_fp8`` is (N_out, K_in), which is already the
+        # (K, N) product layout (K = N_out). Transpose it once so the kernel's
+        # transpose restores grad @ weight. There is no FP8 dtype check, so
+        # E5M2 x E4M3 is accepted.
+        return gemm_a8w8(a_fp8, w_fp8.t(), sa, sw, dtype=torch.bfloat16)
     if _FAST_GEMM_DISPATCH:
         fn = _get_fast_gemm_fn("gemm_per_tensor_mixed")
         if fn is not None:
@@ -785,8 +824,6 @@ def _gemm_wgrad_hipblas(grad_fp8, input_fp8, scale_grad, scale_input):
 
     Supports mixed-dtype: grad can be E5M2, input can be E4M3 (matching TE).
     """
-    from aiter.ops.gradlib import hipb_mm
-
     ensure_hipblaslt_ready()
     g_t = grad_fp8.t()
     sg = (
@@ -802,7 +839,7 @@ def _gemm_wgrad_hipblas(grad_fp8, input_fp8, scale_grad, scale_input):
     M, N_out = grad_fp8.shape
     K_in = input_fp8.shape[1]
     sol = _get_tuned_solution(N_out, K_in, M)
-    return hipb_mm(g_t, input_fp8, sol, out_dtype=torch.bfloat16, scaleA=sg, scaleB=si)
+    return _fp8_mm(g_t, input_fp8, sol, sg, si)
 
 
 def gemm_wgrad_fp8(grad_fp8, input_fp8, scale_grad, scale_input):
@@ -833,7 +870,7 @@ def gemm_wgrad_mixed(grad_fp8, input_fp8, scale_grad, scale_input, grad_t=None):
     this beats the copy-free ``grad.t()`` stride path — that path forces a
     slower kernel variant, so avoiding the transpose is a false economy for the
     large-K wgrad shapes (e.g. down/gate_up: ~6-14% faster with the transpose).
-    Falls back to AITER Triton ``gemm_a8w8_mixed`` when hipBLASLt is absent.
+    Falls back to AITER Triton ``gemm_a8w8`` when hipBLASLt is absent.
 
     ``grad_t`` (optional) is a pre-computed ``(N_out, M)`` contiguous transpose
     of ``grad_fp8``, produced upstream by the fused cast+transpose grad
@@ -853,20 +890,15 @@ def gemm_wgrad_mixed(grad_fp8, input_fp8, scale_grad, scale_input, grad_t=None):
         K_in = input_fp8.shape[1]
         M = grad_fp8.shape[0]
         sol = _get_tuned_solution(N_out, K_in, M)
-        from aiter.ops.gradlib import hipb_mm
+        return _fp8_mm(grad_t, input_fp8, sol, sg, si)
 
-        return hipb_mm(grad_t, input_fp8, sol, out_dtype=torch.bfloat16,
-                       scaleA=sg, scaleB=si)
-
-    from aiter.ops.triton.gemm.basic.gemm_a8w8_mixed import gemm_a8w8_mixed
+    from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8
 
     N_out = grad_fp8.shape[1]
     K_in = input_fp8.shape[1]
     sx = _expand_per_tensor_scale(scale_grad, N_out)
     sw = _expand_per_tensor_scale(scale_input, K_in)
-    return gemm_a8w8_mixed(
-        grad_fp8.t(), input_fp8, sx, sw, dtype=torch.bfloat16, w_transposed=True,
-    )
+    return gemm_a8w8(grad_fp8.t(), input_fp8.t(), sx, sw, dtype=torch.bfloat16)
 
 
 def _gemm_per_token_triton(a_fp8, w_fp8, scale_a, scale_w):
@@ -941,11 +973,37 @@ def gemm_blockscale_with_bias(a_fp8, w_fp8, scale_a, scale_w, bias):
     return try_backends(backends, op_name="gemm_blockscale_fused_bias")
 
 
-def _gemm_mxfp8_triton(a_fp8, w_fp8, scale_a, scale_w):
-    from aiter.ops.triton.gemm.basic.gemm_mxfp8 import gemm_mxfp8
+def _e8m0_to_fp32(scales_e8m0):
+    """E8M0 byte -> FP32, including the two values a numeric cast gets wrong.
 
-    block_size = a_fp8.shape[1] // scale_a.shape[-1]
-    return gemm_mxfp8(a_fp8, w_fp8, scale_a, scale_w, quant_block_size=block_size)
+    The byte is a biased exponent, so ``0`` is ``2**-127`` and ``0xFF`` is a
+    NaN. Casting the byte to int32 and shifting it into the exponent field
+    turns those into ``0.0`` and ``+inf``. Use the same conversion Lumen's
+    MXFP4 path already uses.
+    """
+    from aiter.utility.fp4_utils import e8m0_to_f32
+
+    return e8m0_to_f32(scales_e8m0)
+
+
+def _gemm_mxfp8_triton(a_fp8, w_fp8, scale_a, scale_w):
+    # AITER dropped its ``gemm_mxfp8`` wrapper; it was only an E8M0 -> FP32
+    # scale conversion in front of the block-scale GEMM, so do that here.
+    from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import gemm_a8w8_blockscale
+
+    M, K = a_fp8.shape
+    assert K == w_fp8.shape[1], "Incompatible K dimensions"
+    block_size = K // scale_a.shape[-1]
+    expected_scale_k = K // block_size
+    assert tuple(scale_a.shape) == (M, expected_scale_k), (
+        f"scale_a shape {tuple(scale_a.shape)} != expected ({M}, {expected_scale_k})"
+    )
+    assert scale_w.shape[1] == expected_scale_k, (
+        f"scale_w K-dim {scale_w.shape[1]} != expected {expected_scale_k}"
+    )
+    return gemm_a8w8_blockscale(
+        a_fp8, w_fp8, _e8m0_to_fp32(scale_a), _e8m0_to_fp32(scale_w), dtype=torch.bfloat16,
+    )
 
 
 def gemm_mxfp8(a_fp8, w_fp8, scale_a, scale_w):

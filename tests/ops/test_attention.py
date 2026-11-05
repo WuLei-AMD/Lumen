@@ -53,7 +53,7 @@ def _is_aiter_available():
 
 def _is_gfx950():
     try:
-        from aiter.ops.triton._triton_kernels.attention.fp8_attention_kernel import is_cdna4
+        from lumen.kernels.attention.attention_impl import is_cdna4
 
         return is_cdna4()
     except Exception:
