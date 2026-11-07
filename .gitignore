@@ -19,6 +19,7 @@ train_*.log
 .claude/tmp-training-bugs.md
 
 # Datasets staged by the Megatron launchers
+examples/results/
 examples/*/results/mock_data/
 examples/*/results/c4_data/
 

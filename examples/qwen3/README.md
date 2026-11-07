@@ -1,6 +1,6 @@
 # Qwen3-8B LoRA SFT — PyTorch FSDP + Lumen FP8 blockwise2d
 
-Supervised fine-tuning of **Qwen3-8B** with LoRA on **8×MI308X**, using PyTorch
+Supervised fine-tuning of **Qwen3-8B** with LoRA on **8 GPUs**, using PyTorch
 FSDP for sharding and **Lumen** for FP8 **blockwise2d** linear quantization. Same
 recipe as the Llama2-7B FSDP `fp8_blockwise2d` run (`../llama2`): `LumenConfig.enable`
 applies FP8 blockwise2d linear quant + LoRA; attention and norm stay BF16.
@@ -10,7 +10,7 @@ applies FP8 blockwise2d linear quant + LoRA; attention and norm stay BF16.
 | Path | Purpose |
 |---|---|
 | `train_qwen3_fsdp.py` | Training script (FSDP + `LumenConfig.enable`; `--mode bf16|fp8_blockwise2d|mxfp4`) |
-| `run_qwen3_fsdp_mi308.sh` | Docker launcher for 8×MI308X |
+| `run_qwen3_fsdp.sh` | Docker launcher for 8 GPUs |
 | `scripts/download_model.py` | Fetch the HF model checkpoint |
 | `scripts/download_dataset.py` | Fetch an alpaca-style dataset as jsonl |
 | `requirements.txt` | Python deps (`transformers`, `peft`, `datasets`, ...) |
@@ -37,7 +37,7 @@ python scripts/download_dataset.py --dataset_name tatsu-lab/alpaca --output_dir 
 ```bash
 HOST_MODEL=/data/Qwen3-8B HOST_DATA=/data/alpaca \
 TRAIN_FILE=train.jsonl VAL_FILE=validation.jsonl \
-  bash run_qwen3_fsdp_mi308.sh
+  bash run_qwen3_fsdp.sh
 ```
 
 Overridable env: `HOST_MODEL`, `HOST_DATA`, `HOST_RESULTS`, `TRAIN_FILE`,
@@ -53,8 +53,9 @@ torchrun --nproc_per_node=8 train_qwen3_fsdp.py \
   --seq-length 2048 --max-steps 200 --eval-interval 50 --seed 1234
 ```
 
-MXFP4 mode requires gfx950. The MI308X launcher is gfx942-only and rejects
-`MODE=mxfp4`; run the trainer directly on a gfx950 host instead. Packed-FP4
+MXFP4 mode requires gfx950. `run_qwen3_fsdp.sh` is the BF16 / FP8 blockwise2d
+launcher and rejects `MODE=mxfp4`. On gfx950, LoRA SFT is `run_qwen3_fsdp_mxfp4_sft.sh` and
+full-parameter pretraining is `run_qwen3_fsdp_mxfp4_pretrain.sh`. Packed-FP4
 parameter all-gather is opt-in and requires FSDP2:
 
 ```bash
@@ -128,7 +129,7 @@ FSDP_VERSION=2 CACHE_FROZEN_WEIGHT=1 BPRESHUFFLE=1 GRAD_CKPT=0 \
 SHARDING=shard_grad_op LIMIT_ALL_GATHERS=0 FORWARD_PREFETCH=1 \
 AITER_ATTN=1 LUMEN_NORM=1 FUSE_ROPE=1 MODE=fp8_blockwise2d \
 HOST_MODEL=/data/Qwen3-8B HOST_DATA=/data/alpaca \
-  bash run_qwen3_fsdp_mi308.sh
+  bash run_qwen3_fsdp.sh
 ```
 
 | stage | step time |
