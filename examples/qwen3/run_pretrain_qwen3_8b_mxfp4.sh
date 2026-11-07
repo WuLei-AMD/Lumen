@@ -43,6 +43,11 @@ CFG_ENV=(
     SEED="${SEED:-1234}"
     NPROC="${NPROC:-8}"
 )
+# Empty keeps train_pretrain.sh's own cadence (about ten evals per run).
+# A set value is the step interval, matching the other launchers' TRAIN_STEPS.
+if [ -n "${EVAL_INTERVAL:-}" ]; then
+    CFG_ENV+=(EVAL_INTERVAL="${EVAL_INTERVAL}")
+fi
 
 # Shared by both modes. Everything here is either a ROCm/RCCL tuning knob or a
 # Lumen fusion switch; none of them change numerics.
@@ -137,6 +142,9 @@ docker run --rm --init \
     --cap-add=SYS_PTRACE \
     --shm-size 16G \
     -v "${LUMEN_DIR}:/workspace/Lumen" \
+    ${AITER_SRC:+-v "${AITER_SRC}:/opt/aiter"} \
+    ${AITER_JIT_DIR:+-v "${AITER_JIT_DIR}:/aiter-jit"} \
+    ${AITER_JIT_DIR:+-e AITER_JIT_DIR=/aiter-jit} \
     -v "${TOKENIZER_DIR}:/tokenizer:ro" \
     -v "${RESULTS_DIR}:/results" \
     "${DOCKER_ENV[@]}" \

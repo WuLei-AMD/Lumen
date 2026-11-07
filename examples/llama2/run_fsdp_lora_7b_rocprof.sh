@@ -2,7 +2,7 @@
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 #
 # Capture a rocprofv3 performance trace of Llama2-7B FSDP LoRA SFT, FP8
-# blockwise2d, on 8x MI308X. Only GLOBAL rank 0 is profiled. A short run is
+# blockwise2d, on 8 GPUs. Only GLOBAL rank 0 is profiled. A short run is
 # enough — the trace covers model load, first-step JIT/compile, and a few
 # steady-state training steps. View the resulting .pftrace at ui.perfetto.dev.
 #
@@ -24,12 +24,14 @@ export TRAIN_STEPS="${TRAIN_STEPS:-8}"
 export LUMEN_ROCPROF=1
 export LUMEN_ROCPROF_OPTS="${LUMEN_ROCPROF_OPTS:--r}"
 
-export HOST_MODEL="${HOST_MODEL:-/mnt/raid0/leiwu/mlperf/llama2_7b_hf}"
-export HOST_RESULTS="${HOST_RESULTS:-/mnt/raid0/leiwu/mlperf/results/rocprof_7b_fp8_blockwise2d}"
+: "${HOST_MODEL:?Set HOST_MODEL to a HuggingFace Llama-2-7b directory}"
+: "${HOST_DATA:?Set HOST_DATA to the directory that contains train.npy and validation.npy}"
+export HOST_MODEL HOST_DATA
+export HOST_RESULTS="${HOST_RESULTS:-${SCRIPT_DIR}/results/rocprof_7b_fp8_blockwise2d}"
 export CONTAINER_NAME="${CONTAINER_NAME:-lumen_fsdp_7b_rocprof}"
 
 # Trace default-heuristic kernels (no first-step tuning sweep). Set =1 to trace
 # the tuned kernels instead (adds minutes of startup).
 export PYTORCH_TUNABLEOP_ENABLED="${PYTORCH_TUNABLEOP_ENABLED:-0}"
 
-bash "${SCRIPT_DIR}/run_fsdp_lora_7b_mi308.sh"
+bash "${SCRIPT_DIR}/run_fsdp_lora_7b.sh"

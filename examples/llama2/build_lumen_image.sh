@@ -17,4 +17,4 @@ docker build \
 
 echo "[build] Done: ${IMAGE}"
 echo "Run training with:"
-echo "  bash /mnt/raid0/leiwu/mlperf/run_mlperf_70b_latest_blockwise2d.sh"
+echo "  IMAGE=${IMAGE} HOST_MODEL=/path/to/model HOST_DATA=/path/to/data bash examples/llama2/run_fsdp_lora_7b.sh"

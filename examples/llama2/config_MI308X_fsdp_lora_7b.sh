@@ -17,7 +17,7 @@
 #
 # Usage (the launcher forwards MODE into the container):
 #   MODE=fp8_delayed CONFIG=config_MI308X_fsdp_lora_7b.sh \
-#       bash run_fsdp_lora_mi308.sh
+#       bash run_fsdp_lora.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Capture any env overrides BEFORE sourcing the base config, which unconditionally
@@ -26,6 +26,15 @@ _OVR_TRAIN_STEPS="${TRAIN_STEPS:-}"
 _OVR_SAVE_INTERVAL="${SAVE_INTERVAL:-}"
 _OVR_SAVE_CKPT="${SAVE_CKPT:-}"
 _OVR_TUNABLEOP="${PYTORCH_TUNABLEOP_ENABLED:-}"   # config_MI355X hardcodes =1; capture caller value first
+# The base config assigns SEQ_LEN, MBS and the npy paths unconditionally.
+# Capture the caller values first so a later default does not clobber them.
+_OVR_SEQ_LEN="${SEQ_LEN:-}"
+_OVR_MBS="${MBS:-}"
+_OVR_GRAD_ACCUM="${GRAD_ACCUM:-}"
+_OVR_TRAIN_DATA="${TRAIN_DATA:-}"
+_OVR_VALID_DATA="${VALID_DATA:-}"
+_OVR_EVAL_EVERY="${EVAL_EVERY:-}"
+_OVR_EVAL_INTERVAL="${EVAL_INTERVAL:-}"
 # Inherit all FSDP launcher defaults (NCCL/ROCm perf env, arg plumbing).
 source "${SCRIPT_DIR}/config_MI355X_1x8x1.sh"
 
@@ -39,15 +48,15 @@ export MODEL="/model-hf"
 export TOKENIZER="${SCRIPT_DIR}/tokenizer"
 
 # ---- Data (preprocessed .npy, mounted at /data) -----------------------------
-export TRAIN_DATA="/data/train.npy"
-export VALID_DATA="/data/validation.npy"
+export TRAIN_DATA="${_OVR_TRAIN_DATA:-${TRAIN_DATA:-/data/train.npy}}"
+export VALID_DATA="${_OVR_VALID_DATA:-${VALID_DATA:-/data/validation.npy}}"
 export TRAIN_SAMPLES=10000
 export VAL_SAMPLES=500
 
 # ---- Training hyperparameters (MLPerf-aligned, mode-agnostic) ---------------
-export SEQ_LEN=8192
-export MBS=1
-export GRAD_ACCUM=1          # GBS = MBS(1) x DP(8) x accum(1) = 8
+export SEQ_LEN="${_OVR_SEQ_LEN:-${SEQ_LEN:-8192}}"
+export MBS="${_OVR_MBS:-${MBS:-1}}"
+export GRAD_ACCUM="${_OVR_GRAD_ACCUM:-${GRAD_ACCUM:-1}}"          # GBS = MBS x DP(8) x accum
 export TRAIN_STEPS="${_OVR_TRAIN_STEPS:-200}"   # 7B default 200; override via env
 export LR=4e-4
 export MIN_LR=0
@@ -119,8 +128,8 @@ export STEP_TIME_ATOL=0      # no step-time assertion
 export LOG_INTERVAL=1
 export SAVE_DIR="/results/checkpoints"
 export SAVE_INTERVAL="${_OVR_SAVE_INTERVAL:-0}"   # 0 = no periodic saves; override via env
-export EVAL_EVERY=80         # eval cadence in sequences -> 10 steps at GBS=8
-export EVAL_INTERVAL=0       # let run_finetune.sh derive from EVAL_EVERY
+export EVAL_EVERY="${_OVR_EVAL_EVERY:-80}"         # 80 sequences -> 10 steps at GBS=8
+export EVAL_INTERVAL="${_OVR_EVAL_INTERVAL:-0}"    # 0 lets run_finetune.sh derive from EVAL_EVERY
 export START_EVAL_AT=0
 export NUM_WORKERS=4
 export SHARDING="full_shard"

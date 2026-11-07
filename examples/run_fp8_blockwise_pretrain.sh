@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
-# Run llama2-7b / llama31-8b / qwen3-8b Megatron pretrain smoke (FP8 blockwise, 2 steps).
+# Run llama2-7b / llama31-8b / qwen3-8b Megatron pretrain smoke (FP8 blockwise).
+# TRAIN_STEPS defaults to 20. The inner scripts stay on delayed scaling; this
+# wrapper rewrites those flags to blockwise before launch.
 #
 # Usage:
-#   MODEL=llama2 bash examples/run_fp8_blockwise_pretrain_2step.sh
-#   MODEL=all  bash examples/run_fp8_blockwise_pretrain_2step.sh
+#   MODEL=llama2 bash examples/run_fp8_blockwise_pretrain.sh
+#   MODEL=all  bash examples/run_fp8_blockwise_pretrain.sh
 
 set -euo pipefail
 
-LUMEN_DIR="${LUMEN_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-IMAGE="${IMAGE:-zhangdanyangamd/lumen:dev-20260818}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LUMEN_DIR="${LUMEN_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+IMAGE="${IMAGE:-lumen:dev}"
 MODEL="${MODEL:-all}"
-TRAIN_STEPS="${TRAIN_STEPS:-2}"
+TRAIN_STEPS="${TRAIN_STEPS:-20}"
 MBS="${MBS:-1}"
 GBS="${GBS:-8}"
 SEQ_LEN="${SEQ_LEN:-2048}"
-LOG_DIR="${LOG_DIR:-/data/leiwu/logs/pretrain_smoke_fp8_blockwise}"
+LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/results/fp8_blockwise}"
 mkdir -p "${LOG_DIR}"
 
 # Patch FP8_ARGS in official scripts: delayed -> blockwise
@@ -31,13 +34,12 @@ run_one() {
     IMAGE="${IMAGE}" LUMEN_DIR="${LUMEN_DIR}" TRAIN_STEPS="${TRAIN_STEPS}" MBS="${MBS}" GBS="${GBS}" SEQ_LEN="${SEQ_LEN}" PRECISION=fp8 \
         bash "${tmp_script}" 2>&1 | tee "${log}"
     rm -f "${tmp_script}"
-    if grep -qE 'iteration\s+2\s|train iteration 2|iteration:.*2/' "${log}" 2>/dev/null || \
-       grep -q 'training ... iteration.*2' "${log}" 2>/dev/null || \
-       grep -q '\[done\]' "${log}" 2>/dev/null; then
-        echo "[OK] ${name} completed"
-    elif grep -q 'ChildFailedError\|Traceback\|ERROR' "${log}"; then
+    if grep -qE 'ChildFailedError|Traceback' "${log}"; then
         echo "[FAIL] ${name} — see ${log}"
         return 1
+    elif grep -qE "iteration[[:space:]]+${TRAIN_STEPS}/" "${log}" || \
+         grep -qE '\[DONE\]|\[done\]' "${log}"; then
+        echo "[OK] ${name} completed"
     else
         echo "[?] ${name} finished — check ${log}"
     fi

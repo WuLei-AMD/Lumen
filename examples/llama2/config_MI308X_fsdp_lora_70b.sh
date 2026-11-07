@@ -7,7 +7,7 @@
 # hyperparameters (see examples/llama2/README.md), but using the FSDP backend
 # instead of Megatron and BF16 instead of FP8 (FSDP+FP8+LoRA is less validated).
 #
-# Usage (inside container, via run_fsdp_lora_mi308.sh):
+# Usage (inside container, via run_fsdp_lora.sh):
 #   CONFIG=config_MI308X_fsdp_lora_70b.sh BACKEND=fsdp bash run_finetune.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
