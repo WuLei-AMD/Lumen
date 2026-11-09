@@ -12,7 +12,7 @@ set -euo pipefail
 
 LUMEN_DIR="${LUMEN_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 IMAGE="${IMAGE:-zhangdanyangamd/lumen:dsv4-flash-308x-finetune}"
-LOG_DIR="${LOG_DIR:-/data/leiwu/logs/patch_smoke}"
+LOG_DIR="${LOG_DIR:-${LUMEN_DIR}/examples/results/patch_smoke}"
 RUN="${RUN:-all}"   # all | patch | llama2 | llama31 | qwen3 | dsv4 | lora
 
 MBS="${MBS:-1}"

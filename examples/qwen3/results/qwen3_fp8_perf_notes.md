@@ -35,7 +35,7 @@ near-optimal. Tuning is a ~3-6% free win at best but does not move step time. Th
 kernel choice** and points the next effort at copy/elementwise.
 
 Tuned CSV: host `/mnt/raid0/leiwu/mlperf/aiter_tune/tuned_qwen3_gfx942.csv`. Enable via launcher:
-`AITER_TUNED_CSV=<path> bash run_qwen3_fsdp_mi308.sh` (gated, default off; first step JIT-compiles
+`AITER_TUNED_CSV=<path> bash run_qwen3_fsdp.sh` (gated, default off; first step JIT-compiles
 the tuned kernels). lm_head (N/K=151936) left untuned (tuner too slow on it; ~1% of GEMM time).
 
 ## Top optimization opportunities (ranked by ROI)
@@ -147,7 +147,7 @@ the tuned kernels). lm_head (N/K=151936) left untuned (tuner too slow on it; ~1%
 | **+ bpreshuffle GEMM** | **960 ms** | lossless; **−66% vs baseline, 44% faster than BF16 (1730)** |
 
 > Reproduce the profile: `LUMEN_PROF_START=12 LUMEN_PROF_END=15 MODE=fp8_blockwise2d MAX_STEPS=16 \
-> bash run_qwen3_fsdp_mi308.sh`. Baseline vs tuned profiles:
+> bash run_qwen3_fsdp.sh`. Baseline vs tuned profiles:
 > `qwen3_profile_fp8_blockwise2d.txt` / `qwen3_profile_fp8_blockwise2d_tuned.txt`.
 > Attribute copies to call sites: add `LUMEN_COPY_TRACE=1` → `<out>_copy_trace.txt`
 > (see `qwen3_copy_trace.txt`).
@@ -287,6 +287,6 @@ which is an architectural change (PEFT + FP8 storage + checkpoint) — not pursu
 
 > Reproduce best: `FSDP_VERSION=2 CACHE_FROZEN_WEIGHT=1 BPRESHUFFLE=1 GRAD_CKPT=0 \
 > SHARDING=shard_grad_op LIMIT_ALL_GATHERS=0 FORWARD_PREFETCH=1 \
-> AITER_ATTN=1 LUMEN_NORM=1 FUSE_ROPE=1 MODE=fp8_blockwise2d bash run_qwen3_fsdp_mi308.sh`.
+> AITER_ATTN=1 LUMEN_NORM=1 FUSE_ROPE=1 MODE=fp8_blockwise2d bash run_qwen3_fsdp.sh`.
 > Reproduce 70B param-storage: `FSDP_VERSION=2 FSDP_FP8_PARAM_STORAGE=1 ...` (see llama2 launcher).
 > Operator breakdown (param-storage vs best, per-kernel + roofline): `qwen3_fsdp2_operator_breakdown.xlsx`.

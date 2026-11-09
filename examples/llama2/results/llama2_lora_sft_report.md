@@ -82,13 +82,14 @@ FP8 scaling notes:
 FSDP (precision via `MODE`):
 ```bash
 MODE=bf16|fp8_delayed|fp8_blockwise2d \
-HOST_RESULTS=/mnt/raid0/leiwu/mlperf/results/<dir> CONTAINER_NAME=<name> \
-bash examples/llama2/run_fsdp_lora_7b_mi308.sh        # 7B
-# 70B: CONFIG=config_MI308X_fsdp_lora_70b.sh HOST_MODEL=<70b dir> bash run_fsdp_lora_mi308.sh
+HOST_MODEL=/path/to/model HOST_DATA=/path/to/npy \
+HOST_RESULTS=examples/llama2/results/<dir> CONTAINER_NAME=<name> \
+bash examples/llama2/run_fsdp_lora_7b.sh        # 7B
+# 70B: CONFIG=config_MI308X_fsdp_lora_70b.sh HOST_MODEL=<70b dir> HOST_DATA=<npy dir> bash examples/llama2/run_fsdp_lora.sh
 ```
 Megatron 70B blockwise2d:
 ```bash
-cd /mnt/raid0/leiwu/mlperf && bash run_mlperf_70b_latest_blockwise2d.sh
+bash examples/llama2/run_lora_finetune_llama2_70b.sh
 ```
 Useful env: `TRAIN_STEPS`, `HOST_DATA` (`/data_mlperf` = answer-only), `HOST_MODEL`,
 `PYTORCH_TUNABLEOP_ENABLED` (default 0; set 1 for long runs to amortize first-step GEMM tuning).
