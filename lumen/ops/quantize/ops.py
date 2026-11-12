@@ -21,12 +21,10 @@ import triton
 from aiter.ops.quant import static_per_tensor_quant
 try:
     from aiter.ops.triton._triton_kernels.quant.quant_fp8_blockwise import (
-        quant_fp8_blockwise_for_act_grad_kernel,
         quant_fp8_blockwise_kernel,
         quant_fp8_blockwise_segment_m_kernel,
     )
 except (ImportError, ModuleNotFoundError):
-    quant_fp8_blockwise_for_act_grad_kernel = None  # type: ignore[assignment]
     quant_fp8_blockwise_kernel = None  # type: ignore[assignment]
     quant_fp8_blockwise_segment_m_kernel = None  # type: ignore[assignment]
 try:
@@ -123,11 +121,16 @@ def quant_fp8_blockwise_impl(
         x,
         x_fp8,
         x_scales,
+        # The column outputs are only written when DUAL, which is a constexpr:
+        # Triton drops those stores, so reusing the primary buffers is free.
+        x_fp8,
+        x_scales,
         M,
         N,
         block_size,
         torch.finfo(dtype).max,
         axis,
+        False,  # DUAL
     )
     return x_fp8, x_scales
 
@@ -177,7 +180,9 @@ def quant_fp8_blockwise_dual_axis_impl(
     x_scales_col = torch.empty((triton.cdiv(M, block_size), N), dtype=torch.float32, device=x.device)
 
     grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
-    wrap_triton(quant_fp8_blockwise_for_act_grad_kernel)[grid](
+    # One kernel serves both: AXIS=1 is the row-wise (1xB) copy, DUAL adds the
+    # col-wise (Bx1) copy from the same loaded tile.
+    wrap_triton(quant_fp8_blockwise_kernel)[grid](
         x,
         x_fp8_row,
         x_scales_row,
@@ -187,6 +192,8 @@ def quant_fp8_blockwise_dual_axis_impl(
         N,
         block_size,
         torch.finfo(dtype).max,
+        1,  # AXIS
+        True,  # DUAL
     )
     return x_fp8_row, x_scales_row, x_fp8_col, x_scales_col
 

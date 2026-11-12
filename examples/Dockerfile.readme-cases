@@ -1,0 +1,12 @@
+# One image for the 14 examples/README.md cases.
+#
+# The base already has ROCm, torch, Megatron-LM and the compiled aiter
+# extensions. This layer only adds the LoRA dependency. aiter's Python tree is
+# not copied: launchers bind-mount third_party/aiter onto /opt/aiter
+# (AITER_SRC), which is the path this image imports.
+#
+#   docker build -f examples/Dockerfile.readme-cases -t zhangdanyangamd/lumen:examples-runbook-gfx950-rocm7.14.0-261107 .
+FROM lumen-smoke:aiter-full2
+
+RUN pip install --no-deps 'peft==0.21.2' 'accelerate==1.15.0' \
+    && python -c "import peft, accelerate; print(peft.__version__, accelerate.__version__)"

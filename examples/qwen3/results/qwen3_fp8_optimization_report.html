@@ -173,7 +173,7 @@
     <pre>FSDP_VERSION=2 CACHE_FROZEN_WEIGHT=1 BPRESHUFFLE=1 GRAD_CKPT=0 \
 SHARDING=shard_grad_op LIMIT_ALL_GATHERS=0 FORWARD_PREFETCH=1 \
 AITER_ATTN=1 LUMEN_NORM=1 FUSE_ROPE=1 MODE=fp8_blockwise2d \
-  bash examples/qwen3/run_qwen3_fsdp_mi308.sh</pre>
+  bash examples/qwen3/run_qwen3_fsdp.sh</pre>
     <div style="font-size:13px;margin:10px 0 4px">FSDP1 (960ms, remove fusion trio and <code>FSDP_VERSION</code>). Large-model OOM prevention: <code>FSDP_VERSION=2 FSDP_FP8_PARAM_STORAGE=1</code>, remove <code>GRAD_CKPT=0</code>/<code>SHARDING</code> and <code>cache_frozen_weight</code>.</div>
   </div>
 

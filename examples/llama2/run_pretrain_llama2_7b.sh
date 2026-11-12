@@ -53,6 +53,7 @@ FP8_ARGS=()
 if [ "${PRECISION}" = "fp8" ]; then
     FP8_ARGS=(
         --linear-fp8
+        --lumen-linear
         --fp8-format hybrid
         --linear-fp8-scaling delayed
         --linear-fp8-amax-algo max
@@ -69,6 +70,9 @@ docker run --rm --init \
     --cap-add=SYS_PTRACE \
     --shm-size 16G \
     -v "${LUMEN_DIR}:/workspace/Lumen" \
+    ${AITER_SRC:+-v "${AITER_SRC}:/opt/aiter"} \
+    ${AITER_JIT_DIR:+-v "${AITER_JIT_DIR}:/aiter-jit"} \
+    ${AITER_JIT_DIR:+-e AITER_JIT_DIR=/aiter-jit} \
     -v "${TOKENIZER_DIR}:/tokenizer:ro" \
     -v "${RESULTS_DIR}:/results" \
     -e HF_HUB_OFFLINE=1 \

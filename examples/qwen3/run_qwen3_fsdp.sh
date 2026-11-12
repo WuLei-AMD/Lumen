@@ -1,7 +1,7 @@
 #!/bin/bash
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 #
-# Qwen3-8B LoRA SFT — 8x MI308X, PyTorch FSDP + Lumen FP8 blockwise2d.
+# Qwen3-8B LoRA SFT — 8 GPUs, PyTorch FSDP + Lumen FP8 blockwise2d.
 #
 # Launches the lumen/llama2 container, overlays the host Lumen package and
 # examples (keeping the image's compiled third_party AITER/mori), mounts the HF
@@ -12,21 +12,21 @@
 #
 # Example:
 #   HOST_MODEL=/path/to/Qwen3-8B HOST_DATA=/path/to/alpaca_jsons \
-#     bash run_qwen3_fsdp_mi308.sh
+#     bash run_qwen3_fsdp.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOST_LUMEN="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # ---- Host paths (model / data / results) — overridable via env --------------
-HOST_MODEL="${HOST_MODEL:-/mnt/raid0/changcui/models/Qwen3-8B}"
-HOST_DATA="${HOST_DATA:-/mnt/raid0/zrz/qwen/qwen-datasets/jsons}"
-HOST_RESULTS="${HOST_RESULTS:-/mnt/raid0/leiwu/mlperf/results/qwen3_fsdp_fp8_blockwise2d}"
+HOST_MODEL="${HOST_MODEL:?Set HOST_MODEL to a Qwen3-8B directory}"
+HOST_DATA="${HOST_DATA:?Set HOST_DATA to a directory of alpaca jsonl}"
+HOST_RESULTS="${HOST_RESULTS:-${SCRIPT_DIR}/results}"
 TRAIN_FILE="${TRAIN_FILE:-alpaca_zh-train-general.jsonl}"
 VAL_FILE="${VAL_FILE:-alpaca_zh-valid-general.jsonl}"
 MODE="${MODE:-fp8_blockwise2d}"        # bf16 | fp8_blockwise2d
 if [[ "${MODE}" == "mxfp4" ]]; then
-    echo "ERROR: MXFP4 training requires gfx950; MI308X is gfx942." >&2
+    echo "ERROR: this launcher is BF16 / FP8 blockwise2d. MXFP4 LoRA SFT is run_qwen3_fsdp_mxfp4_sft.sh; full-parameter pretraining is run_qwen3_fsdp_mxfp4_pretrain.sh." >&2
     exit 2
 fi
 SEQ_LENGTH="${SEQ_LENGTH:-2048}"
@@ -65,6 +65,9 @@ docker run --rm --init \
     --ipc=host --network=host \
     --security-opt=seccomp=unconfined \
     --cap-add=SYS_PTRACE \
+    ${AITER_SRC:+-v "${AITER_SRC}:/opt/aiter"} \
+    ${AITER_JIT_DIR:+-v "${AITER_JIT_DIR}:/aiter-jit"} \
+    ${AITER_JIT_DIR:+-e AITER_JIT_DIR=/aiter-jit} \
     -v "${HOST_LUMEN}/lumen:/workspace/Lumen/lumen" \
     -v "${HOST_LUMEN}/examples:/workspace/Lumen/examples" \
     -v "${HOST_LUMEN}/third_party/aiter/aiter/ops/triton/configs:/workspace/Lumen/third_party/aiter/aiter/ops/triton/configs" \
@@ -85,6 +88,8 @@ docker run --rm --init \
     -e LUMEN_COPY_TRACE="${LUMEN_COPY_TRACE:-}" \
     -e LUMEN_PROF_SHAPES="${LUMEN_PROF_SHAPES:-}" \
     -e SEQ_LENGTH="${SEQ_LENGTH}" \
+    -e MBS="${MBS:-1}" \
+    -e GRAD_ACCUM="${GRAD_ACCUM:-1}" \
     -e MAX_STEPS="${MAX_STEPS}" \
     -e EVAL_INTERVAL="${EVAL_INTERVAL}" \
     -e CACHE_FROZEN_WEIGHT="${CACHE_FROZEN_WEIGHT:-}" \
@@ -121,7 +126,8 @@ torchrun --nproc_per_node=8 train_qwen3_fsdp.py \
     --train-data-path "/data/${TRAIN_FILE}" \
     --val-data-path "/data/${VAL_FILE}" \
     --mode "${MODE}" ${EXTRA} --sharding "${SHARDING}" --fp8-scaling "${FP8_SCALING}" \
-    --seq-length "${SEQ_LENGTH}" --max-steps "${MAX_STEPS}" \
+    --seq-length "${SEQ_LENGTH}" --micro-batch-size "${MBS}" \
+    --gradient-accumulation-steps "${GRAD_ACCUM}" --max-steps "${MAX_STEPS}" \
     --eval-interval "${EVAL_INTERVAL}" --seed 1234 2>&1 \
     | tee "/results/train_${MODE}.log"
 '

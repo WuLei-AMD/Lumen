@@ -450,7 +450,7 @@ dx ". $EX/env.sh && PYTHONPATH=\$LUMEN_PYTHONPATH python3 \$EXAMPLE_DIR/tune_con
 | `train_dit_lumen.py` | VeOmni 训练入口的包装：按 `LUMEN_PATCH` 装配补丁，并报告卷积实现、查表与路由计数 |
 | `lumen_vae_conv.py` | VAE 卷积改写：T=1 精确转 conv2d、T>1 替换底层 kernel、padding 交给 kernel |
 | `veomni_patches/` | L 级的全部补丁：`aiter_conv.py`（aiter 卷积接入与查表计数）、`sdpa.py`、`rmsnorm.py`、`local_adamw.py`、`qwen_offline.py` |
-| `overlay_aiter.py` / `aiter_overlay/` | 为旧版 aiter 补齐缺失的文件（Lumen fork 的 triton 模块、#5370 的卷积与调优表），以及为 L3 另调的表 |
+| `overlay_aiter.py` / `aiter_overlay/` | 为旧版 aiter 补齐缺失的文件（Lumen 用到的 Triton 模块，取自 submodule 钉住的 aiter main；#5370 的卷积与调优表），以及为 L3 另调的表 |
 | `tune_conv3d.py` | 录制未命中的卷积形状并调优，生成 aiter 格式的调优表 |
 | `verify_aiter_conv.py` / `verify_sdpa_triton_fwd.py` / `verify_rmsnorm_fuse.py` | 单卡数值与性能校验 |
 | `test_patches.py` | `veomni_patches/` 的单元测试 |

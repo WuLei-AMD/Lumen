@@ -488,7 +488,7 @@ dx ". $EX/env.sh && PYTHONPATH=\$LUMEN_PYTHONPATH python3 \$EXAMPLE_DIR/tune_con
 | `train_dit_lumen.py` | wrapper around VeOmni's training entry: applies the patches from `LUMEN_PATCH`, and reports the convolution implementation, table lookups and routing counts |
 | `lumen_vae_conv.py` | VAE convolution rewrites: exact T=1 → conv2d, kernel swap under T>1, padding in the kernel |
 | `veomni_patches/` | every Lumen-level patch: `aiter_conv.py` (the aiter convolution and lookup counting), `sdpa.py`, `rmsnorm.py`, `local_adamw.py`, `qwen_offline.py` |
-| `overlay_aiter.py` / `aiter_overlay/` | the files an older aiter lacks (Lumen fork's triton modules, #5370's convolution and tables), plus the table for the L3 shapes |
+| `overlay_aiter.py` / `aiter_overlay/` | the files an older aiter lacks (the Triton modules Lumen imports, taken from aiter main at the pinned submodule; #5370's convolution and tables), plus the table for the L3 shapes |
 | `tune_conv3d.py` | records the convolution shapes a table missed, tunes them, and writes an aiter-format table |
 | `verify_aiter_conv.py` / `verify_sdpa_triton_fwd.py` / `verify_rmsnorm_fuse.py` | single-GPU numerics and speed checks |
 | `test_patches.py` | unit tests for `veomni_patches/` |

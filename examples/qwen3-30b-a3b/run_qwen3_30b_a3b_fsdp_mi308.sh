@@ -12,22 +12,22 @@
 #
 # Example (master node):
 #   NODE_RANK=0 MASTER_ADDR=10.0.0.1 MASTER_PORT=29500 \
-#   HOST_MODEL=/mnt/raid0/models/Qwen3-30B-A3B \
-#   HOST_DATA=/mnt/raid0/danyzhan/datasets/alpaca \
+#   HOST_MODEL=/path/to/Qwen3-30B-A3B \
+#   HOST_DATA=/path/to/alpaca \
 #   TRAIN_FILE=train.jsonl VAL_FILE=test.jsonl \
 #     bash run_qwen3_30b_a3b_fsdp_mi308.sh
 #
 # Example (worker node):
 #   NODE_RANK=1 MASTER_ADDR=10.0.0.1 MASTER_PORT=29500 \
-#   HOST_MODEL=/mnt/raid0/models/Qwen3-30B-A3B \
-#   HOST_DATA=/mnt/raid0/danyzhan/datasets/alpaca \
+#   HOST_MODEL=/path/to/Qwen3-30B-A3B \
+#   HOST_DATA=/path/to/alpaca \
 #   TRAIN_FILE=train.jsonl VAL_FILE=test.jsonl \
 #     bash run_qwen3_30b_a3b_fsdp_mi308.sh
 #
 # Single-node DP=1 EP=8 (backward compatible):
 #   NNODES=1 DP_SIZE=1 EP_SIZE=8 \
-#   HOST_MODEL=/mnt/raid0/models/Qwen3-30B-A3B \
-#   HOST_DATA=/mnt/raid0/danyzhan/datasets/alpaca \
+#   HOST_MODEL=/path/to/Qwen3-30B-A3B \
+#   HOST_DATA=/path/to/alpaca \
 #   TRAIN_FILE=train.jsonl VAL_FILE=test.jsonl \
 #     bash run_qwen3_30b_a3b_fsdp_mi308.sh
 #
@@ -42,8 +42,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOST_LUMEN="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # ---- Host paths ----
-HOST_MODEL="${HOST_MODEL:-/mnt/raid0/models/Qwen3-30B-A3B}"
-HOST_DATA="${HOST_DATA:-/mnt/raid0/danyzhan/datasets/alpaca}"
+HOST_MODEL="${HOST_MODEL:?Set HOST_MODEL to a Qwen3-30B-A3B directory}"
+HOST_DATA="${HOST_DATA:?Set HOST_DATA to an alpaca jsonl directory}"
 HOST_RESULTS="${HOST_RESULTS:-${SCRIPT_DIR}/results}"
 TRAIN_FILE="${TRAIN_FILE:-train.jsonl}"
 VAL_FILE="${VAL_FILE:-test.jsonl}"

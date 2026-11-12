@@ -117,19 +117,19 @@ def _quant_blockwise_2d(w, fp8_dtype, block_size=128):
 
 
 def _get_gmm():
-    from aiter.ops.triton.gmm import gmm
+    from aiter.ops.triton.gemm.grouped.gmm import gmm
 
     return gmm
 
 
 def _get_ptgmm():
-    from aiter.ops.triton.gmm import ptgmm
+    from aiter.ops.triton.gemm.grouped.gmm import ptgmm
 
     return ptgmm
 
 
 def _get_nptgmm():
-    from aiter.ops.triton.gmm import nptgmm
+    from aiter.ops.triton.gemm.grouped.gmm import nptgmm
 
     return nptgmm
 
