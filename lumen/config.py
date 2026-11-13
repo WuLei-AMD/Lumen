@@ -318,6 +318,9 @@ class LumenConfig:
                 self._patch_sdpa()
             except ImportError as exc:
                 _rank0_print(f"> ATOM rollout: SDPA patch skipped ({exc})")
+            LumenConfig._atom_fp8 = self.scaling == "blockwise2d"
+            if LumenConfig._atom_fp8:
+                _rank0_print("> ATOM rollout: linears except lm_head run ATOM per_block_fp8 (Triton blockscale)")
             if "varlen_attn" in tags:
                 self._patch_varlen_attn()
             self._patch_linear(model, atom_mode=True)
@@ -476,6 +479,42 @@ class LumenConfig:
         from lumen.ops.gemm.stable_tgemm_mm import stable_tgemm_mm
 
         return stable_tgemm_mm(tgemm, x, weight, bias, otype)
+
+    # Set by enable() for rollout=ATOM with blockwise2d FP8 training.
+    _atom_fp8 = False
+
+    @staticmethod
+    def _atom_fp8_mm(x, weight, bias):
+        """ATOM per_block_fp8 linear: the forward ATOM runs for qkv/o/gate_up/down.
+
+        The weight is quantized by ATOM's own 128x128 function (Lumen's HIP
+        tile quant differs from it in a few elements per layer), the input by
+        aiter's 1x128 HIP quant with a row-major scale, and the product by the
+        Triton blockscale GEMM. ATOM takes that GEMM with
+        ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0 and ATOM_USE_TRITON_GEMM=1; its
+        rows do not depend on M, while the default bpreshuffle and CK
+        dispatches change kernels with M.
+        """
+        from aiter import QuantType, dtypes, get_hip_quant
+        from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import gemm_a8w8_blockscale
+        from atom.quantization.quark.utils import quantize_weight_to_fp8_128x128_blockscale
+
+        n, k = weight.shape
+        orig_shape = x.shape
+        w_q, w_scale = quantize_weight_to_fp8_128x128_blockscale(weight.detach(), dtypes.fp8)
+        x_q, x_scale = get_hip_quant(QuantType.per_1x128)(
+            x.reshape(-1, k).contiguous(), quant_dtype=dtypes.fp8, transpose_scale=False
+        )
+        y = gemm_a8w8_blockscale(x_q, w_q, x_scale, w_scale, dtype=x.dtype)
+        if bias is not None:
+            y += bias
+        return y.reshape(*orig_shape[:-1], n)
+
+    @staticmethod
+    def _atom_mm(tgemm, x, weight, bias, otype, fp8=True):
+        if fp8 and LumenConfig._atom_fp8:
+            return LumenConfig._atom_fp8_mm(x, weight, bias)
+        return LumenConfig._stable_tgemm_mm(tgemm, x, weight, bias, otype)
 
     def _patch_qwen3_qkv(self, model) -> None:
         from lumen.models.qwen3_fusion import patch_qwen3_qkv

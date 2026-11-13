@@ -6,14 +6,20 @@
 
 """Fused linear, QKV, and gate/up GEMMs.
 
-Each forward concatenates the weights, runs :func:`stable_tgemm_mm`, and the
-backward is a dense matmul on the saved input. The factories close over one
-``TunedGemm`` instance for the life of the patched model.
+Each forward concatenates the weights and runs ``LumenConfig._atom_mm``.
+With ``rollout=ATOM`` and blockwise2d that is the ATOM per_block_fp8 GEMM.
+Otherwise it is the splitK=1 BF16 scan. ``lm_head`` stays on the BF16 scan.
+The backward is a dense matmul on the saved input. The factories close over
+one ``TunedGemm`` instance for the life of the patched model.
 """
 
 from __future__ import annotations
 
-from lumen.ops.gemm.stable_tgemm_mm import stable_tgemm_mm
+
+def _atom_mm(tgemm, x, weight, bias, otype, fp8=True):
+    from lumen.config import LumenConfig
+
+    return LumenConfig._atom_mm(tgemm, x, weight, bias, otype, fp8)
 
 
 def make_tuned_linear_fn(tgemm):
@@ -21,10 +27,10 @@ def make_tuned_linear_fn(tgemm):
 
     class TunedLinearFn(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, input, weight, bias):
+        def forward(ctx, input, weight, bias, fp8):
             ctx.save_for_backward(input, weight)
             ctx.has_bias = bias is not None
-            return stable_tgemm_mm(tgemm, input, weight, bias, input.dtype)
+            return _atom_mm(tgemm, input, weight, bias, input.dtype, fp8)
 
         @staticmethod
         def backward(ctx, grad_output):
@@ -35,7 +41,7 @@ def make_tuned_linear_fn(tgemm):
             grad_input = grad_input.reshape(input.shape)
             grad_weight = grad_flat.t() @ input_flat
             grad_bias = (grad_flat.sum(0) if ctx.has_bias else None)
-            return grad_input, grad_weight, grad_bias
+            return grad_input, grad_weight, grad_bias, None
 
     return TunedLinearFn
 
@@ -57,7 +63,7 @@ def make_fused_qkv_fn(tgemm):
                 bias = torch.cat(parts, dim=0)
             ctx.save_for_backward(x, wq, wk, wv)
             ctx.bias_flags = (bq is not None, bk is not None, bv is not None)
-            return stable_tgemm_mm(tgemm, x, weight, bias, x.dtype)
+            return _atom_mm(tgemm, x, weight, bias, x.dtype)
 
         @staticmethod
         def backward(ctx, grad_output):
@@ -98,7 +104,7 @@ def make_fused_gate_up_fn(tgemm):
                 bias = torch.cat(parts, dim=0)
             ctx.save_for_backward(x, w_gate, w_up)
             ctx.bias_flags = (b_gate is not None, b_up is not None)
-            return stable_tgemm_mm(tgemm, x, weight, bias, x.dtype)
+            return _atom_mm(tgemm, x, weight, bias, x.dtype)
 
         @staticmethod
         def backward(ctx, grad_output):

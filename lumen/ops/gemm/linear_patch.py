@@ -46,9 +46,9 @@ def patch_linear(model, *, atom_mode: bool = False) -> None:
         for _name, module in model.named_modules():
             if isinstance(module, nn.Linear):
 
-                def _make_forward(mod):
+                def _make_forward(mod, fp8="lm_head" not in _name):
                     def _forward(input):
-                        return linear_fn.apply(input, mod.weight, mod.bias)
+                        return linear_fn.apply(input, mod.weight, mod.bias, fp8)
                     return _forward
 
                 module.forward = _make_forward(module)
