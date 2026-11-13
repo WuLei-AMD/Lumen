@@ -317,6 +317,9 @@ class LumenConfig:
                 self._patch_sdpa()
             except ImportError as exc:
                 _rank0_print(f"> ATOM rollout: SDPA patch skipped ({exc})")
+            LumenConfig._atom_fp8 = self.scaling == "blockwise2d"
+            if LumenConfig._atom_fp8:
+                _rank0_print("> ATOM rollout: linears except lm_head run ATOM per_block_fp8 (Triton blockscale)")
             if "varlen_attn" in tags:
                 self._patch_varlen_attn()
             self._patch_linear(model, atom_mode=True)
@@ -681,6 +684,42 @@ class LumenConfig:
         out_padded = tgemm.mm(x_padded, weight, bias, otype=otype)
         return out_padded[:m].reshape(*orig_shape[:-1], n).contiguous()
 
+    # Set by enable() for rollout=ATOM with blockwise2d FP8 training.
+    _atom_fp8 = False
+
+    @staticmethod
+    def _atom_fp8_mm(x, weight, bias):
+        """ATOM per_block_fp8 linear: the forward ATOM runs for qkv/o/gate_up/down.
+
+        The weight is quantized by ATOM's own 128x128 function (Lumen's HIP
+        tile quant differs from it in a few elements per layer), the input by
+        aiter's 1x128 HIP quant with a row-major scale, and the product by the
+        Triton blockscale GEMM. ATOM takes that GEMM with
+        ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0 and ATOM_USE_TRITON_GEMM=1; its
+        rows do not depend on M, while the default bpreshuffle and CK
+        dispatches change kernels with M.
+        """
+        from aiter import QuantType, dtypes, get_hip_quant
+        from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import gemm_a8w8_blockscale
+        from atom.quantization.quark.utils import quantize_weight_to_fp8_128x128_blockscale
+
+        n, k = weight.shape
+        orig_shape = x.shape
+        w_q, w_scale = quantize_weight_to_fp8_128x128_blockscale(weight.detach(), dtypes.fp8)
+        x_q, x_scale = get_hip_quant(QuantType.per_1x128)(
+            x.reshape(-1, k).contiguous(), quant_dtype=dtypes.fp8, transpose_scale=False
+        )
+        y = gemm_a8w8_blockscale(x_q, w_q, x_scale, w_scale, dtype=x.dtype)
+        if bias is not None:
+            y += bias
+        return y.reshape(*orig_shape[:-1], n)
+
+    @staticmethod
+    def _atom_mm(tgemm, x, weight, bias, otype, fp8=True):
+        if fp8 and LumenConfig._atom_fp8:
+            return LumenConfig._atom_fp8_mm(x, weight, bias)
+        return LumenConfig._stable_tgemm_mm(tgemm, x, weight, bias, otype)
+
     def _patch_qwen3_qkv(self, model) -> None:
         """Replace Qwen3 q/k/v projections with one concatenated GEMM.
 
@@ -707,7 +746,7 @@ class LumenConfig:
                     bias = torch.cat(parts, dim=0)
                 ctx.save_for_backward(x, wq, wk, wv)
                 ctx.bias_flags = (bq is not None, bk is not None, bv is not None)
-                return LumenConfig._stable_tgemm_mm(tgemm, x, weight, bias, x.dtype)
+                return LumenConfig._atom_mm(tgemm, x, weight, bias, x.dtype)
 
             @staticmethod
             def backward(ctx, grad_output):
@@ -755,7 +794,7 @@ class LumenConfig:
                 cached = pending.pop("k", None)
                 if cached is not None:
                     return cached
-                return LumenConfig._stable_tgemm_mm(
+                return LumenConfig._atom_mm(
                     tgemm, hidden, k_mod.weight, k_mod.bias, hidden.dtype
                 )
 
@@ -763,7 +802,7 @@ class LumenConfig:
                 cached = pending.pop("v", None)
                 if cached is not None:
                     return cached
-                return LumenConfig._stable_tgemm_mm(
+                return LumenConfig._atom_mm(
                     tgemm, hidden, v_mod.weight, v_mod.bias, hidden.dtype
                 )
 
@@ -800,7 +839,7 @@ class LumenConfig:
                     bias = torch.cat(parts, dim=0)
                 ctx.save_for_backward(x, w_gate, w_up)
                 ctx.bias_flags = (b_gate is not None, b_up is not None)
-                return LumenConfig._stable_tgemm_mm(tgemm, x, weight, bias, x.dtype)
+                return LumenConfig._atom_mm(tgemm, x, weight, bias, x.dtype)
 
             @staticmethod
             def backward(ctx, grad_output):
@@ -842,7 +881,7 @@ class LumenConfig:
                 cached = pending.pop("up", None)
                 if cached is not None:
                     return cached
-                return LumenConfig._stable_tgemm_mm(
+                return LumenConfig._atom_mm(
                     tgemm, hidden, up_mod.weight, up_mod.bias, hidden.dtype
                 )
 
@@ -1167,10 +1206,10 @@ class LumenConfig:
 
             class _AtomLinearFn(torch.autograd.Function):
                 @staticmethod
-                def forward(ctx, input, weight, bias):
+                def forward(ctx, input, weight, bias, fp8):
                     ctx.save_for_backward(input, weight)
                     ctx.has_bias = bias is not None
-                    return LumenConfig._stable_tgemm_mm(tgemm, input, weight, bias, input.dtype)
+                    return LumenConfig._atom_mm(tgemm, input, weight, bias, input.dtype, fp8)
 
                 @staticmethod
                 def backward(ctx, grad_output):
@@ -1181,16 +1220,16 @@ class LumenConfig:
                     grad_input = grad_input.reshape(input.shape)
                     grad_weight = grad_flat.t() @ input_flat
                     grad_bias = (grad_flat.sum(0) if ctx.has_bias else None)
-                    return grad_input, grad_weight, grad_bias
+                    return grad_input, grad_weight, grad_bias, None
 
-            # HF path: patch nn.Linear modules
+            # HF path: patch nn.Linear modules. ATOM keeps lm_head in BF16.
             count = 0
             for _name, module in model.named_modules():
                 if isinstance(module, nn.Linear):
 
-                    def _make_atom_forward(mod):
+                    def _make_atom_forward(mod, fp8="lm_head" not in _name):
                         def _forward(input):
-                            return _AtomLinearFn.apply(input, mod.weight, mod.bias)
+                            return _AtomLinearFn.apply(input, mod.weight, mod.bias, fp8)
                         return _forward
 
                     module.forward = _make_atom_forward(module)
