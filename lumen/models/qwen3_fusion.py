@@ -9,8 +9,7 @@
 from __future__ import annotations
 
 from lumen.ops.rope_cached import make_cached_rope_fn
-from lumen.ops.gemm.linear_autograd import make_fused_gate_up_fn, make_fused_qkv_fn
-from lumen.ops.gemm.stable_tgemm_mm import stable_tgemm_mm
+from lumen.ops.gemm.linear_autograd import _atom_mm, make_fused_gate_up_fn, make_fused_qkv_fn
 
 
 def _rank0_print(msg: str) -> None:
@@ -57,7 +56,7 @@ def patch_qwen3_qkv(model) -> None:
             cached = pending.pop("k", None)
             if cached is not None:
                 return cached
-            return stable_tgemm_mm(
+            return _atom_mm(
                 tgemm, hidden, k_mod.weight, k_mod.bias, hidden.dtype
             )
 
@@ -65,7 +64,7 @@ def patch_qwen3_qkv(model) -> None:
             cached = pending.pop("v", None)
             if cached is not None:
                 return cached
-            return stable_tgemm_mm(
+            return _atom_mm(
                 tgemm, hidden, v_mod.weight, v_mod.bias, hidden.dtype
             )
 
@@ -110,7 +109,7 @@ def patch_qwen3_gate_up(model) -> None:
             cached = pending.pop("up", None)
             if cached is not None:
                 return cached
-            return stable_tgemm_mm(
+            return _atom_mm(
                 tgemm, hidden, up_mod.weight, up_mod.bias, hidden.dtype
             )
 
