@@ -55,13 +55,12 @@ __all__ = [
 
 
 def _sbhd_to_bshd(t: torch.Tensor, materialize: bool = True) -> torch.Tensor:
-    """Megatron [s, b, h, d] -> TL [b, s, h, d]
+    """Megatron [s, b, h, d] -> TL [b, s, h, d].
 
-    The permuted view keeps ``stride(-1) == 1``, which is the only layout
-    constraint the CK flash-attention entry point imposes -- it reads the batch,
-    sequence and head strides from the tensor. Materialising the permute is
-    therefore only needed for backends that assert contiguity (Triton FP8) or
-    that reinterpret the buffer directly (context-parallel all-to-all).
+    CK and OPUS read tensor strides, so their permuted views do not need a
+    materializing copy. Other backends keep the contiguous layout. The permuted
+    view keeps ``stride(-1) == 1``, which is the only layout constraint those
+    entry points impose.
     """
     view = t.permute(1, 0, 2, 3)
     return view.contiguous() if materialize else view
@@ -91,10 +90,11 @@ class LumenDotProductAttention(MegatronModule):
     output back.
 
     Backends (``--lumen-attn-backend``):
-        User-facing choices: ``auto``, ``triton``, ``csrc``, ``asm``.
+        User-facing choices: ``auto``, ``triton``, ``csrc``, ``asm``, ``opus``.
         Combined with ``--lumen-fp8-attn`` (``none``/``dpa``/``mha``), these
-        resolve to concrete kernels: ``aiter_csrc``, ``aiter_triton``,
-        ``aiter_triton_fp8``, ``aiter_csrc_fp8``, ``aiter_asm_fp8``.
+        resolve to concrete kernels: ``aiter_csrc``, ``aiter_opus``,
+        ``aiter_triton``, ``aiter_triton_fp8``, ``aiter_csrc_fp8``,
+        ``aiter_asm_fp8``.
     """
 
     def __init__(
@@ -177,7 +177,7 @@ class LumenDotProductAttention(MegatronModule):
         Returns:
             context: [sq, b, hp]   (hp = np * hn)
         """
-        materialize = self.backend != "aiter_csrc" or self.cp_size > 1
+        materialize = self.backend not in ("aiter_csrc", "aiter_opus") or self.cp_size > 1
         q = _sbhd_to_bshd(query, materialize)
         k = _sbhd_to_bshd(key, materialize)
         v = _sbhd_to_bshd(value, materialize)
@@ -218,11 +218,11 @@ class LumenDotProductAttention(MegatronModule):
                 scale_manager=self.scale_manager,
             )
         else:
-            if self.backend == "aiter_csrc" and not is_aiter_available():
+            if self.backend in ("aiter_csrc", "aiter_opus") and not is_aiter_available():
                 raise RuntimeError(
-                    "AITER is not installed. The aiter_csrc backend "
+                    f"AITER is not installed. The {self.backend} backend "
                     "requires 'aiter' — install it or use "
-                    "--lumen-attn-backend aiter_triton."
+                    "--lumen-attn-backend triton."
                 )
             out = attention(
                 q,

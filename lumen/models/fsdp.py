@@ -202,6 +202,18 @@ def add_common_fsdp_args(parser):
         choices=["nccl"],
         help="Communication backend for 'pipeline' overlap mode. Only 'nccl' supported.",
     )
+    overlap.add_argument(
+        "--lumen-moe-dispatch-overlap",
+        action="store_true",
+        default=False,
+        help="Overlap MoE split-count exchange with token permutation and payload packing.",
+    )
+    overlap.add_argument(
+        "--lumen-moe-global-expert-layout",
+        action="store_true",
+        default=False,
+        help="Use expert-major MoE dispatch to remove receiver-side token sorting.",
+    )
 
     # -- Fused MLP --
     fmlp = parser.add_argument_group("fused-mlp")
@@ -210,6 +222,12 @@ def add_common_fsdp_args(parser):
         action="store_true",
         default=False,
         help="Use fused MLP modules for reduced kernel launch overhead.",
+    )
+    fmlp.add_argument(
+        "--lumen-fused-router",
+        action="store_true",
+        default=False,
+        help="Install autograd-safe AITER MoE router functions into Megatron.",
     )
 
     # -- FP8 activation store --

@@ -1,0 +1,74 @@
+schema_version: geak_data_config_v2
+
+tokenizer:
+  path: ../../models/Qwen3-30B-A3B
+  sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+
+tokenization:
+  model_family: Qwen/Qwen3-30B-A3B
+  max_length: 32768
+  include_assistant_eot_in_loss: true
+  overflow_policy: quarantine
+
+sampling:
+  steps: 1000
+  length_penalty_power: 0.5
+  seed: 0
+  replay_mix:
+    enabled: true
+    min_assistant_loss_token_share: 0.15
+    max_assistant_loss_token_share: 0.20
+
+sources:
+  - name: kernel
+    type: local_hf_layout
+    path: ../../data/kernel
+    split: train
+    admission:
+      type: generic
+      allowed_splits: [train, dev]
+      require_checksum: true
+      expected_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      required_provenance_fields: [source_hash]
+    field_mapping: &canonical_kernel_mapping
+      schema_version: {source: schema_version}
+      sample_id: {source: sample_id}
+      sample_domain: {const: kernel}
+      task_type: {source: task_type}
+      split: {source: split}
+      input: {source: input}
+      output: {source: output}
+      labels: {source: labels}
+      provenance: {source: provenance}
+
+  - name: replay
+    type: local_jsonl
+    path: ../../data/replay/accepted.jsonl
+    admission:
+      type: geak_replay_release
+      package_root: ../../data/replay
+      accepted_rows: 500
+      allowed_splits: [train]
+      require_checksum: true
+      expected_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      required_provenance_fields: [dataset_id, dataset_revision]
+    field_mapping:
+      schema_version: {source: schema_version}
+      sample_id: {source: sample_id}
+      sample_domain: {const: general_coding}
+      task_type: {const: general_coding_replay}
+      coding_task_type: {source: coding_task_type}
+      primary_language:
+        pick:
+          - {source: primary_language}
+          - {source: provenance.language}
+      split: {source: split}
+      input: {source: input}
+      output: {source: output}
+      provenance: {source: provenance}
+
+output:
+  directory: ../../data/build/qwen3_30b_a3b
+  train_file: train.tokenized.jsonl
+  dev_file: dev.tokenized.jsonl
+  manifest_file: manifest.json

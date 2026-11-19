@@ -1,0 +1,116 @@
+{
+  "up_forward": {
+    "kind": "forward",
+    "K": 2048,
+    "N": 1536,
+    "E": 16,
+    "has_gather": true,
+    "selected": [
+      {
+        "cache_key": "(1536, 2048, 16, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.bfloat16', 'torch.int32', 'torch.int32')",
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 128,
+          "BLOCK_K": 64,
+          "num_warps": 4,
+          "num_stages": 2
+        }
+      }
+    ]
+  },
+  "down_forward": {
+    "kind": "forward",
+    "K": 768,
+    "N": 2048,
+    "E": 16,
+    "has_gather": false,
+    "selected": [
+      {
+        "cache_key": "(2048, 768, 16, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.bfloat16', 'torch.int32', 'torch.int32')",
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 128,
+          "BLOCK_K": 64,
+          "num_warps": 4,
+          "num_stages": 2
+        }
+      }
+    ]
+  },
+  "down_backward_input": {
+    "kind": "forward",
+    "K": 2048,
+    "N": 768,
+    "E": 16,
+    "has_gather": false,
+    "selected": [
+      {
+        "cache_key": "(768, 2048, 16, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.bfloat16', 'torch.int32', 'torch.int32')",
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 128,
+          "BLOCK_K": 64,
+          "num_warps": 4,
+          "num_stages": 2
+        }
+      }
+    ]
+  },
+  "up_backward_input": {
+    "kind": "forward",
+    "K": 1536,
+    "N": 2048,
+    "E": 16,
+    "has_gather": false,
+    "selected": [
+      {
+        "cache_key": "(2048, 1536, 16, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.bfloat16', 'torch.int32', 'torch.int32')",
+        "config": {
+          "BLOCK_M": 128,
+          "BLOCK_N": 128,
+          "BLOCK_K": 64,
+          "num_warps": 4,
+          "num_stages": 2
+        }
+      }
+    ]
+  },
+  "dw1": {
+    "kind": "dw",
+    "K": 2048,
+    "N": 1536,
+    "E": 16,
+    "has_gather": true,
+    "selected": [
+      {
+        "cache_key": "(1536, 2048, 16, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.int32')",
+        "config": {
+          "BLOCK_K": 128,
+          "BLOCK_N": 128,
+          "BLOCK_T": 64,
+          "num_warps": 4,
+          "num_stages": 2
+        }
+      }
+    ]
+  },
+  "dw2": {
+    "kind": "dw",
+    "K": 768,
+    "N": 2048,
+    "E": 16,
+    "has_gather": false,
+    "selected": [
+      {
+        "cache_key": "(2048, 768, 16, 'torch.bfloat16', 'torch.bfloat16', 'torch.bfloat16', 'torch.int32', 'torch.int32')",
+        "config": {
+          "BLOCK_K": 128,
+          "BLOCK_N": 128,
+          "BLOCK_T": 32,
+          "num_warps": 4,
+          "num_stages": 2
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,51 @@
+recipe:
+  name: geak_coder_mi308_fp8_v1
+
+model:
+  name_or_path: Qwen/Qwen3-Coder-30B-A3B-Instruct
+  revision: null
+  max_position_embeddings: 262144
+
+distributed:
+  expert_backend: sonic
+  sharding: full_shard
+
+lora:
+  attention_rank: 32
+  attention_alpha: 64
+  expert_rank: 8
+  expert_alpha: 16
+  dropout: 0.0
+  targets:
+    attention: [q_proj, k_proj, v_proj, o_proj]
+    experts: [gate_up_proj, down_proj]
+
+precision:
+  mode: fp8_blockwise2d
+  fp8_format: e4m3fnuz
+  lumen_format: fp8_e4m3
+  scaling: blockwise2d
+  block_size: 128
+  adapter_dtype: bfloat16
+  fp8_param_storage: true
+
+training:
+  micro_batch_size: 1
+  gradient_accumulation_steps: 8
+  max_steps: 125
+  learning_rate: 0.0001
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  log_interval: 1
+  evaluation_interval: 25
+  validation_batches: 32
+  early_stopping_patience: 3
+  seed: 1234
+
+optimizations:
+  aiter_attn: false
+  lumen_norm: false
+  fused_router: false
+  moe_dispatch_overlap: false
+  moe_global_expert_layout: true
+  fuse_rope: false

@@ -8,6 +8,7 @@ build/
 .eggs/
 /docs/
 outputs/2026-*/
+examples/qwen3-30b-a3b/results/
 tunableop_results*.csv
 .rocprofv3/
 data/
@@ -41,3 +42,10 @@ examples/*/results/**/events.out.tfevents.*
 examples/*/results/**/*.pt.trace.json
 
 examples/precision_matrix_runs.tsv
+/data/
+experiments/*/models/
+experiments/*/outputs/
+experiments/*/data/build/
+!experiments/*/configs/data/
+*.safetensors
+gpucore.*

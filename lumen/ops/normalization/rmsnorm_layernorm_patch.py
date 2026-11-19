@@ -84,6 +84,7 @@ def patch_norms(model, *, atom_mode: bool = False, extra_classes: tuple[str, ...
                 "MistralRMSNorm",
                 "Qwen2RMSNorm",
                 "Qwen3RMSNorm",
+                "Qwen3MoeRMSNorm",
             ):
                 hidden = child.weight.shape[0]
                 eps = getattr(child, "eps", getattr(child, "variance_epsilon", 1e-6))

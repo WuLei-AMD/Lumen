@@ -30,6 +30,7 @@ Usage::
 
 import functools
 import logging
+import os
 import os as _os
 import re
 import threading
@@ -268,6 +269,9 @@ _LAYER_INDEX_RE = re.compile(r"layers\.(\d+)\b")
 
 # Module leaf names of the vocab-projection (output) layer across HF / Megatron.
 _OUTPUT_LAYER_NAMES = ("lm_head", "output_layer")
+# Official Qwen3-*-FP8 keeps the MoE router in BF16 (HF ``mlp.gate``,
+# Megatron ``mlp.router``).
+_MOE_ROUTER_NAMES = ("gate", "router")
 
 
 def _is_output_layer(name: str) -> bool:
@@ -278,6 +282,49 @@ def _is_output_layer(name: str) -> bool:
     """
     leaf = name.rsplit(".", 1)[-1]
     return leaf in _OUTPUT_LAYER_NAMES
+
+
+def _is_moe_router(name: str) -> bool:
+    """True if *name* is the MoE router linear (not expert SwiGLU gate)."""
+    return name.rsplit(".", 1)[-1] in _MOE_ROUTER_NAMES
+
+
+def _materialize_linear_weight(module: nn.Module, scaling_type: str, block_size: int):
+    """Return a dense ``[out, in]`` weight for FP8 GEMM.
+
+    FSDP2 all-gather should already have run on the parent layer. If the live
+    Parameter is still a sharded DTensor, fail closed rather than tiling
+    128×128 on a rank-local slice (``k_proj`` 512/8=64 is not 128-aligned).
+    """
+    w = module.weight
+    to_local = getattr(w, "to_local", None)
+    if callable(to_local):
+        local = to_local()
+        global_shape = tuple(w.shape)
+        if tuple(local.shape) != global_shape:
+            name = getattr(module, "_quant_tensor_id", type(module).__name__)
+            raise RuntimeError(
+                f"{name}: FP8 Linear saw a sharded DTensor local "
+                f"{tuple(local.shape)} vs global {global_shape}. "
+                "blockwise2d needs the full unsharded weight; the parent "
+                "FSDP all-gather did not run before this forward."
+            )
+        w = local
+    if hasattr(module, "out_features") and hasattr(module, "in_features"):
+        expected = (int(module.out_features), int(module.in_features))
+        if tuple(w.shape) != expected:
+            name = getattr(module, "_quant_tensor_id", type(module).__name__)
+            raise RuntimeError(
+                f"{name}: FP8 Linear weight shape {tuple(w.shape)} != {expected}"
+            )
+    if scaling_type in ("blockwise", "blockwise2d") and w.dim() == 2:
+        if w.shape[0] % block_size or w.shape[1] % block_size:
+            name = getattr(module, "_quant_tensor_id", type(module).__name__)
+            raise RuntimeError(
+                f"{name}: FP8 {scaling_type} weight {tuple(w.shape)} is not "
+                f"divisible by block_size={block_size}"
+            )
+    return w
 
 
 def _build_bf16_skip_prefixes(
@@ -408,13 +455,46 @@ def _patch_linear_layers(
                 skipped += 1
                 continue
 
+            # Keep the output/vocab-projection layer in BF16 unless explicitly
+            # opted in: official Qwen3-*-FP8 also leaves lm_head in high precision,
+            # and the Triton FP8 GEMM overflows int32 pointer math on large vocab
+            # × long sequence (page fault).
             if not config.quantize_output_layer and _is_output_layer(name):
                 skipped += 1
                 continue
 
+            if _is_moe_router(name):
+                skipped += 1
+                continue
+
+            # Keep PEFT LoRA adapter matrices (lora_A / lora_B) in BF16: they are
+            # the trainable low-rank update and their rank dim (e.g. 16) is not
+            # block-quantizable (blockwise / blockwise2d require dims divisible by
+            # block_size). Only the wrapped base_layer weight is quantized.
             if "lora_" in name:
                 skipped += 1
                 continue
+
+            # Dense attention/MLP GEMMs stay BF16; SonicMoE experts still FP8.
+            if os.environ.get("LUMEN_FP8_EXPERTS_ONLY", "0") == "1":
+                leaf = name.rsplit(".", 1)[-1]
+                if leaf in (
+                    "linear_qkv",
+                    "linear_proj",
+                    "linear_q",
+                    "linear_k",
+                    "linear_v",
+                    "linear_fc1",
+                    "linear_fc2",
+                    # HuggingFace Qwen3 attention (FSDP path).
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "qkv_proj",
+                ):
+                    skipped += 1
+                    continue
 
             tensor_id = f"{name}.weight" if name else "weight"
             module._quant_manager = manager
@@ -712,6 +792,12 @@ def _replace_forward(
     if not is_megatron:
 
         def quant_forward(input_tensor, *args, **kwargs):
+            # MoE token routing can assign zero tokens to a local expert.
+            # AITER's dynamic quantization kernel cannot launch a zero-sized
+            # grid, while the original linear handles the empty tensor and
+            # produces correctly connected zero gradients.
+            if input_tensor.numel() == 0:
+                return original_forward(input_tensor, *args, **kwargs)
             _maybe_cache_frozen_weight(module, scaling_type, fp8_dtype, block_size)
             w = module.weight
             _wcache = getattr(module, "_fp8_weight_data", None)
@@ -719,8 +805,13 @@ def _replace_forward(
             if isinstance(w, Blockwise2DFP8Gathered):
                 _wcache, _wscale = w._fp8, w._scale
                 w._lumen_frozen = True
-            elif getattr(module, "_lumen_frozen", False):
-                w._lumen_frozen = True
+            else:
+                w = _materialize_linear_weight(module, scaling_type, block_size)
+                if getattr(module, "_lumen_frozen", False):
+                    # thread the patch-time frozen fact onto the live weight
+                    # tensor so the autograd Function can skip its WGrad
+                    # (FSDP may swap the param view).
+                    w._lumen_frozen = True
             _wcache, _wscale = _mxfp4_cached_weight(
                 module, w, _wcache, _wscale, scaling_type, fp8_dtype, block_size,
                 gemm_rows=input_tensor.numel() // input_tensor.shape[-1],
@@ -750,6 +841,8 @@ def _replace_forward(
     else:
 
         def quant_forward(input_tensor, *args, **kwargs):
+            if input_tensor.numel() == 0:
+                return original_forward(input_tensor, *args, **kwargs)
             skip_bias_add = getattr(module, "skip_bias_add", False)
             bias = getattr(module, "bias", None)
             bias_for_gemm = None if skip_bias_add else bias

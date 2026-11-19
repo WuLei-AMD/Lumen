@@ -1199,6 +1199,263 @@ def install_cross_entropy(**_kwargs) -> None:
 
 # ── Patch registry (Phase 1) ────────────────────────────────────────────────
 
+# ── MoE split-size D2H: overlap count all-gather with permute1 ───────────────
+
+def _moe_split_sizes_on_host(value):
+    """Materialize A2A split sizes after the D2H event has been synchronized."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return value
+    if torch.is_tensor(value):
+        if value.is_cuda:
+            value = value.cpu()
+        return [int(item) for item in value.tolist()]
+    return [int(item) for item in value]
+
+
+def _moe_pinned_d2h(cached, tensor):
+    """Queue a D2H into pinned memory. Pageable ``.to(cpu)`` would sync immediately."""
+    if tensor is None or not torch.is_tensor(tensor) or not tensor.is_cuda:
+        return cached, tensor
+    if (
+        cached is None
+        or cached.shape != tensor.shape
+        or cached.dtype != tensor.dtype
+    ):
+        cached = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+    cached.copy_(tensor, non_blocking=True)
+    tensor.record_stream(torch.cuda.current_stream())
+    return cached, cached
+
+
+def _device_a2a_enabled() -> bool:
+    return os.environ.get("LUMEN_MOE_DEVICE_A2A", "1") != "0"
+
+
+def install_moe_async_split_metadata():
+    """Hide EP split metadata behind permute1; keep expert counts on GPU.
+
+    Megatron all-gathers ``tokens_per_expert`` on the default stream, then
+    D2Hs split sizes before permute1. ``maybe_move_tensor_to_cpu`` writes
+    pageable memory, so that D2H syncs the host immediately and the
+    following permute never overlaps it.
+
+    With ``LUMEN_MOE_DEVICE_A2A=1`` (the default) the data all-to-all reads
+    split sizes on device, so this patch only publishes a pinned row count
+    and the launch point uses ``wait_event`` instead of
+    ``hipEventSynchronize``. Set ``LUMEN_MOE_DEVICE_A2A=0`` to keep the
+    host-list path, which still synchronizes at the A2A launch.
+
+    Disable the side-stream metadata path with ``LUMEN_MOE_ASYNC_SPLITS=0``.
+    """
+    if os.environ.get("LUMEN_MOE_ASYNC_SPLITS", "1") == "0":
+        return
+
+    from megatron.core.transformer.enums import CudaGraphScope
+    from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
+
+    if getattr(MoEAlltoAllTokenDispatcher, "_lumen_async_splits_patched", False):
+        return
+
+    _orig_preprocess = MoEAlltoAllTokenDispatcher.preprocess
+    _orig_dtoh = MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize
+
+    def _async_splits_supported(dispatcher) -> bool:
+        config = dispatcher.config
+        if dispatcher.drop_and_pad:
+            return False
+        if dispatcher.ep_size <= 1 and dispatcher.tp_size <= 1:
+            return False
+        if config.moe_expert_capacity_factor is not None:
+            return False
+        if config.moe_router_padding_for_quantization:
+            return False
+        if config.cuda_graph_impl != "none" and (
+            CudaGraphScope.moe_preprocess in config.cuda_graph_scope
+            or not config.cuda_graph_scope
+        ):
+            return False
+        return True
+
+    def _patched_preprocess(self, routing_map):
+        if not _async_splits_supported(self):
+            return _orig_preprocess(self, routing_map)
+
+        ready = torch.cuda.current_stream().record_event()
+        self.cuda_dtoh_stream.wait_event(ready)
+        with torch.cuda.stream(self.cuda_dtoh_stream):
+            tokens_per_expert = _orig_preprocess(self, routing_map)
+            if _device_a2a_enabled() and torch.is_tensor(self.output_splits) and self.output_splits.is_cuda:
+                # Full split vectors, not just the sum. The GPU tensors stay
+                # in place; RCCL reads a host snapshot once this D2H finishes.
+                self._lumen_pinned_input, pinned_in = _moe_pinned_d2h(
+                    getattr(self, "_lumen_pinned_input", None), self.input_splits
+                )
+                self._lumen_pinned_output, pinned_out = _moe_pinned_d2h(
+                    getattr(self, "_lumen_pinned_output", None), self.output_splits
+                )
+                self.d2h_event = self.cuda_dtoh_stream.record_event()
+                for gpu_tensor, pinned in (
+                    (self.input_splits, pinned_in),
+                    (self.output_splits, pinned_out),
+                ):
+                    if torch.is_tensor(gpu_tensor):
+                        gpu_tensor._lumen_pinned_splits = pinned
+                        gpu_tensor._lumen_rows_event = self.d2h_event
+            else:
+                self._lumen_pinned_input, self.input_splits = _moe_pinned_d2h(
+                    getattr(self, "_lumen_pinned_input", None), self.input_splits
+                )
+                self._lumen_pinned_output, self.output_splits = _moe_pinned_d2h(
+                    getattr(self, "_lumen_pinned_output", None), self.output_splits
+                )
+                self._lumen_pinned_output_tp, self.output_splits_tp = _moe_pinned_d2h(
+                    getattr(self, "_lumen_pinned_output_tp", None), self.output_splits_tp
+                )
+            self.d2h_event = self.cuda_dtoh_stream.record_event()
+        self._lumen_async_splits = True
+        return tokens_per_expert
+
+    def _patched_dtoh(self, point, tokens_per_expert=None):
+        if not getattr(self, "_lumen_async_splits", False):
+            return _orig_dtoh(self, point, tokens_per_expert)
+        if point == self.cuda_sync_point:
+            event = getattr(self, "d2h_event", None)
+            if _device_a2a_enabled():
+                # Order the data all-to-all after the count exchange without
+                # blocking the host. Split tensors stay on device.
+                if event is not None:
+                    torch.cuda.current_stream().wait_event(event)
+            else:
+                if event is not None:
+                    event.synchronize()
+                self.input_splits = _moe_split_sizes_on_host(self.input_splits)
+                self.output_splits = _moe_split_sizes_on_host(self.output_splits)
+                self.output_splits_tp = _moe_split_sizes_on_host(self.output_splits_tp)
+        return tokens_per_expert
+
+    MoEAlltoAllTokenDispatcher.preprocess = _patched_preprocess
+    MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize = _patched_dtoh
+    MoEAlltoAllTokenDispatcher._lumen_async_splits_patched = True
+
+
+def _host_split_list(value):
+    """Host split list. Synchronize only if the side-stream D2H is not done."""
+    if value is None or isinstance(value, list):
+        return value
+    pinned = getattr(value, "_lumen_pinned_splits", None)
+    event = getattr(value, "_lumen_rows_event", None)
+    if pinned is not None and event is not None:
+        if not event.query():
+            event.synchronize()
+        return [int(item) for item in pinned.tolist()]
+    return _moe_split_sizes_on_host(value)
+
+
+def install_moe_device_alltoall():
+    """Give RCCL host split lists without waiting when the D2H already finished.
+
+    The payload stays on RCCL. ``LUMEN_MOE_DEVICE_A2A=0`` keeps the original
+    path, which synchronizes the split D2H at every launch.
+    """
+    if not _device_a2a_enabled():
+        return
+
+    import megatron.core.tensor_parallel.mappings as mappings
+
+    if getattr(mappings._AllToAll, "_lumen_device_a2a", False):
+        return
+
+    _orig_forward = mappings._AllToAll.forward
+
+    def _device_forward(ctx, group, input, output_split_sizes, input_split_sizes):
+        device_splits = (
+            torch.is_tensor(output_split_sizes)
+            and torch.is_tensor(input_split_sizes)
+            and output_split_sizes.is_cuda
+            and input_split_sizes.is_cuda
+        )
+        if not device_splits:
+            return _orig_forward(ctx, group, input, output_split_sizes, input_split_sizes)
+        return _orig_forward(
+            ctx,
+            group,
+            input,
+            _host_split_list(output_split_sizes),
+            _host_split_list(input_split_sizes),
+        )
+
+    mappings._AllToAll.forward = staticmethod(_device_forward)
+    mappings._AllToAll._lumen_device_a2a = True
+
+
+
+# ── Router backward GEMM in bf16 ────────────────────────────────────────────
+
+_ROUTER_BWD_BF16 = os.environ.get("LUMEN_ROUTER_BWD_BF16", "0") == "1"
+_ROUTER_BWD_BF16_LOGGED = False
+
+
+def install_router_bwd_bf16():
+    """Run the fp32 router's backward GEMMs on bf16 inputs.
+
+    Forward logits stay fp32. Megatron otherwise casts the full activation to
+    fp32 before the input and weight gradients. The returned gradients are
+    cast back to the parameter dtype either way.
+
+    Gated by ``LUMEN_ROUTER_BWD_BF16=1``.
+    """
+    if not _ROUTER_BWD_BF16:
+        return
+
+    from megatron.core.transformer.moe import moe_utils
+
+    cls = moe_utils.RouterGatingLinearFunction
+    if getattr(cls, "_lumen_bwd_bf16", False):
+        return
+    te_general_gemm = moe_utils.te_general_gemm
+    if te_general_gemm is None:
+        print("Lumen router bwd bf16: te_general_gemm missing, skipped", flush=True)
+        return
+    orig_backward = cls.backward
+
+    def backward(ctx, grad_output):
+        if ctx.router_dtype != torch.float32:
+            return orig_backward(ctx, grad_output)
+        inp, weight, bias = ctx.saved_tensors
+        inp_shape = inp.shape
+        grad_shape = grad_output.shape
+        inp = inp.view(-1, inp_shape[-1])
+        grad_output = grad_output.view(-1, grad_shape[-1])
+        grad_bf16 = (
+            grad_output
+            if grad_output.dtype == torch.bfloat16
+            else grad_output.to(torch.bfloat16)
+        )
+        weight_bf16 = weight if weight.dtype == torch.bfloat16 else weight.to(torch.bfloat16)
+        inp_bf16 = inp if inp.dtype == torch.bfloat16 else inp.to(torch.bfloat16)
+        grad_input = te_general_gemm(
+            weight_bf16, grad_bf16, torch.float32, layout="NN", grad=True
+        )[0]
+        grad_weight = te_general_gemm(
+            inp_bf16, grad_bf16, torch.float32, layout="NT", grad=True
+        )[0]
+        grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
+        return (
+            grad_input.to(ctx.input_dtype).view(inp_shape),
+            grad_weight.to(ctx.weight_dtype),
+            grad_bias,
+            None,
+        )
+
+    cls.backward = staticmethod(backward)
+    cls._lumen_bwd_bf16 = True
+    global _ROUTER_BWD_BF16_LOGGED
+    if not _ROUTER_BWD_BF16_LOGGED:
+        _ROUTER_BWD_BF16_LOGGED = True
+        print("Lumen router backward GEMM: bf16 inputs, fp32 accumulate", flush=True)
+
 from lumen.patches.registry import PatchPhase, register_patch
 
 
@@ -1319,6 +1576,28 @@ register_patch(
 )(install_cross_entropy)
 
 
+
+register_patch(
+    "moe_async_split_metadata",
+    PatchPhase.IMPORT,
+    description="Overlap MoE EP split-size D2H with permute",
+    tags=frozenset({"moe", "megatron", "comm"}),
+)(install_moe_async_split_metadata)
+
+register_patch(
+    "moe_device_alltoall",
+    PatchPhase.IMPORT,
+    description="Keep MoE all-to-all split sizes on device until RCCL needs a host list",
+    tags=frozenset({"moe", "megatron", "comm"}),
+)(install_moe_device_alltoall)
+
+register_patch(
+    "router_bwd_bf16",
+    PatchPhase.IMPORT,
+    description="BF16 inputs for the fp32 MoE router backward GEMM",
+    tags=frozenset({"moe", "megatron"}),
+)(install_router_bwd_bf16)
+
 # ── Public API ──────────────────────────────────────────────────────────────
 
 def install_all():
@@ -1332,6 +1611,9 @@ def install_all():
     from lumen.patches import apply_patches
 
     apply_patches(PatchPhase.IMPORT, default_only=True)
+    from lumen.models.expert_remap import install_megatron_expert_remap
+
+    install_megatron_expert_remap()
 
     # SDMA DP gradient all-reduce (replaces NCCL when --use-sdma is set)
     # Disabled: the sdma_dp_grad_reduce module was never committed on this

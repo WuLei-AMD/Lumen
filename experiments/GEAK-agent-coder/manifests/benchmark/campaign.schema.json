@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://geak.local/schemas/benchmark/campaign.schema.json",
+  "title": "GEAK fixed-agent benchmark campaign artifact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "name",
+    "status",
+    "fixed_identity",
+    "variants",
+    "tasks_manifest",
+    "protected_sha256",
+    "runner",
+    "gpu_isolation",
+    "artifacts",
+    "config_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": "geak_benchmark_campaign_v1"},
+    "name": {"type": "string", "minLength": 1},
+    "status": {
+      "enum": ["planned", "running", "complete", "failed", "invalid"]
+    },
+    "fixed_identity": {"$ref": "#/$defs/fixedIdentity"},
+    "variants": {
+      "type": "array",
+      "minItems": 2,
+      "items": {"$ref": "#/$defs/variant"}
+    },
+    "tasks_manifest": {"type": "string", "minLength": 1},
+    "protected_sha256": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 32}
+    },
+    "runner": {"type": "object"},
+    "gpu_isolation": {"type": "object"},
+    "artifacts": {"type": "object"},
+    "config_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  },
+  "$defs": {
+    "fixedIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent_hash", "suite_hash", "decode_hash"],
+      "properties": {
+        "agent_hash": {"type": "string", "minLength": 1},
+        "suite_hash": {"type": "string", "minLength": 1},
+        "decode_hash": {"type": "string", "minLength": 1}
+      }
+    },
+    "variant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "base_url", "model", "checkpoint_identity"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "base_url": {"type": "string", "minLength": 1},
+        "model": {"type": "string", "minLength": 1},
+        "checkpoint_identity": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

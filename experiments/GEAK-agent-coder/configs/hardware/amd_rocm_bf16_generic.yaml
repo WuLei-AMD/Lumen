@@ -1,0 +1,21 @@
+hardware:
+  profile: amd_rocm_bf16_generic
+  vendor: amd
+  gpu_sku: generic-rocm
+  target_arch: "gfx*"
+  supported_arches: ["gfx*"]
+  runtime_arch_check: true
+  nodes: 1
+  gpus_per_node: 1
+  memory_gib_per_gpu: null
+  tuned_kernel_overlay: null
+  capabilities:
+    bf16: true
+    native_fp8: false
+    fp8_formats: []
+
+distributed:
+  nproc_per_node: 1
+  world_size: 1
+  dp_size: 1
+  ep_size: 1

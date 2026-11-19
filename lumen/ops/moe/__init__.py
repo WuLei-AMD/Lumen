@@ -4,6 +4,8 @@
 # Licensed under the Apache License, Version 2.0
 ###############################################################################
 
+from lumen.ops.moe.dispatch_layout import transpose_variable_chunks
+from lumen.ops.moe.dispatch_overlap import AsyncCountExchange, begin_count_exchange
 from lumen.ops.moe.fused_moe import fused_moe_triton
 from lumen.ops.moe.fused_router import (
     fused_compute_score_for_moe_aux_loss,
@@ -11,17 +13,18 @@ from lumen.ops.moe.fused_router import (
     fused_topk_with_score_function,
 )
 from lumen.ops.moe.fused_routing import (
-    decode_aiter_sorted_ids,
     fused_permute,
     fused_topk,
     fused_unpermute,
 )
 
 __all__ = [
+    "AsyncCountExchange",
+    "begin_count_exchange",
+    "transpose_variable_chunks",
     "fused_topk",
     "fused_permute",
     "fused_unpermute",
-    "decode_aiter_sorted_ids",
     "fused_moe_triton",
     "fused_topk_with_score_function",
     "fused_compute_score_for_moe_aux_loss",

@@ -1,0 +1,54 @@
+schema_version: geak_data_config_v2
+
+tokenizer:
+  path: ../../models/Qwen3-30B-A3B
+  sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+
+tokenization:
+  model_family: Qwen/Qwen3-30B-A3B
+  max_length: 32768
+  include_assistant_eot_in_loss: true
+  overflow_policy: quarantine
+
+sampling:
+  steps: 1000
+  seed: 0
+  length_penalty_power: 0.5
+  replay_mix:
+    enabled: false
+
+sources:
+  - name: cached_hf_coding
+    type: hf_cache
+    dataset_id: organization/coding-dataset
+    revision: PINNED_DATASET_REVISION
+    cache_dir: ../../data/hf-cache
+    split: train
+    allow_network: false
+    admission:
+      type: generic
+      allowed_splits: [train]
+      require_provenance: true
+      required_provenance_fields: [dataset_id, dataset_revision]
+    field_mapping:
+      schema_version: {const: generic_coding_sft_v1}
+      sample_id: {source: id}
+      sample_domain: {const: generic_coding}
+      task_type: {const: coding_instruction}
+      split: {const: train}
+      input:
+        object:
+          prompt: {source: instruction}
+      output:
+        object:
+          response: {source: output}
+      provenance:
+        object:
+          dataset_id: {const: organization/coding-dataset}
+          dataset_revision: {const: PINNED_DATASET_REVISION}
+
+output:
+  directory: ../../data/build/generic_hf
+  train_file: train.tokenized.jsonl
+  dev_file: dev.tokenized.jsonl
+  manifest_file: manifest.json

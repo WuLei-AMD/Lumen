@@ -1,0 +1,42 @@
+recipe:
+  name: qwen3_amd_bf16
+
+model:
+  name_or_path: Qwen/Qwen3-30B-A3B
+  revision: null
+  max_position_embeddings: 40960
+
+distributed:
+  expert_backend: sequential
+  sharding: full_shard
+
+lora:
+  attention_rank: 16
+  attention_alpha: 32
+  expert_rank: 4
+  expert_alpha: 8
+  dropout: 0.0
+  targets:
+    attention: [q_proj, k_proj, v_proj, o_proj]
+    experts: [gate_up_proj, down_proj]
+
+precision:
+  mode: bf16
+  adapter_dtype: bfloat16
+
+training:
+  micro_batch_size: 1
+  gradient_accumulation_steps: 1
+  max_steps: 100
+  learning_rate: 0.0001
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  log_interval: 1
+  evaluation_interval: 0
+  seed: 1234
+
+optimizations:
+  aiter_attn: false
+  lumen_norm: false
+  fused_router: false
+  fuse_rope: false

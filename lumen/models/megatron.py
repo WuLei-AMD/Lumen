@@ -63,9 +63,105 @@ from lumen.patches.builders.megatron_model import (  # noqa: E402
     _patch_rmsnorm,
 )
 
+
+def _install_parity_dump_hook(model: torch.nn.Module) -> None:
+    dump_dir = os.environ.get("QWEN_PARITY_DUMP_DIR")
+    if not dump_dir or (torch.distributed.is_initialized() and torch.distributed.get_rank() != 0):
+        return
+
+    os.makedirs(dump_dir, exist_ok=True)
+    state = {"written": False}
+
+    def dump_first_layer(_module, inputs, kwargs, output):
+        if state["written"]:
+            return
+        hidden_input = inputs[0] if inputs else kwargs["hidden_states"]
+        hidden_output = output[0] if isinstance(output, tuple) else output
+        torch.save(
+            {
+                "input": hidden_input.detach().cpu(),
+                "output": hidden_output.detach().cpu(),
+            },
+            os.path.join(dump_dir, "megatron-layer0.pt"),
+        )
+        state["written"] = True
+
+    model.decoder.layers[0].register_forward_hook(dump_first_layer, with_kwargs=True)
+
+    def dump_component(name):
+        written = {"value": False}
+
+        def hook(_module, _inputs, output):
+            if written["value"]:
+                return
+            tensor = output[0] if isinstance(output, tuple) else output
+            torch.save(
+                tensor.detach().cpu(),
+                os.path.join(dump_dir, f"megatron-{name}.pt"),
+            )
+            written["value"] = True
+
+        return hook
+
+    layer = model.decoder.layers[0]
+    layer.self_attention.register_forward_hook(dump_component("attention"))
+    layer.self_attention.linear_qkv.register_forward_hook(dump_component("linear-qkv"))
+    layer.self_attention.core_attention.register_forward_hook(dump_component("core-attention"))
+    layer.self_attention.linear_proj.register_forward_hook(dump_component("linear-proj"))
+    layer.mlp.register_forward_hook(dump_component("mlp"))
+
+
+def _install_legacy_input_norm_load_hook(model: torch.nn.Module) -> None:
+    """Load checkpoints that stored local-spec input norms under fused TE keys."""
+
+    def remap_input_norms(_module, state_dict, _prefix, *_args):
+        suffix = ".self_attention.linear_qkv.layer_norm_weight"
+        remapped = 0
+        for old_key in [key for key in state_dict if key.endswith(suffix)]:
+            new_key = old_key[: -len(suffix)] + ".input_layernorm.weight"
+            if new_key not in state_dict:
+                state_dict[new_key] = state_dict[old_key]
+                remapped += 1
+            del state_dict[old_key]
+        if remapped:
+            print_rank_0(
+                f"> remapped {remapped} legacy fused input-norm checkpoint keys "
+                "to the local transformer spec"
+            )
+
+    model.register_load_state_dict_pre_hook(remap_input_norms)
+
+
 # Per-head QK norms sit one level down, inside the attention submodule spec, and
 # normalise over head_dim instead of hidden_size.
 _ATTN_NORM_ATTRS = ("q_layernorm", "k_layernorm")
+
+
+def _patch_qk_rmsnorms(model):
+    """Replace the large Q per-head RMSNorm with the Triton implementation.
+
+    K has eight times fewer rows on Qwen3 GQA.  The native PyTorch kernel is
+    faster at that size, so it is intentionally left unchanged.
+    """
+    from lumen.ops.normalization import LumenRMSNorm
+
+    count = 0
+    for module in model.modules():
+        child = getattr(module, "q_layernorm", None)
+        if child is None or isinstance(child, LumenRMSNorm):
+            continue
+        weight = getattr(child, "weight", None)
+        if weight is None or weight.ndim != 1:
+            continue
+        eps = getattr(child, "eps", getattr(child, "epsilon", 1e-6))
+        replacement = LumenRMSNorm(weight.shape[0], eps=eps)
+        # Keep the original Parameter object so checkpoint names, optimizer
+        # attributes, dtype, and sequence-parallel metadata are unchanged.
+        replacement.weight = weight
+        setattr(module, "q_layernorm", replacement)
+        count += 1
+
+    print_rank_0(f"> Replaced {count} Q RMSNorm modules with LumenRMSNorm")
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +182,7 @@ _BACKEND_MAP = {
     "triton": ("aiter_triton", "aiter_triton_fp8"),
     "csrc": ("aiter_csrc", "aiter_csrc_fp8"),
     "asm": ("aiter_csrc", "aiter_asm_fp8"),
+    "opus": ("aiter_opus", "aiter_triton_fp8"),
 }
 
 
@@ -170,7 +267,15 @@ def _patch_cross_entropy():
 # ---------------------------------------------------------------------------
 
 
-def lumen_gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, model_name="GPT"):
+def lumen_gpt_builder(
+    args,
+    pre_process,
+    post_process,
+    vp_stage=None,
+    config=None,
+    pg_collection=None,
+    model_name="GPT",
+):
     """Build a GPTModel with Lumen attention replacing the default
     DotProductAttention in every layer.
 
@@ -188,6 +293,7 @@ def lumen_gpt_builder(args, pre_process, post_process, vp_stage=None, config=Non
             post_process,
             vp_stage=vp_stage,
             config=config,
+            pg_collection=pg_collection,
             model_name=model_name,
         )
 
@@ -195,12 +301,17 @@ def lumen_gpt_builder(args, pre_process, post_process, vp_stage=None, config=Non
 
     _override_te_args_for_lumen(args)
 
-    # Rope fusion needs a kernel only TransformerEngine or Lumen's apex bridge
-    # supplies, so it stays opt-in. Set on args because
-    # core_transformer_config_from_args reads it from there.
-    args.apply_rope_fusion = getattr(args, "lumen_fused_rope", False)
+    # get_model() builds the config before the provider runs, so the flag has
+    # to be stamped onto that object. The provider-built path still reads args.
+    if getattr(args, "lumen_fused_rope", False):
+        args.apply_rope_fusion = True
+        if config is not None:
+            config.apply_rope_fusion = True
+        print_rank_0("> Lumen fused RoPE enabled")
 
     if config is None:
+        if not getattr(args, "lumen_fused_rope", False):
+            args.apply_rope_fusion = False
         config = core_transformer_config_from_args(args)
 
     # Outside the `if` on purpose: these hold regardless of whether the config
@@ -209,13 +320,12 @@ def lumen_gpt_builder(args, pre_process, post_process, vp_stage=None, config=Non
     apply_config_build(config, args, tags={"lumen", "builder"})
 
     transformer_layer_spec = get_gpt_layer_local_spec(
-        args.num_experts,
-        args.moe_grouped_gemm,
-        args.qk_layernorm,
-        args.multi_latent_attention,
-        moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
-        normalization=args.normalization,
-        use_kitchen=config.use_kitchen,
+        getattr(args, "num_experts", None),
+        getattr(args, "moe_grouped_gemm", False),
+        getattr(args, "qk_layernorm", False),
+        getattr(args, "multi_latent_attention", False),
+        normalization=getattr(args, "normalization", "RMSNorm"),
+        use_kitchen=getattr(config, "use_kitchen", False),
     )
 
     apply_model_build(
@@ -239,8 +349,11 @@ def lumen_gpt_builder(args, pre_process, post_process, vp_stage=None, config=Non
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
         rope_scaling=args.use_rope_scaling,
+        pg_collection=pg_collection,
         vp_stage=vp_stage,
     )
+    _install_legacy_input_norm_load_hook(model)
+    _install_parity_dump_hook(model)
 
     apply_model_build(
         config=config,
@@ -248,11 +361,22 @@ def lumen_gpt_builder(args, pre_process, post_process, vp_stage=None, config=Non
         model=model,
         names=GPT_LOCAL_MODEL_PATCHES,
     )
+    if not (getattr(args, "lumen_rmsnorm", False) or getattr(args, "lumen_norm", False)):
+        if os.environ.get("LUMEN_QK_RMSNORM", "0") == "1":
+            _patch_qk_rmsnorms(model)
 
     return model
 
 
-def lumen_gpt_builder_with_spec(args, pre_process, post_process, vp_stage=None, config=None, model_name="GPT"):
+def lumen_gpt_builder_with_spec(
+    args,
+    pre_process,
+    post_process,
+    vp_stage=None,
+    config=None,
+    pg_collection=None,
+    model_name="GPT",
+):
     """Build a GPTModel using the Lumen spec provider.
 
     Instead of patching individual modules post-hoc, this builder uses
@@ -271,8 +395,17 @@ def lumen_gpt_builder_with_spec(args, pre_process, post_process, vp_stage=None, 
 
     _override_te_args_for_lumen(args)
 
+    # get_model() builds the config before the provider runs, so the flag has
+    # to be stamped onto that object. The provider-built path still reads args.
+    if getattr(args, "lumen_fused_rope", False):
+        args.apply_rope_fusion = True
+        if config is not None:
+            config.apply_rope_fusion = True
+        print_rank_0("> Lumen fused RoPE enabled")
+
     if config is None:
-        args.apply_rope_fusion = getattr(args, "lumen_fused_rope", False)
+        if not getattr(args, "lumen_fused_rope", False):
+            args.apply_rope_fusion = False
         config = core_transformer_config_from_args(args)
         apply_config_build(config, args, tags={"lumen", "builder"})
 
@@ -290,7 +423,6 @@ def lumen_gpt_builder_with_spec(args, pre_process, post_process, vp_stage=None, 
             moe_grouped_gemm=getattr(args, "moe_grouped_gemm", False),
             qk_layernorm=getattr(args, "qk_layernorm", False),
             multi_latent_attention=getattr(args, "multi_latent_attention", False),
-            moe_use_legacy_grouped_gemm=getattr(args, "moe_use_legacy_grouped_gemm", False),
             use_kitchen=getattr(config, "use_kitchen", False),
         )
     finally:
@@ -328,6 +460,7 @@ def lumen_gpt_builder_with_spec(args, pre_process, post_process, vp_stage=None, 
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
         rope_scaling=args.use_rope_scaling,
+        pg_collection=pg_collection,
         vp_stage=vp_stage,
     )
 
@@ -337,6 +470,8 @@ def lumen_gpt_builder_with_spec(args, pre_process, post_process, vp_stage=None, 
         model=model,
         names=GPT_LUMEN_MODEL_PATCHES,
     )
+    if os.environ.get("LUMEN_QK_RMSNORM", "0") == "1":
+        _patch_qk_rmsnorms(model)
 
     return model
 
@@ -442,6 +577,7 @@ def _enable_quantization_for_parallel_linear(
     from lumen.modules.grouped_linear import LumenGroupedLinear
     from lumen.modules.layernorm_linear import LumenLayerNormLinear
     from lumen.modules.parallel_linear import LumenColumnParallelLinear, LumenRowParallelLinear
+    from lumen.modules.sonic_moe import SonicMoEExperts
 
     if fp8_dtype is None:
         from lumen.quantize.config import _get_float8_e4m3
@@ -487,7 +623,14 @@ def _enable_quantization_for_parallel_linear(
     skipped = 0
     for name, module in model.named_modules():
         if isinstance(
-            module, (LumenColumnParallelLinear, LumenRowParallelLinear, LumenLayerNormLinear, LumenGroupedLinear)
+            module,
+            (
+                LumenColumnParallelLinear,
+                LumenRowParallelLinear,
+                LumenLayerNormLinear,
+                LumenGroupedLinear,
+                SonicMoEExperts,
+            ),
         ):
             if bf16_prefixes and is_under_bf16_prefix(name, bf16_prefixes):
                 skipped += 1
@@ -867,18 +1010,26 @@ def make_lumen_model_provider(
     """
 
     def model_provider(
-        pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None
+        pre_process=True,
+        post_process=True,
+        vp_stage=None,
+        config=None,
+        pg_collection=None,
     ):
-        # pg_collection is accepted but not forwarded: Megatron's get_model
-        # defaults it to ProcessGroupCollection.use_mpu_process_groups(), which is
-        # the same set GPTModel derives from parallel_state when given None.
+        import inspect
         import os
         from dataclasses import replace as _replace
 
         from lumen.config import LumenConfig
 
         args = get_args()
-        model = model_builder(args, pre_process, post_process, vp_stage, config=config)
+        builder_parameters = inspect.signature(model_builder).parameters
+        builder_kwargs = {"vp_stage": vp_stage}
+        if "config" in builder_parameters:
+            builder_kwargs["config"] = config
+        if "pg_collection" in builder_parameters:
+            builder_kwargs["pg_collection"] = pg_collection
+        model = model_builder(args, pre_process, post_process, **builder_kwargs)
 
         # 1. Megatron LoRA (not PEFT — stays separate)
         if getattr(args, "lora_rank", 0) > 0:
@@ -1071,6 +1222,7 @@ def _run_warmup_eval_pass(model, args):
 
 _val_loss_ema: Optional[float] = None
 _early_stop_logged = False
+_parity_loss_index = 0
 
 
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model=None):
@@ -1079,11 +1231,21 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model=None):
     previous per-step, per-rank training-loss EMA stop caused a DP desync
     (one rank crossed the threshold on its local loss and exited the train
     loop while others continued -> mismatched collectives -> NCCL deadlock)."""
+    global _parity_loss_index
     losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.view(-1).float()
     loss = torch.sum(losses * loss_mask)
     num_tokens = loss_mask.sum().clone().detach().to(torch.int)
     reporting = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
+    if os.environ.get("QWEN_PARITY_LOG_LOCAL_LOSS", "0") == "1":
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        local_mean = loss.detach() / num_tokens.clamp_min(1)
+        print(
+            f"Qwen parity local loss: rank={rank} call={_parity_loss_index} "
+            f"lm_loss={local_mean.item():.9f}",
+            flush=True,
+        )
+        _parity_loss_index += 1
     return loss, num_tokens, {"lm loss": reporting}
 
 
@@ -1102,7 +1264,7 @@ def make_forward_step(get_batch_fn: Callable, loss_fn: Callable = loss_func, zer
         zero_last_loss_mask: Forwarded to :func:`_get_synthetic_batch`.
     """
 
-    def forward_step(data_iterator, model: GPTModel):
+    def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = False):
         global _warmup_step_counter, _warmup_completed
 
         args = get_args()
@@ -1148,8 +1310,18 @@ def make_forward_step(get_batch_fn: Callable, loss_fn: Callable = loss_func, zer
         timers("batch-generator").stop()
 
         with stimer:
-            with get_cpu_offload_context(args):
-                output_tensor = model(tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask)
+            if return_schedule_plan:
+                assert getattr(args, "overlap_moe_expert_parallel_comm", False), (
+                    "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
+                )
+                output_tensor = model.build_schedule_plan(
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                )
+            else:
+                with get_cpu_offload_context(args):
+                    output_tensor = model(
+                        tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                    )
 
         return output_tensor, partial(loss_fn, loss_mask, model=model)
 

@@ -27,6 +27,7 @@ from lumen.ops.quantize.ops import (
     is_cdna4,
     quant_fp8_blockwise_impl,
     quant_fp8_blockwise_segment_m_impl,
+    quant_fp8_blockwise_weight_3d,
     quant_fp8_tensorwise_impl,
     swizzle_mxfp4_scale,
     transpose_packed_fp4,
@@ -40,6 +41,7 @@ __all__ = [
     "is_cdna4",
     "quant_fp8_blockwise_impl",
     "quant_fp8_blockwise_segment_m_impl",
+    "quant_fp8_blockwise_weight_3d",
     "quant_fp8_tensorwise_impl",
     # MXFP4 quant/dequant ops
     "convert_to_mxfp4",

@@ -57,6 +57,8 @@ class PretrainTextDataset(Dataset):
             silently trains on repeated data. Callers that turn it on own
             telling the user: the class does not warn, because it is built once
             per rank and would say it once per rank.
+        virtual_num_samples: If set, expose at least this many samples by
+            cycling over the tokenized chunks.
     """
 
     def __init__(
@@ -69,6 +71,7 @@ class PretrainTextDataset(Dataset):
         rank: int = 0,
         world_size: int = 1,
         allow_repeat: bool = False,
+        virtual_num_samples: Optional[int] = None,
     ):
         if world_size < 1 or not 0 <= rank < world_size:
             raise ValueError(f"Invalid dataset shard rank={rank}, world_size={world_size}")
@@ -79,6 +82,7 @@ class PretrainTextDataset(Dataset):
         self.rank = rank
         self.world_size = world_size
         self._chunks: List[List[int]] = []
+        self._virtual_num_samples = virtual_num_samples
 
         if data_path is None:
             self._max_samples = max_samples or 0
@@ -125,11 +129,14 @@ class PretrainTextDataset(Dataset):
 
     def __len__(self) -> int:
         n = len(self._chunks)
-        if self._max_samples is None:
-            return n
-        if self._allow_repeat and n:
-            return self._max_samples
-        return min(n, self._max_samples)
+        if self._max_samples is not None:
+            if self._allow_repeat and n:
+                n = self._max_samples
+            else:
+                n = min(n, self._max_samples)
+        if self._virtual_num_samples is not None and n:
+            n = max(n, self._virtual_num_samples)
+        return n
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         idx = idx % len(self._chunks)

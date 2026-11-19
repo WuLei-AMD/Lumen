@@ -19,6 +19,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+import torch
 
 from lumen.models.llama31.dataset import PretrainTextDataset, check_sample_budget
 
@@ -159,3 +160,43 @@ class TestCheckSampleBudget:
         # A rank whose shard tokenized nothing is not evidence about the
         # corpus; Megatron's own empty-dataset handling owns that case.
         assert check_sample_budget(0, 100, allow_repeat=False) is None
+
+class _WordTokenizer:
+    eos_token_id = 0
+
+    @staticmethod
+    def encode(text: str, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        return [int(token) for token in text.split()]
+
+
+def test_virtual_samples_cycle_physical_chunks(tmp_path):
+    data_path = tmp_path / "train.jsonl"
+    data_path.write_text('{"text": "1 2 3 4 5 6 7 8 9 10 11"}\n')
+
+    dataset = PretrainTextDataset(
+        str(data_path),
+        seq_length=3,
+        tokenizer=_WordTokenizer(),
+        is_hf_tokenizer=True,
+        virtual_num_samples=5,
+    )
+
+    assert len(dataset) == 5
+    assert torch.equal(dataset[3]["input_ids"], dataset[0]["input_ids"])
+    assert torch.equal(dataset[4]["labels"], dataset[1]["labels"])
+
+
+def test_virtual_samples_do_not_shrink_dataset(tmp_path):
+    data_path = tmp_path / "train.jsonl"
+    data_path.write_text('{"text": "1 2 3 4 5 6 7 8 9 10 11"}\n')
+
+    dataset = PretrainTextDataset(
+        str(data_path),
+        seq_length=3,
+        tokenizer=_WordTokenizer(),
+        is_hf_tokenizer=True,
+        virtual_num_samples=2,
+    )
+
+    assert len(dataset) == 3

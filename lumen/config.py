@@ -75,6 +75,16 @@ _ARG_MAP: dict[str, tuple[str, ...]] = {
     "lumen_norm": ("lumen_norm",),
     "hf_attn_patch": ("hf_attn_patch",),
     "lumen_linear": ("lumen_linear",),
+    "sonic_moe": ("lumen_sonic_moe",),
+    "fused_router": ("lumen_fused_router",),
+    "moe_dispatch_overlap": (
+        "lumen_moe_dispatch_overlap",
+        "moe_dispatch_overlap",
+    ),
+    "moe_global_expert_layout": (
+        "lumen_moe_global_expert_layout",
+        "moe_global_expert_layout",
+    ),
     "fused_mlp": ("lumen_fused_mlp",),
     "fp8_activation_store": ("lumen_fp8_activation_store",),
     "cpu_offload": ("lumen_cpu_offload",),
@@ -156,6 +166,7 @@ class LumenConfig:
 
     # -- Tier 2: Attention FP8 --
     fp8_attn: str = "none"
+    # auto | triton | csrc | asm | opus  (see lumen.models.megatron._BACKEND_MAP)
     attn_backend: str = "auto"
     attn_quant_type: str = "blockwise"
 
@@ -167,6 +178,16 @@ class LumenConfig:
 
     # -- Tier 2: Linear GEMM patching (BF16) --
     lumen_linear: bool = False
+
+    # -- Tier 2: Megatron MoE expert replacement --
+    sonic_moe: bool = False
+
+    # -- Tier 2: Megatron fused router function patch --
+    fused_router: bool = False
+
+    # -- Tier 3: MoE dispatch metadata overlap --
+    moe_dispatch_overlap: bool = False
+    moe_global_expert_layout: bool = False
 
     # -- Tier 3: Execution / fusion --
     fused_mlp: bool = False
@@ -261,6 +282,10 @@ class LumenConfig:
             or self.lumen_norm
             or self.hf_attn_patch
             or self.lumen_linear
+            or self.sonic_moe
+            or self.fused_router
+            or self.moe_dispatch_overlap
+            or self.moe_global_expert_layout
             or self.fp8_param_manager
             or self.lora_rank > 0
             or self.fused_mlp
@@ -303,6 +328,12 @@ class LumenConfig:
                 "nn.Linear weights with FP8 storage before MXFP4 quantization, "
                 "which requires BF16/FP32 masters. Disable fp8_param_manager; "
                 "MXFP4 already caches packed FP4 weights per master-weight version."
+            )
+
+        if self.moe_dispatch_overlap and self.moe_global_expert_layout:
+            raise ValueError(
+                "moe_dispatch_overlap and moe_global_expert_layout are alternate "
+                "dispatcher modes and cannot be enabled together"
             )
 
         if self.rollout.upper() == "ATOM":
@@ -359,6 +390,22 @@ class LumenConfig:
         if self.lumen_linear:
             self._patch_linear(model)
 
+        # 1d. Megatron MoE expert replacement
+        if self.sonic_moe:
+            self._patch_sonic_moe(model)
+
+        # 1e. Megatron fused router function patch
+        if self.fused_router:
+            self._patch_fused_router(model)
+
+        # 1f. Model-local MoE dispatcher overlap
+        if self.moe_dispatch_overlap:
+            self._patch_moe_dispatch_overlap(model)
+
+        # 1g. Model-local expert-major MoE dispatch
+        if self.moe_global_expert_layout:
+            self._patch_moe_global_expert_layout(model)
+
         # 2. Pre-quant module attributes
         self._apply_pre_quant(model)
 
@@ -378,6 +425,10 @@ class LumenConfig:
                 backend=backend,
                 dp_group=dp_group if qcfg.reduce_amax else None,
             )
+
+        # 3b. SonicMoE expert FP8 (experts are not nn.Linear / parallel linear)
+        if self.sonic_moe and qcfg.is_quantized:
+            self._enable_sonic_moe_fp8(model, manager)
 
         # 4. Post-quant features
         self._apply_post_quant(model, manager)
@@ -557,6 +608,113 @@ class LumenConfig:
 
         patch_mlp_activation(model)
 
+    def _patch_sonic_moe(self, model) -> None:
+        """Replace Megatron MoE expert MLPs with AITER SonicMoE."""
+        from lumen.modules.sonic_moe import replace_megatron_moe_experts
+
+        count = replace_megatron_moe_experts(model)
+        if count == 0:
+            raise ValueError("sonic_moe=True but no Megatron MoELayer modules were found")
+        _rank0_print(f"> Replaced {count} Megatron MoE expert modules with SonicMoE")
+
+    def _enable_sonic_moe_fp8(self, model, manager) -> None:
+        """Quantize SonicMoE expert GEMMs after ``quant.enable()``."""
+        from lumen.modules.sonic_moe import SonicMoEExperts
+
+        qcfg = self.quant_config
+        scaling_type = qcfg.scaling.value if hasattr(qcfg.scaling, "value") else str(qcfg.scaling)
+        count = 0
+        for module in model.modules():
+            if not isinstance(module, SonicMoEExperts):
+                continue
+            module.enable_fp8(
+                scaling_manager=manager,
+                scaling_type=scaling_type,
+                fp8_dtype=qcfg.torch_dtype,
+                block_size=qcfg.block_size,
+            )
+            count += 1
+        if count:
+            _rank0_print(
+                f"> Enabled FP8 (scaling={scaling_type}) on {count} SonicMoE expert modules"
+            )
+
+    def _patch_fused_router(self, model) -> None:
+        """Enable model-local router hooks and Megatron patch points."""
+        local_patches = 0
+        for module in model.modules():
+            enable = getattr(module, "enable_lumen_fused_router", None)
+            if enable is not None:
+                enable()
+                local_patches += 1
+
+        try:
+            import megatron.core.transformer.moe.moe_utils as moe_utils
+        except ImportError:
+            _rank0_print(
+                f"> Lumen fused router enabled on {local_patches} model modules"
+            )
+            return
+
+        from lumen.ops.moe.fused_router import (
+            fused_compute_score_for_moe_aux_loss,
+            fused_moe_aux_loss,
+            fused_topk_with_score_function,
+        )
+
+        moe_utils.fused_topk_with_score_function = fused_topk_with_score_function
+        moe_utils.fused_compute_score_for_moe_aux_loss = (
+            fused_compute_score_for_moe_aux_loss
+        )
+        moe_utils.fused_moe_aux_loss = fused_moe_aux_loss
+        try:
+            import megatron.core.extensions.transformer_engine as te_ext
+        except ImportError:
+            te_ext = None
+        if te_ext is not None:
+            te_ext.fused_topk_with_score_function = fused_topk_with_score_function
+            te_ext.fused_compute_score_for_moe_aux_loss = (
+                fused_compute_score_for_moe_aux_loss
+            )
+            te_ext.fused_moe_aux_loss = fused_moe_aux_loss
+        _rank0_print(
+            f"> Lumen fused router installed ({local_patches} model modules + Megatron)"
+        )
+
+    def _patch_moe_dispatch_overlap(self, model) -> None:
+        """Enable asynchronous dispatcher metadata exchange on supported modules."""
+        patched = 0
+        for module in model.modules():
+            enable = getattr(module, "enable_lumen_moe_dispatch_overlap", None)
+            if enable is not None:
+                enable()
+                patched += 1
+        if patched == 0:
+            raise ValueError(
+                "moe_dispatch_overlap=True but no compatible MoE dispatcher modules "
+                "were found"
+            )
+        _rank0_print(
+            f"> Enabled MoE dispatch metadata overlap on {patched} model modules"
+        )
+
+    def _patch_moe_global_expert_layout(self, model) -> None:
+        """Enable expert-major token layout on compatible MoE dispatchers."""
+        patched = 0
+        for module in model.modules():
+            enable = getattr(module, "enable_lumen_moe_global_expert_layout", None)
+            if enable is not None:
+                enable()
+                patched += 1
+        if patched == 0:
+            raise ValueError(
+                "moe_global_expert_layout=True but no compatible MoE dispatcher "
+                "modules were found"
+            )
+        _rank0_print(
+            f"> Enabled global-expert MoE layout on {patched} model modules"
+        )
+
     def _apply_pre_quant(self, model) -> None:
         """Set module attributes that must exist before ``quant.enable()``.
 
@@ -708,6 +866,14 @@ class LumenConfig:
             parts.append("hf_attn_patch")
         if self.lumen_linear:
             parts.append("lumen_linear")
+        if self.sonic_moe:
+            parts.append("sonic_moe")
+        if self.fused_router:
+            parts.append("fused_router")
+        if self.moe_dispatch_overlap:
+            parts.append("moe_dispatch_overlap")
+        if self.moe_global_expert_layout:
+            parts.append("moe_global_expert_layout")
         if self.use_8bit_adam:
             parts.append("use_8bit_adam")
         tier3 = [

@@ -1,11 +1,11 @@
 #!/bin/bash
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 #
-# Qwen3-30B-A3B MoE Training — 2×MI308X nodes (16 GPUs), FSDP2 + DP=2 × EP=8.
+# Qwen3-30B-A3B MoE Training — 2×MI308X nodes (16 GPUs), FSDP2 + EP=8.
 #
 # Launches the lumen/llama2 container, overlays the host Lumen package and
-# examples, mounts the model + dataset, and runs the FSDP2 DP×EP training
-# script with torchrun across 2 nodes.
+# examples, mounts the model + dataset, and runs FSDP2 with overlapping
+# dense-DP and EP process groups across 2 nodes.
 #
 # This script must be run on EACH node. Set NODE_RANK=0 on the master node,
 # NODE_RANK=1 on the worker node.
@@ -15,27 +15,27 @@
 #   HOST_MODEL=/path/to/Qwen3-30B-A3B \
 #   HOST_DATA=/path/to/alpaca \
 #   TRAIN_FILE=train.jsonl VAL_FILE=test.jsonl \
-#     bash run_qwen3_30b_a3b_fsdp_mi308.sh
+#     bash run_qwen3_30b_a3b_fsdp.sh
 #
 # Example (worker node):
 #   NODE_RANK=1 MASTER_ADDR=10.0.0.1 MASTER_PORT=29500 \
 #   HOST_MODEL=/path/to/Qwen3-30B-A3B \
 #   HOST_DATA=/path/to/alpaca \
 #   TRAIN_FILE=train.jsonl VAL_FILE=test.jsonl \
-#     bash run_qwen3_30b_a3b_fsdp_mi308.sh
+#     bash run_qwen3_30b_a3b_fsdp.sh
 #
-# Single-node DP=1 EP=8 (backward compatible):
-#   NNODES=1 DP_SIZE=1 EP_SIZE=8 \
+# Single-node dense-DP=8 EP=8. DP_SIZE must equal WORLD_SIZE.
+#   NNODES=1 DP_SIZE=8 EP_SIZE=8 \
 #   HOST_MODEL=/path/to/Qwen3-30B-A3B \
 #   HOST_DATA=/path/to/alpaca \
 #   TRAIN_FILE=train.jsonl VAL_FILE=test.jsonl \
-#     bash run_qwen3_30b_a3b_fsdp_mi308.sh
+#     bash run_qwen3_30b_a3b_fsdp.sh
 #
-# Fastest config (memory permitting):
-#   MODE=fp8_blockwise2d \
-#   SHARDING=shard_grad_op GRAD_CKPT=0 \
+# Throughput-oriented config (memory permitting). TE grouped experts are
+# not covered by Lumen blockwise2d FP8; use sequential or sonic:
+#   MODE=fp8_blockwise2d EXPERT_BACKEND=sonic SHARDING=shard_grad_op GRAD_CKPT=0 \
 #   AITER_ATTN=1 LUMEN_NORM=1 FUSE_ROPE=1 \
-#     bash run_qwen3_30b_a3b_fsdp_mi308.sh
+#     bash run_qwen3_30b_a3b_fsdp.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -57,20 +57,43 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 
 # ---- Training config ----
 MODE="${MODE:-bf16}"                    # bf16 | fp8_blockwise2d
+EXPERT_BACKEND="${EXPERT_BACKEND:-te_grouped}"  # sequential | te_grouped | sonic
 SEQ_LENGTH="${SEQ_LENGTH:-2048}"
 MAX_STEPS="${MAX_STEPS:-100}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-50}"
 EP_SIZE="${EP_SIZE:-8}"
-DP_SIZE="${DP_SIZE:-2}"
+WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
+DP_SIZE="${DP_SIZE:-${WORLD_SIZE}}"
+if [[ "${DP_SIZE}" -ne "${WORLD_SIZE}" ]]; then
+    echo "ERROR: DP_SIZE=${DP_SIZE} must equal WORLD_SIZE=${WORLD_SIZE}; dense DP overlaps EP" >&2
+    exit 2
+fi
+if (( WORLD_SIZE % EP_SIZE != 0 )); then
+    echo "ERROR: WORLD_SIZE=${WORLD_SIZE} must be divisible by EP_SIZE=${EP_SIZE}" >&2
+    exit 2
+fi
+case "${EXPERT_BACKEND}" in
+    sequential|te_grouped|sonic) ;;
+    *)
+        echo "ERROR: EXPERT_BACKEND must be sequential, te_grouped, or sonic" >&2
+        exit 2
+        ;;
+esac
+if [[ "${MODE}" == "fp8_blockwise2d" && "${EXPERT_BACKEND}" == "te_grouped" ]]; then
+    echo "ERROR: MODE=fp8_blockwise2d does not cover TE grouped experts; use EXPERT_BACKEND=sequential or sonic" >&2
+    exit 2
+fi
 SHARDING="${SHARDING:-full_shard}"      # full_shard | shard_grad_op
 GRAD_CKPT="${GRAD_CKPT:-1}"
 FP8_SCALING="${FP8_SCALING:-blockwise2d}"
 
 # ---- Optimization flags ----
-FSDP_FP8_PARAM_STORAGE="${FSDP_FP8_PARAM_STORAGE:-}"
 AITER_ATTN="${AITER_ATTN:-}"
 LUMEN_NORM="${LUMEN_NORM:-}"
 FUSE_ROPE="${FUSE_ROPE:-}"
+FUSED_ROUTER="${FUSED_ROUTER:-}"
+MOE_DISPATCH_OVERLAP="${MOE_DISPATCH_OVERLAP:-}"
+MOE_GLOBAL_EXPERT_LAYOUT="${MOE_GLOBAL_EXPERT_LAYOUT:-}"
 
 IMAGE="${IMAGE:-lumen/llama2:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-lumen_qwen3_30b_a3b_dp${DP_SIZE}_ep${EP_SIZE}_node${NODE_RANK}}"
@@ -84,14 +107,15 @@ done
 mkdir -p "${HOST_RESULTS}"
 docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
 
-echo "=== Qwen3-30B-A3B DP=${DP_SIZE} × EP=${EP_SIZE} Training ==="
+echo "=== Qwen3-30B-A3B dense-DP=${DP_SIZE}, EP=${EP_SIZE} Training ==="
 echo "  Model:       ${HOST_MODEL}"
 echo "  Data:        ${HOST_DATA}"
 echo "  Mode:        ${MODE}"
+echo "  Experts:     ${EXPERT_BACKEND}"
 echo "  Sharding:    ${SHARDING} (FSDP2 fully_shard)"
 echo "  Steps:       ${MAX_STEPS}"
 echo "  SeqLen:      ${SEQ_LENGTH}"
-echo "  Training:    full-param BF16"
+echo "  Training:    full-param ${MODE}"
 echo "  Nodes:       ${NNODES} (node_rank=${NODE_RANK})"
 echo "  GPUs/node:   ${NPROC_PER_NODE}"
 echo "  Master:      ${MASTER_ADDR}:${MASTER_PORT}"
@@ -108,7 +132,7 @@ docker run --rm --init \
     --cap-add=SYS_PTRACE \
     -v "${HOST_LUMEN}/lumen:/workspace/Lumen/lumen" \
     -v "${HOST_LUMEN}/examples:/workspace/Lumen/examples" \
-    -v "${HOST_LUMEN}/third_party/aiter/aiter/ops/triton/configs:/workspace/Lumen/third_party/aiter/aiter/ops/triton/configs" \
+    -v "${HOST_LUMEN}/third_party/aiter:/workspace/Lumen/third_party/aiter" \
     -v "${HOST_MODEL}:/model-qwen3-moe:ro" \
     -v "${HOST_DATA}:/data:ro" \
     -v "${HOST_RESULTS}:/results" \
@@ -123,11 +147,13 @@ cd /workspace/Lumen/examples/qwen3-30b-a3b
 
 EXTRA=""
 # Optimization flags
-[[ -n "'"${FSDP_FP8_PARAM_STORAGE}"'" ]] && EXTRA="${EXTRA} --fsdp-fp8-param-storage"
 [[ -n "'"${AITER_ATTN}"'" ]]          && EXTRA="${EXTRA} --aiter-attn"
 [[ -n "'"${LUMEN_NORM}"'" ]]          && EXTRA="${EXTRA} --lumen-norm"
 [[ -n "'"${FUSE_ROPE}"'" ]]           && EXTRA="${EXTRA} --fuse-rope"
-[[ "'"${GRAD_CKPT}"'" == "0" ]]       && EXTRA="${EXTRA} --no-grad-checkpointing"
+[[ -n "'"${FUSED_ROUTER}"'" ]]        && EXTRA="${EXTRA} --fused-router"
+[[ -n "'"${MOE_DISPATCH_OVERLAP}"'" ]] && EXTRA="${EXTRA} --lumen-moe-dispatch-overlap"
+[[ -n "'"${MOE_GLOBAL_EXPERT_LAYOUT}"'" ]] && EXTRA="${EXTRA} --lumen-moe-global-expert-layout"
+[[ "'"${GRAD_CKPT}"'" == "0" ]]       && EXTRA="${EXTRA} --no-gradient-checkpointing"
 
 torchrun \
     --nnodes='"${NNODES}"' \
@@ -135,11 +161,13 @@ torchrun \
     --node_rank='"${NODE_RANK}"' \
     --master_addr='"${MASTER_ADDR}"' \
     --master_port='"${MASTER_PORT}"' \
-    train_qwen3_30b_a3b_fsdp_ep8.py \
+    pretrain_qwen3_30b_a3b_fsdp.py \
     --model-name-or-path /model-qwen3-moe \
+    --data-format alpaca \
     --train-data-path "/data/'"${TRAIN_FILE}"'" \
     --val-data-path "/data/'"${VAL_FILE}"'" \
     --mode '"${MODE}"' \
+    --expert-backend '"${EXPERT_BACKEND}"' \
     --ep-size '"${EP_SIZE}"' \
     --dp-size '"${DP_SIZE}"' \
     --sharding '"${SHARDING}"' \

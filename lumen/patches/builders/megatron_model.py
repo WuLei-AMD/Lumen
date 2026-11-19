@@ -286,8 +286,11 @@ def patch_fused_swiglu_mlp(model) -> None:
 
 
 def apply_core_attention_spec(*, spec=None, args=None, config=None, **kwargs) -> None:
-    if spec is not None:
-        patch_core_attention(spec)
+    import os
+
+    if spec is None or os.environ.get("LUMEN_USE_MEGATRON_ATTENTION", "0") == "1":
+        return
+    patch_core_attention(spec)
 
 
 def apply_norms_in_spec(*, spec=None, args=None, config=None, **kwargs) -> None:

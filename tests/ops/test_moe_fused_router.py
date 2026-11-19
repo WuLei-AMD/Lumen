@@ -10,6 +10,8 @@ Tests 1-7 map to the spec's Testing section:
   Test 7: AITER forward parity (7a, 7b, 7c)
 """
 
+from argparse import Namespace
+
 import pytest
 import torch
 from conftest import compute_snr
@@ -30,6 +32,16 @@ _requires_aiter_moe_aux_loss = pytest.mark.skipif(
     not torch.cuda.is_available() or not _probe_aiter_triton_moe_aux_loss(),
     reason="AITER Triton moe_aux_loss not available",
 )
+
+
+def test_lumen_config_maps_fused_router_flag():
+    from lumen.config import LumenConfig
+
+    config = LumenConfig.from_args(
+        Namespace(linear_fp8=False, lumen_fused_router=True)
+    )
+    assert config.fused_router is True
+    assert config.has_any_features
 
 
 # -- Reference implementations --
