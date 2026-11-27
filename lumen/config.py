@@ -343,7 +343,7 @@ class LumenConfig:
             self._patch_norms(
                 model,
                 atom_mode=True,
-                extra_classes=("Qwen3RMSNorm",) if "rmsnorm" in tags else (),
+                extra_classes=("Qwen3RMSNorm", "Qwen3MoeRMSNorm") if "rmsnorm" in tags else (),
             )
             try:
                 self._patch_sdpa()

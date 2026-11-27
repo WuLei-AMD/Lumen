@@ -476,6 +476,19 @@ def grouped_gemm_wgrad(
 
 
 _DUMMY_WGRAD = {}
+_SONIC_ACCUMULATE = None
+
+
+def _sonic_supports_accumulate() -> bool:
+    """Whether AITER Sonic ``grouped_gemm`` takes ``accumulate`` (wgrad into fp32 ``out``)."""
+    global _SONIC_ACCUMULATE
+    if _SONIC_ACCUMULATE is None:
+        import inspect
+
+        from aiter.ops.triton.moe.sonicmoe import grouped_gemm
+
+        _SONIC_ACCUMULATE = "accumulate" in inspect.signature(grouped_gemm).parameters
+    return _SONIC_ACCUMULATE
 
 
 def _expert_wgrad_accum_target(weight: torch.Tensor):
@@ -487,6 +500,8 @@ def _expert_wgrad_accum_target(weight: torch.Tensor):
     ``grad_added_to_main_grad`` flag so the post-hook skips a second add.
     """
     if os.environ.get("LUMEN_EXPERT_WGRAD_ACCUM", "0") != "1":
+        return None
+    if not _sonic_supports_accumulate():
         return None
     if not hasattr(weight, "grad_added_to_main_grad"):
         return None
@@ -519,6 +534,79 @@ def _cu_seqlens_from_group_sizes(group_sizes: torch.Tensor) -> torch.Tensor:
     counts = group_sizes.to(dtype=torch.int32)
     zeros = torch.zeros(1, dtype=torch.int32, device=counts.device)
     return torch.cat([zeros, torch.cumsum(counts, dim=0).to(torch.int32)])
+
+
+def _wgrad_scale_rows(group_sizes, block_size: int) -> int:
+    counts = torch.as_tensor(group_sizes)
+    return int(torch.div(counts + block_size - 1, block_size, rounding_mode="floor").sum())
+
+
+def _sonic_fp8_wgrad_direct(A, B, cu_seqlens, A_scale, B_scale, block_size):
+    """Blockwise FP8 grouped wgrad without AITER's host-side scale check.
+
+    The kernel derives each expert's scale-row offset from ``cu_seqlens`` on
+    device, so the worst-case padded scale buffers from the segment quant are
+    valid as-is. AITER's wrapper sizes-checks them with ``.item()``, one host
+    sync per call. Returns ``None`` when the kernel is not exposed.
+    """
+    import aiter.ops.triton.moe.sonicmoe as sonicmoe
+    import triton
+
+    kernel = getattr(sonicmoe, "_grouped_gemm_dw_kernel", None)
+    if kernel is None or not hasattr(sonicmoe, "split_launch_config"):
+        return None
+    local = getattr(sonicmoe, "_local_tensor", lambda t: t)
+    A, B, cu_seqlens = local(A), local(B), local(cu_seqlens)
+    A_scale, B_scale = local(A_scale), local(B_scale)
+    K_dim = A.shape[1]
+    N = B.shape[1]
+    E = cu_seqlens.shape[0] - 1
+    out = torch.empty(E, K_dim, N, dtype=torch.bfloat16, device=A.device)
+
+    def grid(META):
+        return (E * triton.cdiv(K_dim, META["BLOCK_K"]) * triton.cdiv(N, META["BLOCK_N"]),)
+
+    from lumen.ops.moe.sonic_configs import qwen3_fp8_dw_config
+
+    dw_cfg = qwen3_fp8_dw_config(
+        sonicmoe.get_grouped_gemm_dw_config(
+            N, K_dim, E, False, sonicmoe._use_qwen3_tuned_configs()
+        ),
+        N,
+        K_dim,
+        E,
+        False,
+    )
+    constexprs, launch = sonicmoe.split_launch_config(dw_cfg)
+    kernel[grid](
+        A,
+        B,
+        A_scale,
+        B_scale,
+        out,
+        cu_seqlens,
+        cu_seqlens,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(1),
+        A_scale.stride(0),
+        A_scale.stride(1),
+        B_scale.stride(0),
+        B_scale.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        N=N,
+        K=K_dim,
+        E=E,
+        SCALE_BLOCK_SIZE=block_size,
+        BLOCKWISE_FP8=True,
+        HAS_GATHER_IDX=False,
+        **constexprs,
+        **launch,
+    )
+    return out
 
 
 def _sonic_grouped_linear_backward(
@@ -581,6 +669,22 @@ def _sonic_grouped_linear_backward(
                 block_size,
             )
         )
+        if accumulate_into is None:
+            grad_weight = _sonic_fp8_wgrad_direct(
+                inp_col, grad_col, cu_seqlens, inp_col_scale, grad_col_scale, block_size
+            )
+            if grad_weight is not None:
+                return grad_input, grad_weight
+        # Fallback: AITER's wrapper requires exactly one scale row per expert
+        # M tile, so trim the worst-case segment scales (one host sync).
+        wgrad_scale_rows = _wgrad_scale_rows(group_sizes, block_size)
+        inp_col_scale = inp_col_scale[:wgrad_scale_rows]
+        grad_col_scale = grad_col_scale[:wgrad_scale_rows]
+        accumulate_kwargs = (
+            {"accumulate": accumulate_into is not None}
+            if _sonic_supports_accumulate()
+            else {}
+        )
         grad_weight = sonic_grouped_gemm(
             inp_col,
             grad_col,
@@ -591,7 +695,7 @@ def _sonic_grouped_linear_backward(
             B_scale=grad_col_scale,
             block_size=block_size,
             out_dtype=torch.bfloat16,
-            accumulate=accumulate_into is not None,
+            **accumulate_kwargs,
         )
         return grad_input, grad_weight
 

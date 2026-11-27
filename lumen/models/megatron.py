@@ -1047,9 +1047,13 @@ def make_lumen_model_provider(
         # a partially quantized model -- norms patched, params wrapped, GEMMs
         # untouched -- and reported nothing, so the run looked like a working
         # FP8/FP4 run and trained in BF16. Fail before anything is patched.
+        # SonicMoE experts take FP8 from cfg.enable(), so a SonicMoE run is
+        # quantized even without the parallel-linear pass.
         if (
-            getattr(args, "linear_fp8", False) or getattr(args, "linear_fp4", False)
-        ) and not getattr(args, "lumen_linear", False):
+            (getattr(args, "linear_fp8", False) or getattr(args, "linear_fp4", False))
+            and not getattr(args, "lumen_linear", False)
+            and not getattr(args, "lumen_sonic_moe", False)
+        ):
             _flag = "--linear-fp4" if getattr(args, "linear_fp4", False) else "--linear-fp8"
             raise ValueError(
                 f"{_flag} quantizes Lumen's parallel linear layers, which requires "

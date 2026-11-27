@@ -11,6 +11,10 @@ from __future__ import annotations
 from lumen.ops.rope_cached import make_cached_rope_fn
 from lumen.ops.gemm.linear_autograd import _atom_mm, make_fused_gate_up_fn, make_fused_qkv_fn
 
+# Qwen3-MoE attention and decoder layers have the dense layout under other names.
+_ATTENTION = ("Qwen3Attention", "Qwen3MoeAttention")
+_DECODER_LAYER = ("Qwen3DecoderLayer", "Qwen3MoeDecoderLayer")
+
 
 def _rank0_print(msg: str) -> None:
     from lumen.config import _rank0_print as _print
@@ -31,7 +35,7 @@ def patch_qwen3_qkv(model) -> None:
     qkv_fn = make_fused_qkv_fn(tgemm)
     count = 0
     for module in model.modules():
-        if type(module).__name__ != "Qwen3Attention":
+        if type(module).__name__ not in _ATTENTION:
             continue
         q_mod = getattr(module, "q_proj", None)
         k_mod = getattr(module, "k_proj", None)
@@ -132,7 +136,7 @@ def patch_qwen3_rope(model) -> None:
 
     count = 0
     for module in model.modules():
-        if type(module).__name__ != "Qwen3Attention":
+        if type(module).__name__ not in _ATTENTION:
             continue
         cfg = module.config
         rope_type = cfg.rope_parameters.get("rope_type", "default")
@@ -221,7 +225,7 @@ def patch_qwen3_residual_rmsnorm(model) -> None:
     backbone = getattr(model, "model", model)
     layers = getattr(backbone, "layers", None)
     norm = getattr(backbone, "norm", None)
-    if not layers or norm is None or type(layers[0]).__name__ != "Qwen3DecoderLayer":
+    if not layers or norm is None or type(layers[0]).__name__ not in _DECODER_LAYER:
         _rank0_print("> residual_rmsnorm: Qwen3 decoder stack not found, skipped")
         return
 

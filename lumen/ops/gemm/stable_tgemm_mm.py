@@ -46,6 +46,17 @@ def call_stable_tgemm_mm(raw_mm, gemm, x, weight, bias, otype):
     orig_shape = x.shape
     x_2d = x.reshape(m, k)
 
+    # Kernels index the output with int32, so a vocab-wide lm_head over a packed
+    # training batch (M x 151936 >= 2**31) faults or misses the tuned table.
+    # Row chunks give the same rows when the table's kernels are M-invariant.
+    if m * n >= 2**31:
+        rows = 1 << ((2**31 - 1) // n).bit_length() - 1
+        parts = [
+            call_stable_tgemm_mm(raw_mm, gemm, x_2d[i:i + rows], weight, bias, otype)
+            for i in range(0, m, rows)
+        ]
+        return torch.cat(parts, dim=0).reshape(*orig_shape[:-1], n)
+
     key = (m, n, k)
     stable_m = _stable_m_cache.get(key)
     if stable_m is None:

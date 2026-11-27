@@ -94,6 +94,11 @@ fi
 if [ "${LUMEN_LINEAR_CLI:-0}" = "1" ]; then
     LUMEN_EXTRA_ARGS+=(--lumen-linear)
 fi
+# The 10BT sample packs to fewer than GBS * TRAIN_STEPS sequences. The previous
+# recipe cycled it; without this flag the run stops before step 0.
+if [ "${LUMEN_REPEAT_CORPUS:-1}" = "1" ]; then
+    LUMEN_EXTRA_ARGS+=(--lumen-repeat-corpus)
+fi
 
 FP8_ARGS=()
 case "${FP8_MODE:-bf16}" in

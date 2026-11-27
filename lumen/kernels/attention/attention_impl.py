@@ -138,9 +138,7 @@ def _probe_aiter_csrc():
         _CSRC_OPS["flash_attn_fp8_pertensor_fwd"] = hasattr(mha, "flash_attn_fp8_pertensor_func")
         # OPUS gfx950 bf16 dense forward. Forward-only: there is no OPUS backward
         # kernel, so the opus backend pairs this with the csrc (CK/asm) backward.
-        _CSRC_OPS["fmha_fwd_bf16_opus_fwd"] = hasattr(mha, "fmha_fwd_bf16_opus_fwd") and hasattr(
-            mha, "fmha_fwd_bf16_opus_supported"
-        )
+        _CSRC_OPS["fmha_fwd_bf16_opus_fwd"] = hasattr(mha, "fmha_fwd_bf16_opus_fwd")
         # ── future aiter csrc kernels ──────────────────────────────
         # _CSRC_OPS["flash_attn_fp8_bwd"] = hasattr(mha, "_flash_attn_fp8_backward")
         # _CSRC_OPS["flash_attn_mxfp8_fwd"] = hasattr(mha, "_flash_attn_mxfp8_forward")
@@ -519,6 +517,49 @@ if csrc_available("flash_attn_fp8_pertensor_fwd"):
 # That pairing is sound because the OPUS LSE is the same quantity in the same
 # layout the CK/asm backward already consumes: log-sum-exp of the *scaled*
 # scores, natural log, float32, [B, H_q, S], contiguous along the query dim.
+#
+# AITER used to expose this gate as ``fmha_fwd_bf16_opus_supported`` and then
+# folded it into ``flash_attn_func``, where D=128 is off unless
+# ``AITER_ENABLE_FMHA_OPUS=1``. Lumen calls ``fmha_fwd_bf16_opus_fwd`` directly,
+# so the gate lives here and D=128 stays on.
+
+
+def opus_dense_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    """Whether the dense OPUS forward can run these tensors.
+
+    gfx950, bf16, ``[B, S, H, D]`` with GQA fan-out, unit last-dim strides,
+    D=128 or D_QK=192/D_V=128. D=128 also needs the per-head KV byte extent
+    below 2^32, which is the kernel's 32-bit async-load limit.
+    """
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+
+        if get_gfx() != "gfx950":
+            return False
+        if q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype:
+            return False
+        if q.device != k.device or q.device != v.device:
+            return False
+        if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+            return False
+        if q.size(0) != k.size(0) or k.shape[:3] != v.shape[:3]:
+            return False
+        if q.size(2) % k.size(2) != 0 or q.stride(-1) != 1:
+            return False
+        if k.stride(-1) != 1 or v.stride(-1) != 1:
+            return False
+        hdim_q, hdim_v = q.size(-1), v.size(-1)
+        if k.size(-1) != hdim_q:
+            return False
+        if hdim_q == 192 and hdim_v == 128:
+            return True
+        if hdim_q != 128 or hdim_v != 128:
+            return False
+        kv_stride = max(k.stride(1), v.stride(1))
+        return k.size(1) * kv_stride * k.element_size() < (1 << 32)
+    except (AttributeError, RuntimeError, TypeError):
+        return False
+
 
 if csrc_available("fmha_fwd_bf16_opus_fwd"):
 
@@ -534,15 +575,14 @@ if csrc_available("fmha_fwd_bf16_opus_fwd"):
     ) -> bool:
         """Whether the OPUS forward can serve this call.
 
-        Splits into the kernel's own arch / dtype / head-dim / KV-extent gate
-        (owned by aiter) and the features the OPUS path has no code for at all
-        (dropout, additive bias, alibi, sliding window).
+        The tensor gate is :func:`opus_dense_supported`. Dropout, additive
+        bias, alibi, and sliding window have no OPUS path.
         """
         if dropout_p != 0.0 or bias is not None or alibi_slopes is not None:
             return False
         if window_size_left != -1 or window_size_right != -1:
             return False
-        return bool(_get_aiter_mha().fmha_fwd_bf16_opus_supported(q, k, v))
+        return opus_dense_supported(q, k, v)
 
     @_torch_custom_op_wrapper(
         "lumen::attention_opus_forward_impl",

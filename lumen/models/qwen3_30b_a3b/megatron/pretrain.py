@@ -54,6 +54,14 @@ def add_pretrain_args(parser):
     add_common_megatron_args(parser)
     safe_add_argument(
         parser,
+        "--lumen-repeat-corpus",
+        action="store_true",
+        help="Let the training set wrap to fill --train-iters when the corpus is "
+        "shorter than the run. The fineweb sample used by the 20-step recipe is "
+        "shorter than global-batch-size times train-iters.",
+    )
+    safe_add_argument(
+        parser,
         "--size",
         type=str,
         default="30b-a3b",

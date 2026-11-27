@@ -87,6 +87,20 @@ def add_common_megatron_args(parser):
     )
     safe_add_argument(
         lumen,
+        "--lumen-sonic-moe",
+        action="store_true",
+        default=False,
+        help="Replace Megatron MoE expert MLPs with AITER SonicMoE during LumenConfig.enable().",
+    )
+    safe_add_argument(
+        lumen,
+        "--lumen-fused-router",
+        action="store_true",
+        default=False,
+        help="Install autograd-safe AITER router functions during LumenConfig.enable().",
+    )
+    safe_add_argument(
+        lumen,
         "--lumen-cross-entropy",
         action="store_true",
         default=False,

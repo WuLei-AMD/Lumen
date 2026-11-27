@@ -45,6 +45,7 @@ docker run --rm --init \
     --security-opt=seccomp=unconfined \
     --cap-add=SYS_PTRACE \
     --shm-size=64G \
+    --volume "${REPO_ROOT}/lumen:/workspace/Lumen/lumen" \
     --volume "${REPO_ROOT}/lumen/models/megatron.py:/workspace/Lumen/lumen/models/megatron.py" \
     --volume "${REPO_ROOT}/lumen/models/megatron_patches.py:/workspace/Lumen/lumen/models/megatron_patches.py" \
     --volume "${REPO_ROOT}/lumen/models/spec_provider.py:/workspace/Lumen/lumen/models/spec_provider.py" \

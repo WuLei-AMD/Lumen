@@ -226,6 +226,9 @@ class SonicMoEExperts(nn.Module):
                 "with SONIC_MOE_GROUPED_GEMM_BACKEND="
                 "triton|hipblaslt|multistream|auto"
             )
+        from lumen.ops.moe.sonic_configs import install_qwen3_sonic_configs
+
+        install_qwen3_sonic_configs()
         self.native_weight_layout = (
             self.gemm_backend == "flydsl"
             and os.environ.get("SONIC_MOE_FLYDSL_NATIVE", "1") != "0"

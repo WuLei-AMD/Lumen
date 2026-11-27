@@ -422,6 +422,9 @@ class _SonicLocalExperts(nn.Module):
                 "with SONIC_MOE_GROUPED_GEMM_BACKEND="
                 "triton|hipblaslt|multistream|auto"
             )
+        from lumen.ops.moe.sonic_configs import install_qwen3_sonic_configs
+
+        install_qwen3_sonic_configs()
 
     def enable_fp8(
         self,
